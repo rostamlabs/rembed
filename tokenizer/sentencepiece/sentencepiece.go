@@ -6,11 +6,22 @@
 // the NMT-NFKC normalizer driven by the model's precompiled charsmap, and
 // Viterbi segmentation over the piece vocabulary — with HF's fairseq id
 // remapping on top. Validated token-for-token against HF's
-// XLMRobertaTokenizer by the committed fixture test.
+// XLMRobertaTokenizer over the committed fixture, and byte-for-byte
+// against sentencepiece's own normalizer.
+//
+// Known, DELIBERATE divergence from HF's fast (Rust) tokenizer: NFD
+// (decomposed) Hangul and kana. tokenizers-rs applies the charsmap per
+// grapheme cluster and skips clusters ≥ 6 bytes, so decomposed Korean
+// from e.g. macOS never gets NFC-composed there and shreds into jamo.
+// This implementation matches the sentencepiece C++ reference (and the
+// slow Python tokenizer), which composes them — 65k-input fuzzing
+// against the reference found zero mismatches, with every HF-fast
+// disagreement being HF's known quirk. The NFD fixture pins this.
 package sentencepiece
 
 import (
 	"fmt"
+	"math"
 	"unicode/utf8"
 )
 
@@ -52,11 +63,12 @@ func New(modelPath string) (*Tokenizer, error) {
 		scores:    make([]float32, len(m.pieces)),
 		nPieces:   len(m.pieces),
 	}
-	minScore := float32(0)
+	minScore := float32(math.MaxFloat32)
 	for id, p := range m.pieces {
 		t.scores[id] = p.score
 		t.pieceText[id] = p.text
-		if p.kind == 1 { // NORMAL pieces participate in matching
+		switch p.kind {
+		case 1: // NORMAL pieces participate in matching
 			if _, dup := t.pieceID[p.text]; dup {
 				return nil, fmt.Errorf("sentencepiece: %s: duplicate piece %q", modelPath, p.text)
 			}
@@ -67,6 +79,14 @@ func New(modelPath string) (*Tokenizer, error) {
 			if p.score < minScore {
 				minScore = p.score
 			}
+		case 2, 3: // UNKNOWN, CONTROL — never matched against text
+		default:
+			// USER_DEFINED (4), UNUSED (5), and BYTE (6) pieces carry
+			// semantics this implementation does not reproduce (special
+			// matching rules, score bonuses, byte fallback) — loading such
+			// a model would tokenize differently from sentencepiece, so
+			// refuse loudly (none of the XLM-R-family models use them).
+			return nil, fmt.Errorf("sentencepiece: %s: piece %q has unsupported type %d (USER_DEFINED/UNUSED/BYTE models are not supported)", modelPath, p.text, p.kind)
 		}
 	}
 	if t.maxPiece == 0 {
@@ -185,7 +205,21 @@ func (t *Tokenizer) segment(s string) []span {
 func (t *Tokenizer) Encode(text string, maxLen int) (ids, mask []int64) {
 	ids = append(ids, t.cls)
 	budget := max(maxLen-2, 0)
-	for _, sp := range t.segment(t.norm.normalize(text)) {
+	norm := t.norm.normalize(text)
+	// Bound the Viterbi work by what the budget can consume: a piece is
+	// at least one byte, so (budget+margin)·maxPiece bytes of normalized
+	// text always yields more than budget pieces. Without this, one 32 MB
+	// request buys ~1.5 s of CPU and ~135 MB of allocation to produce 512
+	// ids (measured by the review). Only inputs whose normalized form
+	// exceeds the cap can theoretically differ from HF near the ceiling,
+	// and those are far past the model's sequence limit anyway.
+	if cap := (budget + 16) * t.maxPiece; len(norm) > cap {
+		for cap > 0 && !utf8.RuneStart(norm[cap]) {
+			cap--
+		}
+		norm = norm[:cap]
+	}
+	for _, sp := range t.segment(norm) {
 		if budget <= 0 {
 			break
 		}

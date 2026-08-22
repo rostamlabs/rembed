@@ -36,18 +36,22 @@ var required = []string{
 	"model.safetensors",
 }
 
-// tokenizerFiles returns the tokenizer artifacts to fetch: SentencePiece
-// models (tokenizer_class XLMRobertaTokenizer, on any architecture) ship
-// sentencepiece.bpe.model; byte-level BPE (RoBERTa) ships vocab.json +
-// merges.txt; WordPiece (BERT, MPNet) ships vocab.txt.
-func tokenizerFiles(modelType, tokenizerClass string) []string {
+// tokenizerFiles returns the tokenizer artifacts to fetch and whether
+// sentencepiece.bpe.model must be PROBED first. tokenizer_class is only a
+// fast path: real repos ship classes like "PreTrainedTokenizerFast" (the
+// multilingual MiniLM does — the review caught the probe being gated on
+// an empty class, which made the flagship multilingual model unfetchable),
+// so any class that is not explicitly XLM-R triggers the probe, and a 404
+// falls back to the model_type rules: byte-level BPE (RoBERTa) ships
+// vocab.json + merges.txt; WordPiece (BERT, MPNet) ships vocab.txt.
+func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe bool) {
 	if strings.HasPrefix(tokenizerClass, "XLMRobertaTokenizer") {
-		return []string{"sentencepiece.bpe.model"}
+		return []string{"sentencepiece.bpe.model"}, false
 	}
 	if modelType == "roberta" {
-		return []string{"vocab.json", "merges.txt"}
+		return []string{"vocab.json", "merges.txt"}, true
 	}
-	return []string{"vocab.txt"}
+	return []string{"vocab.txt"}, true
 }
 
 // supported mirrors internal/model's architecture allowlist. Duplicated
@@ -108,14 +112,11 @@ func Ensure(modelID, cacheDir string) (string, error) {
 		_ = os.Remove(filepath.Join(dir, "1_Pooling"))
 		_ = os.Remove(dir)
 	}
-	// config.json and tokenizer_config.json first, alone: model_type
-	// decides whether to continue at all, and together with
-	// tokenizer_class decides which tokenizer files exist to fetch.
-	for _, f := range []string{"config.json", "tokenizer_config.json"} {
-		if err := fetch(modelID, f, dir); err != nil {
-			cleanup("config.json")
-			return "", err
-		}
+	// config.json first and alone: model_type decides whether to continue
+	// at all, before anything else is spent.
+	if err := fetch(modelID, "config.json", dir); err != nil {
+		cleanup()
+		return "", err
 	}
 	var hf struct {
 		ModelType string `json:"model_type"`
@@ -125,13 +126,19 @@ func Ensure(modelID, cacheDir string) (string, error) {
 		err = json.Unmarshal(raw, &hf)
 	}
 	if err != nil {
-		cleanup("config.json", "tokenizer_config.json")
+		cleanup("config.json")
 		return "", fmt.Errorf("hub: %s: config.json: %w", modelID, err)
 	}
 	if !supported(hf.ModelType) {
-		cleanup("config.json", "tokenizer_config.json")
+		cleanup("config.json")
 		return "", fmt.Errorf("hub: %s: model_type %q is not supported (rembed runs bert, roberta, and mpnet encoders)", modelID, hf.ModelType)
 	}
+	fetched := []string{"config.json"}
+	if err := fetch(modelID, "tokenizer_config.json", dir); err != nil {
+		cleanup(fetched...)
+		return "", err
+	}
+	fetched = append(fetched, "tokenizer_config.json")
 	var tc struct {
 		TokenizerClass string `json:"tokenizer_class"`
 	}
@@ -140,15 +147,13 @@ func Ensure(modelID, cacheDir string) (string, error) {
 		err = json.Unmarshal(raw, &tc)
 	}
 	if err != nil {
-		cleanup("config.json", "tokenizer_config.json")
+		cleanup(fetched...)
 		return "", fmt.Errorf("hub: %s: tokenizer_config.json: %w", modelID, err)
 	}
-	fetched := []string{"config.json", "tokenizer_config.json"}
-	// Older exports omit tokenizer_class entirely (the multilingual
-	// MiniLM does), so the SentencePiece file itself is probed: a 404
-	// falls back to the model_type rules, any other failure is real.
-	tokFiles := tokenizerFiles(hf.ModelType, tc.TokenizerClass)
-	if tc.TokenizerClass == "" {
+	// Tokenizer files come BEFORE the weights: they are small, and a
+	// probe miss or 404 must not cost a 470 MB download per retry.
+	tokFiles, probe := tokenizerFiles(hf.ModelType, tc.TokenizerClass)
+	if probe {
 		err := fetch(modelID, "sentencepiece.bpe.model", dir)
 		switch {
 		case err == nil:
@@ -161,7 +166,7 @@ func Ensure(modelID, cacheDir string) (string, error) {
 			return "", err
 		}
 	}
-	for _, f := range append(append([]string{}, required...), tokFiles...) {
+	for _, f := range append(tokFiles, required...) {
 		if err := fetch(modelID, f, dir); err != nil {
 			cleanup(fetched...)
 			return "", err
@@ -232,7 +237,7 @@ func fetch(modelID, name, dir string) error {
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		return fmt.Errorf("hub: %s has no %s — not a sentence-transformers-format BERT repo%w", modelID, name, errNotFound)
+		return fmt.Errorf("hub: %s has no %s — not a sentence-transformers-format encoder repo%w", modelID, name, errNotFound)
 	case http.StatusUnauthorized, http.StatusForbidden:
 		// HF answers 401 for repos that DO NOT EXIST as well as for gated
 		// and private ones — never assume this is an auth problem.

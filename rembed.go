@@ -152,8 +152,14 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 	// ids), so their check is one-sided.
 	switch {
 	case cfg.Tokenizer == "sentencepiece":
-		if tok.VocabSize() > cfg.VocabSize {
-			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model only %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
+		// Padded embedding tables are real (250037 rows for 250002 ids on
+		// the multilingual MiniLM) but the gap is small; a LARGE gap means
+		// a wrong .model file paired with the weights — which would embed
+		// silent garbage, since a smaller tokenizer only emits in-range
+		// ids and no downstream bounds check can fire (the review
+		// demonstrated it with a 42-piece model).
+		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 64 {
+			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 		}
 	case tok.VocabSize() != cfg.VocabSize:
 		return nil, fmt.Errorf("rembed: vocab has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)

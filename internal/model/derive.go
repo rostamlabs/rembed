@@ -103,9 +103,13 @@ func DeriveConfig(dir, name string) (Config, error) {
 	// architecture (multilingual-e5, paraphrase-multilingual MiniLM). The
 	// FILE is the authoritative signal: older exports lack the
 	// tokenizer_class field entirely (the multilingual MiniLM does).
-	sentencePiece := strings.HasPrefix(tok.TokenizerClass, "XLMRobertaTokenizer")
-	if !sentencePiece {
-		if _, err := os.Stat(filepath.Join(dir, "sentencepiece.bpe.model")); err == nil {
+	// Only BERT-architecture repos wear the XLM-R tokenizer (the ST
+	// multilingual exports are all model_type=bert); keying the file probe
+	// on that keeps a stray sentencepiece.bpe.model in e.g. a roberta dir
+	// from silently switching tokenizer family.
+	sentencePiece := hf.ModelType == "bert" && strings.HasPrefix(tok.TokenizerClass, "XLMRobertaTokenizer")
+	if !sentencePiece && hf.ModelType == "bert" {
+		if fi, err := os.Stat(filepath.Join(dir, "sentencepiece.bpe.model")); err == nil && !fi.IsDir() {
 			sentencePiece = true
 		}
 	}

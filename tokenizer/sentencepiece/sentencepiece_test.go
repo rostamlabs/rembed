@@ -123,3 +123,44 @@ func TestEncodeTinyMaxLen(t *testing.T) {
 		}
 	}
 }
+
+// TestNFDAgainstSentencePiece pins the DELIBERATE divergence from HF's
+// fast tokenizer: NFD (decomposed) Hangul/kana — routine output from
+// macOS — where tokenizers-rs skips ≥6-byte grapheme clusters in its
+// per-cluster charsmap pass and shreds Korean into jamo (the R6 review
+// measured cosine 0.32 between the two on NFD Korean). rembed matches
+// the sentencepiece C++ reference, which composes NFD back: this fixture
+// carries the reference's own normalize/pieces layers, and additionally
+// requires NFD and NFC forms to tokenize IDENTICALLY.
+func TestNFDAgainstSentencePiece(t *testing.T) {
+	tok := loadTok(t)
+	raw, err := os.ReadFile("testdata/fixture-nfd.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Cases []struct {
+			Text       string   `json:"text"`
+			Normalized string   `json:"normalized"`
+			Pieces     []string `json:"pieces"`
+			NFCPieces  []string `json:"nfc_pieces"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Cases) < 4 {
+		t.Fatalf("suspiciously small NFD fixture: %d cases", len(f.Cases))
+	}
+	for _, c := range f.Cases {
+		if got := tok.Normalize(c.Text); got != c.Normalized {
+			t.Errorf("Normalize(NFD %.30q):\n got %q\nwant %q", c.Text, got, c.Normalized)
+		}
+		if got := tok.Pieces(c.Text); !slices.Equal(got, c.Pieces) {
+			t.Errorf("Pieces(NFD %.30q):\n got %v\nwant %v", c.Text, got, c.Pieces)
+		}
+		if !slices.Equal(c.Pieces, c.NFCPieces) {
+			t.Errorf("reference itself split NFD vs NFC for %.30q — fixture assumption broken", c.Text)
+		}
+	}
+}

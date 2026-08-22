@@ -151,16 +151,15 @@ def main() -> None:
     shutil.copyfile(st, out / "model.safetensors")
 
     config = json.loads(fetch("config.json").read_text())
-    tok_config_early = json.loads(fetch("tokenizer_config.json").read_text())
-    sentencepiece_tok = str(tok_config_early.get("tokenizer_class", "")).startswith("XLMRobertaTokenizer")
-    if not sentencepiece_tok:
-        # Older exports omit tokenizer_class; the file is the authority.
-        from huggingface_hub.errors import EntryNotFoundError
-        try:
-            fetch("sentencepiece.bpe.model")
-            sentencepiece_tok = True
-        except EntryNotFoundError:
-            pass
+    # The sentencepiece.bpe.model FILE is the authority — tokenizer_class
+    # is unreliable in real repos (the multilingual MiniLM says
+    # PreTrainedTokenizerFast).
+    from huggingface_hub.errors import EntryNotFoundError
+    try:
+        fetch("sentencepiece.bpe.model")
+        sentencepiece_tok = True
+    except EntryNotFoundError:
+        sentencepiece_tok = False
     # SentencePiece models (XLM-R tokenizer, any architecture) ship
     # sentencepiece.bpe.model; byte-level BPE (RoBERTa) ships vocab.json +
     # merges.txt; WordPiece (BERT, MPNet) ships vocab.txt.

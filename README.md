@@ -62,6 +62,13 @@ embeds exactly the text you pass and does not add prefixes; add them
 yourself or retrieval quality silently degrades (multilingual-e5 is the
 main SentencePiece model in this category).
 
+One deliberate tokenizer divergence: on NFD (decomposed) Hangul/kana —
+routine output from macOS — HF's fast tokenizer skips ≥6-byte grapheme
+clusters during normalization and shreds Korean into jamo; rembed
+matches the sentencepiece C++ reference instead, which composes NFD
+back so decomposed and composed text embed identically. 65k-input
+fuzzing against the reference: zero mismatches.
+
 ## Dev: golden reference generation
 
 The validation harness's golden files come from ONNX Runtime in Python
