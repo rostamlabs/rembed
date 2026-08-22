@@ -66,3 +66,42 @@ chains bound it). The remaining gap to ONNX is precisely what M2
 (parallelism, ~11× → target /nCores) and M3 (AVX2 SIMD, the big lever) exist
 to close. The 3–5× estimate assumed more headroom in scalar code than
 exists.
+
+## M2 — goroutine parallelism (2026-08-22)
+
+Same machine (20 logical CPUs). MatMulParallel partitions output columns
+into 64-wide blocks over a fixed GOMAXPROCS fan-out (tensor.ParallelFor);
+attention fans out across heads; GELU across rows. Every path stays
+bit-identical to the serial kernels (disjoint outputs, unchanged
+accumulation order), pinned by the cross-kernel test and a
+concurrent-vs-serial e2e test under -race.
+
+Kernel (same-session A/B, median of 3×20 runs):
+
+| kernel | 128×384·384×1536 (FFN) | 12×384·384×384 |
+|--------|------------------------|-----------------|
+| blocked (serial) | 20.5 ms | 0.56 ms |
+| parallel | 4.8 ms | 0.17 ms |
+
+End-to-end (`bench/compare.py`, 40 runs, both orders):
+
+| engine | threads | median | p10 | p90 | spread |
+|--------|---------|--------|-----|-----|--------|
+| rembed M2 | GOMAXPROCS | 15.5–17.3 ms | 11.3 ms | 23.6 ms | 58–79% (FLAGged) |
+| ONNX Runtime | 1 (pinned) | 3.8 ms | 3.7 ms | 4.2 ms | 12% |
+| ONNX Runtime | default pool | 1.8 ms | 1.7 ms | 2.2 ms | 30% |
+
+**e2e 67.4 → ~16 ms ≈ 4.1× over M1 — the 2–4× target hit at the top end.
+ours/onnx ≈ 9.6× against ORT's default pool, the like-for-like config now
+that both engines are multithreaded** (the ladder so far: ~45× → ~25× →
+9.6× in that configuration). Two honesty caveats, both FLAGged by the
+harness: (1) this box swung ~1.7× between sessions (M1's blocked-kernel
+FFN measured 35 ms then, 20.5 ms now; ORT moved too), so only same-session
+A/B ratios are quoted; (2) rembed's spread is now 58–79% — goroutine
+scheduling on a P/E-core laptop — versus ~4% when single-threaded, so the
+median is soft. The pinned-cloud-box rule from DESIGN.md starts mattering
+here, one rung before M3 was expected to need it.
+
+Steady-state allocations grew from 29 to a fixed ~49 per forward pass (the
+fan-out's goroutine/closure overhead) — still constant across sequence
+lengths, which the alloc test continues to enforce.

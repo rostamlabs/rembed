@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"runtime"
+	"sync/atomic"
 	"testing"
 )
 
@@ -35,8 +36,9 @@ func TestMatMulNaiveSmall(t *testing.T) {
 // kernels lists every matmul body; each must pass the float64 cross-check
 // below — it is the per-kernel safety net of the optimization ladder.
 var kernels = map[string]MatMulFunc{
-	"naive":   MatMulNaive,
-	"blocked": MatMulBlocked,
+	"naive":    MatMulNaive,
+	"blocked":  MatMulBlocked,
+	"parallel": MatMulParallel,
 }
 
 // TestMatMulAgainstFloat64Reference cross-checks every kernel body against a
@@ -188,5 +190,18 @@ func benchMatMul(b *testing.B, kern MatMulFunc) {
 	}
 }
 
-func BenchmarkMatMulNaive(b *testing.B)   { benchMatMul(b, MatMulNaive) }
-func BenchmarkMatMulBlocked(b *testing.B) { benchMatMul(b, MatMulBlocked) }
+func BenchmarkMatMulNaive(b *testing.B)    { benchMatMul(b, MatMulNaive) }
+func BenchmarkMatMulBlocked(b *testing.B)  { benchMatMul(b, MatMulBlocked) }
+func BenchmarkMatMulParallel(b *testing.B) { benchMatMul(b, MatMulParallel) }
+
+func TestParallelForCoversEveryUnitOnce(t *testing.T) {
+	for _, units := range []int{0, 1, 2, 7, 64, 1000} {
+		hits := make([]atomic.Int32, units)
+		ParallelFor(units, func(u int) { hits[u].Add(1) })
+		for u := range hits {
+			if got := hits[u].Load(); got != 1 {
+				t.Fatalf("units=%d: unit %d executed %d times", units, u, got)
+			}
+		}
+	}
+}

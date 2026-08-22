@@ -5,11 +5,13 @@ package rembed
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -99,6 +101,59 @@ func TestEmbedContextCancellation(t *testing.T) {
 	}
 }
 
+// TestEmbedConcurrentMatchesSerial pins two properties of the M2 parallel
+// forward pass at once: determinism (parallel execution must be bit-identical
+// to a serial reference — workers own disjoint outputs and never change
+// accumulation order) and scratch-pool isolation under concurrent Embed
+// calls. Run with -race for the full effect.
+func TestEmbedConcurrentMatchesSerial(t *testing.T) {
+	dir := modelDir(t)
+	emb, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	texts := []string{
+		"hello world",
+		"The quick brown fox jumps over the lazy dog.",
+		"Rostam is a vector database written in Go, with BM25 and semantic caching built in.",
+		strings.Repeat("a longer text to hit a different scratch size class ", 20),
+	}
+	want := make([][]float32, len(texts))
+	for i, text := range texts {
+		v, err := emb.Embed(ctx, []string{text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want[i] = v[0]
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for w := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for rep := range 4 {
+				i := (w + rep) % len(texts)
+				v, err := emb.Embed(ctx, []string{texts[i]})
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !slices.Equal(v[0], want[i]) {
+					errs <- fmt.Errorf("concurrent embed of text %d diverged from serial result", i)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
 // TestEmbedSteadyStateAllocs pins the M1 alloc-free property. The real
 // invariant lives at the Forward level: after warm-up, a forward pass
 // allocates ONLY the returned vector, so its alloc count must be identical
@@ -131,14 +186,18 @@ func TestEmbedSteadyStateAllocs(t *testing.T) {
 		})
 	}
 	// Warm the long size first so the short runs reuse grown buffers too.
+	// The absolute bound covers the M2 fan-out's fixed goroutine/closure
+	// allocations (measured 49); equality across seq is the invariant that
+	// catches a regression to per-call buffer allocation.
 	aLong := forwardAllocs(long)
 	aShort := forwardAllocs(short)
-	if aShort != aLong || aShort > 2 {
-		t.Fatalf("Forward allocs must be tiny and independent of seq: short=%v long=%v (want equal, <= 2)", aShort, aLong)
+	if aShort != aLong || aShort > 64 {
+		t.Fatalf("Forward allocs must be small and independent of seq: short=%v long=%v (want equal, <= 64)", aShort, aLong)
 	}
 
 	// End-to-end sanity: tokenizer allocations scale with token count, so
-	// only the short text gets an absolute bound (steady state measured 29).
+	// only the short text gets an absolute bound (Forward's fan-out plus
+	// ~28 tokenizer/output allocations).
 	ctx := context.Background()
 	texts := []string{"The quick brown fox jumps over the lazy dog."}
 	embedAllocs := testing.AllocsPerRun(20, func() {
@@ -146,8 +205,8 @@ func TestEmbedSteadyStateAllocs(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if embedAllocs > 32 {
-		t.Fatalf("steady-state Embed does %v allocs/op, want <= 32", embedAllocs)
+	if embedAllocs > 96 {
+		t.Fatalf("steady-state Embed does %v allocs/op, want <= 96", embedAllocs)
 	}
 }
 

@@ -50,17 +50,18 @@ type Model struct {
 // passes allocate nothing but the returned vector.
 //
 // Buffers only grow: one max-length (512-token) input inflates a scratch to
-// ~10 MB, and sync.Pool retains up to one scratch per P until GC drains it.
-// That is a deliberate trade (reuse over footprint) — revisit if rembed's
-// host process cares about worst-case resident memory.
+// ~25 MB (the per-head scores panel dominates), and sync.Pool retains up to
+// one scratch per P until GC drains it. That is a deliberate trade (reuse
+// over footprint) — revisit if rembed's host process cares about worst-case
+// resident memory.
 type scratch struct {
 	x, q, k, v      []float32 // [seq×H]
 	ctxOut, attnOut []float32 // [seq×H]
 	ffnOut          []float32 // [seq×H]
 	ffnHidden       []float32 // [seq×I]
-	scores          []float32 // [seq×seq]
-	qh, kh, ch      []float32 // [seq×dh]
-	vhT             []float32 // [dh×seq]
+	scores          []float32 // [heads×seq×seq]
+	qh, kh, ch      []float32 // [heads][seq×dh] = [seq×H]
+	vhT             []float32 // [heads][dh×seq] = [H×seq]
 }
 
 // grow reslices buf to n floats, reallocating only when capacity is short.
@@ -72,6 +73,7 @@ func grow(buf []float32, n int) []float32 {
 }
 
 func (s *scratch) resize(seq, H, I, dh int) {
+	heads := H / dh
 	s.x = grow(s.x, seq*H)
 	s.q = grow(s.q, seq*H)
 	s.k = grow(s.k, seq*H)
@@ -80,11 +82,11 @@ func (s *scratch) resize(seq, H, I, dh int) {
 	s.attnOut = grow(s.attnOut, seq*H)
 	s.ffnOut = grow(s.ffnOut, seq*H)
 	s.ffnHidden = grow(s.ffnHidden, seq*I)
-	s.scores = grow(s.scores, seq*seq)
-	s.qh = grow(s.qh, seq*dh)
-	s.kh = grow(s.kh, seq*dh)
-	s.ch = grow(s.ch, seq*dh)
-	s.vhT = grow(s.vhT, dh*seq)
+	s.scores = grow(s.scores, heads*seq*seq)
+	s.qh = grow(s.qh, seq*H)
+	s.kh = grow(s.kh, seq*H)
+	s.ch = grow(s.ch, seq*H)
+	s.vhT = grow(s.vhT, H*seq)
 }
 
 // Load builds a Model from a safetensors file and a validated Config.
@@ -239,28 +241,45 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 		m.matmul(v, x, l.vW, seq, H, H)
 		tensor.AddBias(v, l.vB, seq, H)
 
-		// Scaled dot-product attention, one head at a time.
+		// Scaled dot-product attention, heads fanned out in parallel.
+		// Repack every head first: qh/kh are [heads][seq×dh], vhT is
+		// [heads][dh×seq] so probs·V fits the single MatMul (bT) signature.
 		for h := range heads {
 			off := h * dh
-			// Repack this head's slices: qh,kh are [seq×dh]; vhT is Vᵀ [dh×seq]
-			// so that probs·V fits the single MatMul (bT) signature.
+			qhH := qh[h*seq*dh:]
+			khH := kh[h*seq*dh:]
+			vhTH := vhT[h*dh*seq:]
 			for i := range seq {
-				copy(qh[i*dh:i*dh+dh], q[i*H+off:i*H+off+dh])
-				copy(kh[i*dh:i*dh+dh], k[i*H+off:i*H+off+dh])
+				copy(qhH[i*dh:i*dh+dh], q[i*H+off:i*H+off+dh])
+				copy(khH[i*dh:i*dh+dh], k[i*H+off:i*H+off+dh])
 				for d := range dh {
-					vhT[d*seq+i] = v[i*H+off+d]
+					vhTH[d*seq+i] = v[i*H+off+d]
 				}
 			}
+		}
+		tensor.ParallelFor(heads, func(h int) {
+			qhH := qh[h*seq*dh : (h+1)*seq*dh]
+			khH := kh[h*seq*dh : (h+1)*seq*dh]
+			vhTH := vhT[h*dh*seq : (h+1)*dh*seq]
+			chH := ch[h*seq*dh : (h+1)*seq*dh]
+			sc := scores[h*seq*seq : (h+1)*seq*seq]
+			// The heads ARE the parallelism here, so the serial kernel is
+			// deliberate: nesting MatMulParallel would oversubscribe the
+			// scheduler and make allocation counts depend on seq.
 			// scores = Qh·Khᵀ / √dh; Kh as bT gives exactly Qh·Khᵀ.
-			m.matmul(scores, qh, kh, seq, dh, seq)
-			for i := range scores {
-				scores[i] *= scale
+			tensor.MatMulBlocked(sc, qhH, khH, seq, dh, seq)
+			for i := range sc {
+				sc[i] *= scale
 			}
-			tensor.Softmax(scores, seq, seq)
+			tensor.Softmax(sc, seq, seq)
 			// ch = probs·Vh, with Vhᵀ as the bT operand.
-			m.matmul(ch, scores, vhT, seq, seq, dh)
+			tensor.MatMulBlocked(chH, sc, vhTH, seq, seq, dh)
+		})
+		for h := range heads {
+			off := h * dh
+			chH := ch[h*seq*dh:]
 			for i := range seq {
-				copy(ctxOut[i*H+off:i*H+off+dh], ch[i*dh:i*dh+dh])
+				copy(ctxOut[i*H+off:i*H+off+dh], chH[i*dh:i*dh+dh])
 			}
 		}
 
@@ -273,7 +292,11 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 		// FFN: GELU(x·W1ᵀ+b1)·W2ᵀ+b2 + residual + LayerNorm.
 		m.matmul(ffnHidden, x, l.ffn1W, seq, H, I)
 		tensor.AddBias(ffnHidden, l.ffn1B, seq, I)
-		tensor.GELU(ffnHidden)
+		// GELU's erf is the priciest non-matmul op (seq×I calls); rows fan
+		// out with the same fixed-worker ParallelFor.
+		tensor.ParallelFor(seq, func(i int) {
+			tensor.GELU(ffnHidden[i*I : i*I+I])
+		})
 		m.matmul(ffnOut, ffnHidden, l.ffn2W, seq, I, H)
 		tensor.AddBias(ffnOut, l.ffn2B, seq, H)
 		tensor.Add(x, ffnOut)

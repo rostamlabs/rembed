@@ -6,7 +6,12 @@
 // this package without touching model code.
 package tensor
 
-import "math"
+import (
+	"math"
+	"runtime"
+	"sync"
+	"sync/atomic"
+)
 
 // MatMulFunc computes C[m×n] = A[m×k] · Bᵀ, where bT is the [n×k] row-major
 // transpose of B. This layout is chosen deliberately: HuggingFace stores
@@ -18,7 +23,7 @@ type MatMulFunc func(dst, a, bT []float32, m, k, n int)
 // Default returns the best matmul body for this platform. Model code binds
 // it ONCE at load time (a mutable package variable would race with in-flight
 // forward passes); benchmarks A/B the named implementations directly.
-func Default() MatMulFunc { return MatMulBlocked }
+func Default() MatMulFunc { return MatMulParallel }
 
 // MatMulNaive is the M0 reference body: three plain loops, dot products of
 // contiguous rows.
@@ -65,10 +70,18 @@ func MatMulBlocked(dst, a, bT []float32, m, k, n int) {
 		// corrupted silently instead of panicking like the naive body does.
 		_ = dst[m*n-1]
 	}
+	matMulBlockedCols(dst, a, bT, m, k, n, 0, n)
+}
+
+// matMulBlockedCols is the blocked kernel restricted to output columns
+// [jLo, jHi). Workers on disjoint column ranges write disjoint dst elements,
+// and each element's k-accumulation is unchanged, so a column-partitioned
+// run is bit-identical to a whole-matrix run.
+func matMulBlockedCols(dst, a, bT []float32, m, k, n, jLo, jHi int) {
 	for i0 := 0; i0 < m; i0 += blockM {
 		i1 := min(i0+blockM, m)
 		var j int
-		for j = 0; j+blockN <= n; j += blockN {
+		for j = jLo; j+blockN <= jHi; j += blockN {
 			b0 := bT[(j+0)*k : (j+0)*k+k]
 			b1 := bT[(j+1)*k : (j+1)*k+k]
 			b2 := bT[(j+2)*k : (j+2)*k+k]
@@ -86,7 +99,7 @@ func MatMulBlocked(dst, a, bT []float32, m, k, n int) {
 				d[0], d[1], d[2], d[3] = s0, s1, s2, s3
 			}
 		}
-		for ; j < n; j++ { // n % blockN remainder columns
+		for ; j < jHi; j++ { // remainder columns of this range
 			br := bT[j*k : j*k+k]
 			for i := i0; i < i1; i++ {
 				ar := a[i*k : i*k+k]
@@ -98,6 +111,74 @@ func MatMulBlocked(dst, a, bT []float32, m, k, n int) {
 			}
 		}
 	}
+}
+
+// ParallelFor runs fn(u) for every u in [0, units), fanned out over exactly
+// GOMAXPROCS goroutines pulling unit indexes from an atomic counter. The
+// worker count is deliberately NOT scaled to units: a fixed fan-out keeps
+// the per-call allocation count constant (the alloc-regression test relies
+// on allocations being independent of sequence length) and the atomic
+// counter load-balances uneven units for free. units <= 1 runs inline.
+func ParallelFor(units int, fn func(u int)) {
+	if units <= 1 {
+		for u := range units {
+			fn(u)
+		}
+		return
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers == 1 {
+		for u := range units {
+			fn(u)
+		}
+		return
+	}
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for {
+				u := int(next.Add(1)) - 1
+				if u >= units {
+					return
+				}
+				fn(u)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// parallelCols is the column-block width MatMulParallel hands each unit:
+// blockN-aligned, and — with k ≥ 384 in every model matmul — comfortably
+// more work (~100 µs) than the per-unit overhead.
+const parallelCols = 64
+
+// minParallelWork is the matmul size (m·k·n multiply-adds) below which
+// spawning workers costs more than it saves; smaller calls run inline.
+const minParallelWork = 1 << 20
+
+// MatMulParallel is the M2 body: MatMulBlocked with the output columns
+// partitioned into 64-wide blocks executed via ParallelFor. Workers own
+// disjoint column ranges (disjoint dst writes, no synchronization beyond
+// the final wait), and each element's k-accumulation is untouched, so the
+// result is bit-identical to MatMulBlocked.
+func MatMulParallel(dst, a, bT []float32, m, k, n int) {
+	if m*n > 0 {
+		_ = dst[m*n-1] // same fail-fast as MatMulBlocked
+	}
+	if m*k*n < minParallelWork || n < 2*parallelCols {
+		matMulBlockedCols(dst, a, bT, m, k, n, 0, n)
+		return
+	}
+	units := (n + parallelCols - 1) / parallelCols
+	ParallelFor(units, func(u int) {
+		jLo := u * parallelCols
+		jHi := min(jLo+parallelCols, n)
+		matMulBlockedCols(dst, a, bT, m, k, n, jLo, jHi)
+	})
 }
 
 // AddBias adds bias (length n) to each of the m rows of x.

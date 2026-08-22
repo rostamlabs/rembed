@@ -52,9 +52,10 @@ def bench_onnx(model_id: str, text: str, runs: int, warmup: int, threads: int) -
 
     tok = AutoTokenizer.from_pretrained(model_id)
     so = ort.SessionOptions()
-    # Pin ORT's pools: the Go engine is single-threaded until M2, so the
-    # like-for-like baseline is 1; pass --onnx-threads 0 for ORT's default
-    # all-cores pool (report which one a number came from!).
+    # ORT thread pool control. Since M2 the Go engine is multithreaded, so
+    # the like-for-like default is ORT's own default all-cores pool (0);
+    # pin to 1 for single-core kernel-quality comparisons (report which
+    # configuration a number came from!).
     if threads > 0:
         so.intra_op_num_threads = threads
         so.inter_op_num_threads = 1
@@ -96,8 +97,8 @@ def main() -> None:
     ap.add_argument("--text", default=DEFAULT_TEXT)
     ap.add_argument("--runs", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--onnx-threads", type=int, default=1,
-                    help="ORT intra-op threads (1 = like-for-like vs single-threaded Go; 0 = ORT default pool)")
+    ap.add_argument("--onnx-threads", type=int, default=0,
+                    help="ORT intra-op threads (0 = default pool, like-for-like since M2's parallelism; 1 = single-core kernel comparison)")
     args = ap.parse_args()
     if args.runs <= 0 or args.warmup < 0:
         raise SystemExit("--runs must be > 0 and --warmup >= 0")
