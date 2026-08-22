@@ -14,3 +14,6 @@ models/.venv/
 # Editors
 .idea/
 .vscode/
+
+# OMC session state (local tooling)
+.omc/
