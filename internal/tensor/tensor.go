@@ -20,10 +20,17 @@ import (
 // contiguous rows.
 type MatMulFunc func(dst, a, bT []float32, m, k, n int)
 
-// Default returns the best matmul body for this platform. Model code binds
-// it ONCE at load time (a mutable package variable would race with in-flight
-// forward passes); benchmarks A/B the named implementations directly.
-func Default() MatMulFunc { return MatMulParallel }
+// Default returns the best matmul body for this platform: the AVX2+FMA
+// SIMD kernel where the CPU supports it, the scalar parallel kernel
+// otherwise. Model code binds it ONCE at load time (a mutable package
+// variable would race with in-flight forward passes); benchmarks A/B the
+// named implementations directly.
+func Default() MatMulFunc {
+	if hasSIMD {
+		return MatMulSIMD
+	}
+	return MatMulParallel
+}
 
 // MatMulNaive is the M0 reference body: three plain loops, dot products of
 // contiguous rows.
@@ -194,6 +201,73 @@ func MatMulParallel(dst, a, bT []float32, m, k, n int) {
 		// A row block is contiguous in dst and a, so the row range is just
 		// a sub-slice; the kernel's own i-tiling sees a single tile.
 		matMulBlockedCols(dst[i0*n:i1*n], a[i0*k:i1*k], bT, i1-i0, k, n, jLo, jHi)
+	})
+}
+
+// matMulSIMDCols is matMulBlockedCols with the 1×4 micro-kernel replaced by
+// the AVX2+FMA dot4 primitive. Same tiling, same remainder handling; the
+// only numeric difference is dot4's 8-lane accumulation order (within fp32
+// rounding of the scalar kernels, not bit-identical).
+func matMulSIMDCols(dst, a, bT []float32, m, k, n, jLo, jHi int) {
+	for i0 := 0; i0 < m; i0 += blockM {
+		i1 := min(i0+blockM, m)
+		var j int
+		for j = jLo; j+blockN <= jHi; j += blockN {
+			b0 := bT[(j+0)*k : (j+0)*k+k]
+			b1 := bT[(j+1)*k : (j+1)*k+k]
+			b2 := bT[(j+2)*k : (j+2)*k+k]
+			b3 := bT[(j+3)*k : (j+3)*k+k]
+			for i := i0; i < i1; i++ {
+				ar := a[i*k : i*k+k]
+				dot4AVX2(&dst[i*n+j], &ar[0], &b0[0], &b1[0], &b2[0], &b3[0], k)
+			}
+		}
+		for ; j < jHi; j++ { // remainder columns of this range (scalar)
+			br := bT[j*k : j*k+k]
+			for i := i0; i < i1; i++ {
+				ar := a[i*k : i*k+k]
+				var s float32
+				for p, av := range ar {
+					s += av * br[p]
+				}
+				dst[i*n+j] = s
+			}
+		}
+	}
+}
+
+// MatMulSIMD is the M3 body: the AVX2+FMA dot kernel under the same 2-D
+// output partition and per-unit gate as MatMulParallel. Falls back to the
+// scalar parallel body when the CPU lacks AVX2/FMA (or k is 0, which the
+// asm loop structure has no reason to special-case).
+func MatMulSIMD(dst, a, bT []float32, m, k, n int) {
+	if !hasSIMD || k == 0 {
+		MatMulParallel(dst, a, bT, m, k, n)
+		return
+	}
+	if m*n > 0 {
+		_ = dst[m*n-1] // same fail-fast as MatMulBlocked
+	}
+	rowTiles := (m + blockM - 1) / blockM
+	colBlocks := (n + parallelCols - 1) / parallelCols
+	units := rowTiles * colBlocks
+	perUnit := min(m, blockM) * k * min(n, parallelCols)
+	// Same gate as the scalar path. The SIMD kernel shrinks a unit's work
+	// ~6×, but raising the gate proportionally would flip short-sequence
+	// projections back to serial — the regression the M2 review caught —
+	// and at the gate boundary the fan-out still wins (a seq=3 projection
+	// is ~36 µs serial vs ~10 µs fanned out). It also keeps allocation
+	// counts seq-independent, which the alloc test enforces.
+	if units < 2 || perUnit < minUnitWork {
+		matMulSIMDCols(dst, a, bT, m, k, n, 0, n)
+		return
+	}
+	ParallelFor(units, func(u int) {
+		i0 := (u / colBlocks) * blockM
+		i1 := min(i0+blockM, m)
+		jLo := (u % colBlocks) * parallelCols
+		jHi := min(jLo+parallelCols, n)
+		matMulSIMDCols(dst[i0*n:i1*n], a[i0*k:i1*k], bT, i1-i0, k, n, jLo, jHi)
 	})
 }
 

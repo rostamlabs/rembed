@@ -133,3 +133,42 @@ around 4 in-flight requests (~190 embeds/s on 20 cores) and higher
 concurrency mostly buys tail latency. The 9.6× figure is single-request
 latency. A worker-cap option on Load is the natural M3+ knob if a server
 workload needs it.
+
+## M3 — AVX2 SIMD matmul (2026-08-22)
+
+Hand-written plan9 asm (the kickoff allowed avo or hand-written; the whole
+kernel is one dot4 primitive): 8-lane FMA accumulators over four bT rows
+per call, sharing every load of the A row, with a scalar tail folded in
+AFTER the ymm→xmm reduction (VEX xmm writes zero the upper lanes — the
+first version lost half the vector sum on any k%8≠0 and the float64
+reference sweep caught it immediately). Same 2-D partition and per-unit
+gate as the scalar path; CPU detection via golang.org/x/sys/cpu, scalar
+fallback everywhere else. SIMD accumulation order differs from the scalar
+kernels (horizontal reduction), so it is held to the relative-tolerance
+checks, not bit-identity; golden cases still match ONNX within 1e-4.
+
+Kernel (same-session A/B, median of 3×30):
+
+| shape | parallel (scalar) | SIMD | delta |
+|-------|-------------------|------|-------|
+| 128×384·384×1536 | 2.97 ms | 0.75 ms | 4.0× |
+| 12×384·384×384 | 176 µs | 47 µs | 3.8× |
+| 3×384·384×384 | 55 µs | 24 µs | 2.3× |
+
+End-to-end (same session):
+
+| config | median | note |
+|--------|--------|------|
+| seq=12, all cores | **4.5 ms** (compare.py: 4.8 ms, spread 57%, FLAGged) | was 17.4 ms at M2 → **3.9×** |
+| seq=3, all cores | 2.5 ms | was 4.4 ms |
+| seq=12, GOMAXPROCS=1 | 9.9 ms (spread 4.2%) | M0 was 122 ms serial → 12.3× per-core |
+| ONNX default pool | 1.5 ms | |
+| ONNX 1 thread | ~3.8–6.1 ms (this box, unstable) | |
+
+**ours/onnx ≈ 3.3× against ORT's default pool — the M3 target ("within
+~2–3× of ONNX Runtime") is hit at its edge, with both order-median FLAGs
+firing.** Ladder to date in that configuration: ~45× → ~25× → 9.6× →
+3.3×. Single-core, rembed is within ~1.6–2.6× of pinned ORT. This is the
+rung DESIGN.md says needs a pinned cloud box before any publishable claim;
+these laptop numbers remain relative-only, and the remaining gap is now of
+the same magnitude as this machine's own noise floor.

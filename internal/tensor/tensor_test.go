@@ -35,11 +35,29 @@ func TestMatMulNaiveSmall(t *testing.T) {
 
 // kernels lists every matmul body; each must pass the float64 cross-check
 // below — it is the per-kernel safety net of the optimization ladder.
-var kernels = map[string]MatMulFunc{
-	"naive":    MatMulNaive,
-	"blocked":  MatMulBlocked,
-	"parallel": MatMulParallel,
-}
+// exact marks kernels whose k-accumulation order matches naive (bit-identical
+// on non-FMA-fusing targets); the SIMD kernel reduces 8 lanes horizontally,
+// so it is held to the relative-tolerance check only.
+var kernels = func() map[string]struct {
+	fn    MatMulFunc
+	exact bool
+} {
+	m := map[string]struct {
+		fn    MatMulFunc
+		exact bool
+	}{
+		"naive":    {MatMulNaive, true},
+		"blocked":  {MatMulBlocked, true},
+		"parallel": {MatMulParallel, true},
+	}
+	if hasSIMD {
+		m["simd"] = struct {
+			fn    MatMulFunc
+			exact bool
+		}{MatMulSIMD, false}
+	}
+	return m
+}()
 
 // TestMatMulAgainstFloat64Reference cross-checks every kernel body against a
 // float64 reference on random matrices, over shapes that exercise the
@@ -87,7 +105,7 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 		results := map[string][]float32{}
 		for name, kern := range kernels {
 			got := make([]float32, m*n)
-			kern(got, a, bT, m, k, n)
+			kern.fn(got, a, bT, m, k, n)
 			results[name] = got
 			// fp32 accumulation error grows with k and |value|, so the
 			// tolerance is relative: 1e-5 · (1 + |want|).
@@ -97,18 +115,25 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 				}
 			}
 		}
-		// Cross-kernel check against naive: same accumulation order over k,
-		// so bit-identical where the compiler does not fuse mul+add (amd64);
-		// within tight fp32 tolerance elsewhere. This is a far stronger net
-		// than the float64 tolerance alone.
-		exact := runtime.GOARCH == "amd64"
+		// Cross-kernel check against naive: exact kernels share naive's
+		// accumulation order, so they are bit-identical where the compiler
+		// does not fuse mul+add (amd64); every kernel — the SIMD one
+		// included — must stay within tight fp32 tolerance of naive. This
+		// is a far stronger net than the float64 tolerance alone.
+		bitwise := runtime.GOARCH == "amd64"
 		for name, got := range results {
 			ref := results["naive"]
+			// Reordered-accumulation kernels (SIMD lanes) legitimately
+			// differ from naive by more than exact ones can.
+			tol := 1e-6
+			if !kernels[name].exact {
+				tol = 1e-5
+			}
 			for i := range ref {
-				if exact && got[i] != ref[i] {
+				if bitwise && kernels[name].exact && got[i] != ref[i] {
 					t.Fatalf("%s %dx%dx%d: [%d]=%v differs from naive %v (expected bit-identical on amd64)", name, m, k, n, i, got[i], ref[i])
 				}
-				if d := math.Abs(float64(got[i] - ref[i])); d > 1e-6*(1+math.Abs(float64(ref[i]))) {
+				if d := math.Abs(float64(got[i] - ref[i])); d > tol*(1+math.Abs(float64(ref[i]))) {
 					t.Fatalf("%s %dx%dx%d: [%d]=%v vs naive %v (diff %g)", name, m, k, n, i, got[i], ref[i], d)
 				}
 			}
@@ -202,6 +227,13 @@ func benchMatMul(b *testing.B, kern MatMulFunc) {
 func BenchmarkMatMulNaive(b *testing.B)    { benchMatMul(b, MatMulNaive) }
 func BenchmarkMatMulBlocked(b *testing.B)  { benchMatMul(b, MatMulBlocked) }
 func BenchmarkMatMulParallel(b *testing.B) { benchMatMul(b, MatMulParallel) }
+
+func BenchmarkMatMulSIMD(b *testing.B) {
+	if !hasSIMD {
+		b.Skip("no AVX2+FMA on this CPU")
+	}
+	benchMatMul(b, MatMulSIMD)
+}
 
 func TestParallelForCoversEveryUnitOnce(t *testing.T) {
 	// Sweep GOMAXPROCS so the atomic-counter path is exercised even when
