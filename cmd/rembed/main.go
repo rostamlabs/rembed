@@ -6,6 +6,7 @@
 //	rembed embed    -model DIR [-full] text...
 //	rembed validate -model DIR [-golden FILE] [-tol 1e-4]
 //	rembed bench    -model DIR [-runs 30] [-warmup 5] [-text S]
+//	rembed serve    -model DIR|HF-ID [-addr :8080] [-int8] [-workers N]
 package main
 
 import (
@@ -33,6 +34,8 @@ func main() {
 		err = cmdValidate(os.Args[2:])
 	case "bench":
 		err = cmdBench(os.Args[2:])
+	case "serve":
+		err = cmdServe(os.Args[2:])
 	default:
 		usage()
 	}
@@ -50,7 +53,7 @@ func int8Opts(useInt8 bool) []rembed.Option {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: rembed {embed|validate|bench} -model DIR [flags] [args]")
+	fmt.Fprintln(os.Stderr, "usage: rembed {embed|validate|bench|serve} -model DIR|HF-ID [flags] [args]")
 	os.Exit(2)
 }
 
