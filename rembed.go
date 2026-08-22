@@ -25,9 +25,28 @@ type Embedder struct {
 	m   *model.Model
 }
 
+// Option configures Load.
+type Option func(*loadOptions)
+
+type loadOptions struct {
+	int8 bool
+}
+
+// WithInt8 selects weight-only int8 inference: weights are quantized at
+// load (per-output-channel symmetric scales; activations stay float32),
+// cutting weight memory and per-embed weight traffic 4×. Embeddings differ
+// slightly from fp32 — see the int8 golden test for the measured bound.
+func WithInt8() Option {
+	return func(o *loadOptions) { o.int8 = true }
+}
+
 // Load opens a model directory produced by models/convert.py, containing
 // model.safetensors, vocab.txt, and manifest.json.
-func Load(modelDir string) (*Embedder, error) {
+func Load(modelDir string, opts ...Option) (*Embedder, error) {
+	var o loadOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	cfg, err := model.LoadConfig(filepath.Join(modelDir, "manifest.json"))
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
@@ -41,7 +60,7 @@ func Load(modelDir string) (*Embedder, error) {
 		// otherwise produce silently wrong (or per-call failing) embeddings.
 		return nil, fmt.Errorf("rembed: vocab.txt has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 	}
-	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg)
+	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, o.int8)
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}

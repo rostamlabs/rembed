@@ -22,6 +22,7 @@ import (
 // HuggingFace's [out, in] layout, exactly the bT operand of MatMulFunc.
 type denseWeight struct {
 	packed  *tensor.PackedB
+	packed8 *tensor.PackedB8
 	raw     []float32
 	bias    []float32
 	in, out int
@@ -113,9 +114,16 @@ func (s *scratch) resize(seq, H, I, dh int) {
 }
 
 // newDense builds a denseWeight, packing eagerly where the SIMD gemm can
-// consume it and keeping the raw bT layout otherwise. The two layouts are
-// never both retained.
-func newDense(raw, bias []float32, in, out int) denseWeight {
+// consume it and keeping the raw bT layout otherwise. Only one layout is
+// ever retained. quantize selects weight-only int8 (per-channel symmetric;
+// activations stay float32): 4× less weight traffic on a pass bound by
+// streaming weights, at the cost of the weights' 8-bit rounding.
+func newDense(raw, bias []float32, in, out int, quantize bool) denseWeight {
+	if quantize {
+		if pb, err := tensor.PackB8(raw, in, out); err == nil {
+			return denseWeight{packed8: pb, bias: bias, in: in, out: out}
+		}
+	}
 	if pb, err := tensor.PackB(raw, in, out); err == nil {
 		return denseWeight{packed: pb, bias: bias, in: in, out: out}
 	}
@@ -125,7 +133,9 @@ func newDense(raw, bias []float32, in, out int) denseWeight {
 // applyDense computes dst = x·Wᵀ + bias for seq rows. dst must be sized for
 // PackAPad(seq) rows (scratch is); x must hold exactly seq×in floats.
 func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch) {
-	if w.packed != nil {
+	if w.packed8 != nil {
+		tensor.MatMulPacked8(dst, x, w.packed8, seq, s.aPack[:tensor.PackAPad(seq)*w.in], s.pool)
+	} else if w.packed != nil {
 		tensor.MatMulPacked(dst, x, w.packed, seq, s.aPack[:tensor.PackAPad(seq)*w.in], s.pool)
 	} else {
 		m.matmul(dst, x, w.raw, seq, w.in, w.out)
@@ -135,8 +145,9 @@ func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch
 
 // Load builds a Model from a safetensors file and a validated Config.
 // Tensor names follow HuggingFace BertModel conventions, with or without a
-// leading "bert." prefix.
-func Load(weightsPath string, cfg Config) (*Model, error) {
+// leading "bert." prefix. quantize selects weight-only int8 inference (see
+// newDense).
+func Load(weightsPath string, cfg Config, quantize bool) (*Model, error) {
 	tensors, err := safetensors.Load(weightsPath)
 	if err != nil {
 		return nil, err
@@ -232,10 +243,10 @@ func Load(weightsPath string, cfg Config) (*Model, error) {
 		qkvW = append(append(append(qkvW, raw.qW...), raw.kW...), raw.vW...)
 		qkvB := make([]float32, 0, 3*H)
 		qkvB = append(append(append(qkvB, raw.qB...), raw.kB...), raw.vB...)
-		l.qkv = newDense(qkvW, qkvB, H, 3*H)
-		l.attnOut = newDense(raw.attnOutW, raw.attnOutB, H, H)
-		l.ffn1 = newDense(raw.ffn1W, raw.ffn1B, H, I)
-		l.ffn2 = newDense(raw.ffn2W, raw.ffn2B, I, H)
+		l.qkv = newDense(qkvW, qkvB, H, 3*H, quantize)
+		l.attnOut = newDense(raw.attnOutW, raw.attnOutB, H, H, quantize)
+		l.ffn1 = newDense(raw.ffn1W, raw.ffn1B, H, I, quantize)
+		l.ffn2 = newDense(raw.ffn2W, raw.ffn2B, I, H, quantize)
 	}
 
 	// token_type_embeddings may have any first dimension; only row 0 is used.

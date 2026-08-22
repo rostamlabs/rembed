@@ -23,3 +23,9 @@ func dot4AVX2(dst, a, b0, b1, b2, b3 *float32, k int)
 //
 //go:noescape
 func gemm4x16(dst *float32, n int, pa, pb *float32, k int)
+
+// gemm4x16i8 is gemm4x16 over an int8 B panel with per-column dequant
+// scales applied in the epilogue (implemented in gemm8_amd64.s). k >= 1.
+//
+//go:noescape
+func gemm4x16i8(dst *float32, n int, pa *float32, pb *int8, k int, scales *float32)

@@ -154,6 +154,7 @@ func cmdBench(args []string) error {
 	modelDir := fs.String("model", "models/all-MiniLM-L6-v2", "model directory")
 	runs := fs.Int("runs", 30, "measured runs")
 	warmup := fs.Int("warmup", 5, "discarded warm-up runs")
+	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
 	text := fs.String("text", "The quick brown fox jumps over the lazy dog.", "input text")
 	asJSON := fs.Bool("json", false, "emit machine-readable per-run latencies (for bench/compare.py)")
 	_ = fs.Parse(args)
@@ -161,7 +162,11 @@ func cmdBench(args []string) error {
 		return fmt.Errorf("bench: -runs must be > 0 and -warmup >= 0 (got %d, %d)", *runs, *warmup)
 	}
 
-	emb, err := rembed.Load(*modelDir)
+	var opts []rembed.Option
+	if *useInt8 {
+		opts = append(opts, rembed.WithInt8())
+	}
+	emb, err := rembed.Load(*modelDir, opts...)
 	if err != nil {
 		return err
 	}

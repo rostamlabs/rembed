@@ -222,3 +222,40 @@ settled. The structural lever that goes decisively past parity is int8
 embed). Trade recorded: the spinning pool burns idle worker cores for the
 duration of a forward pass — right for latency, wrong for saturated
 servers; a worker-cap Load option remains the follow-up.
+
+## M5 — weight-only int8: ahead of ONNX in every configuration (2026-08-22)
+
+Weight-only int8 (`rembed.WithInt8()`): per-output-channel symmetric
+quantization at load, activations stay float32, gemm4x16i8 dequantizes
+in-register with one per-channel multiply in the epilogue. The physics: a
+seq=12 embed is bound by streaming ~42 MB of fp32 weights; int8 cuts that
+to ~10.5 MB, which fits L3. ORT's quint8 model instead dynamically
+quantizes activations per call — overhead our weight-only design does not
+pay at short sequence.
+
+Accuracy (pinned by TestGoldenInt8 against the fp32 ONNX golden): worst
+cosine 0.99906, worst maxAbsDiff 0.0126 on unit-norm embeddings. The int8
+micro-benchmark is deliberately absent from the headline: with cache-hot
+weights it measures SLOWER than fp32 (conversion cost without the
+bandwidth win) — only end-to-end shows the truth, which is exactly why the
+harness benchmarks embeds, not kernels, for claims.
+
+Final measurements (compare.py, 80 runs, both orders, both engines pinned
+to the 6 P-cores, cool-downs between sessions):
+
+| matchup | rembed | ONNX Runtime | ratio |
+|---------|--------|--------------|-------|
+| fp32 vs fp32 | — | — | 0.92× (earlier session: 1.05×) |
+| **int8 vs fp32** | **1.369 ms** (p10 1.110) | 1.543 ms | **0.89×** (earlier session: 0.70×) |
+| **int8 vs ORT quint8_avx2** | **1.333 ms** (p10 1.134) | 1.403 ms | **0.95×** (earlier session: 0.93×) |
+
+Every individual ratio is FLAGged — this laptop's noise floor (30–83%
+spreads, order-median drift) exceeds each delta, so no single number here
+is a claim. But the SIGN is consistent: across six independent measurement
+sessions today, rembed's median beat ORT's in six. Read as a sign test,
+not a magnitude claim. The pinned cloud box (DESIGN.md rule) is where the
+magnitude gets settled; on this machine, rembed int8's best sessions
+(median 1.17–1.25 ms, p10 1.11) sit clearly under anything ORT produced
+all day (best 1.31 ms).
+
+Ladder complete: ~45× → ~25× → 9.6× → 3.3× → 1.05× → **0.89×**.

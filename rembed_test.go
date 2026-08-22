@@ -102,6 +102,47 @@ func TestEmbedContextCancellation(t *testing.T) {
 	}
 }
 
+// TestGoldenInt8 pins the int8 accuracy contract against the same fp32
+// ONNX reference: weight-only per-channel quantization measured worst
+// maxAbsDiff 0.0126 and worst cosine 0.99906 across the golden set; the
+// bounds below leave ~2× headroom without letting real degradation hide.
+func TestGoldenInt8(t *testing.T) {
+	dir := modelDir(t)
+	raw, err := os.ReadFile("testdata/golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden goldenFile
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	if len(golden.Cases) == 0 {
+		t.Fatal("golden file has no cases")
+	}
+	emb, err := Load(dir, WithInt8())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range golden.Cases {
+		v, err := emb.Embed(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var dot, maxd float64
+		for i, want := range c.Embedding {
+			dot += float64(v[0][i]) * float64(want)
+			if d := math.Abs(float64(v[0][i] - want)); d > maxd {
+				maxd = d
+			}
+		}
+		if maxd > 0.03 || dot < 0.998 {
+			t.Errorf("%.40q: int8 maxAbsDiff=%.4g cosine=%.6f (want <= 0.03, >= 0.998)", c.Text, maxd, dot)
+		} else {
+			t.Logf("%.40q: int8 maxAbsDiff=%.4g cosine=%.6f", c.Text, maxd, dot)
+		}
+	}
+}
+
 // TestEmbedConcurrentMatchesSerial pins two properties of the M2 parallel
 // forward pass at once: determinism (parallel execution must be bit-identical
 // to a serial reference — workers own disjoint outputs and never change
