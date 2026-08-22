@@ -42,6 +42,13 @@ func main() {
 	}
 }
 
+func int8Opts(useInt8 bool) []rembed.Option {
+	if useInt8 {
+		return []rembed.Option{rembed.WithInt8()}
+	}
+	return nil
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: rembed {embed|validate|bench} -model DIR [flags] [args]")
 	os.Exit(2)
@@ -51,12 +58,13 @@ func cmdEmbed(args []string) error {
 	fs := flag.NewFlagSet("embed", flag.ExitOnError)
 	modelDir := fs.String("model", "models/all-MiniLM-L6-v2", "model directory")
 	full := fs.Bool("full", false, "print full vectors as JSON instead of a preview")
+	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
 	_ = fs.Parse(args)
 	texts := fs.Args()
 	if len(texts) == 0 {
 		return fmt.Errorf("embed: no texts given")
 	}
-	emb, err := rembed.Load(*modelDir)
+	emb, err := rembed.Load(*modelDir, int8Opts(*useInt8)...)
 	if err != nil {
 		return err
 	}
@@ -88,9 +96,13 @@ func cmdValidate(args []string) error {
 	fs := flag.NewFlagSet("validate", flag.ExitOnError)
 	modelDir := fs.String("model", "models/all-MiniLM-L6-v2", "model directory")
 	goldenPath := fs.String("golden", "testdata/golden.json", "golden reference file")
-	tol := fs.Float64("tol", 1e-4, "max abs difference tolerance")
+	tol := fs.Float64("tol", 1e-4, "max abs difference tolerance (int8 default: 0.03)")
+	useInt8 := fs.Bool("int8", false, "weight-only int8 inference (loosens default -tol)")
 	force := fs.Bool("force", false, "proceed even if the golden was generated for a different model")
 	_ = fs.Parse(args)
+	if *useInt8 && *tol == 1e-4 {
+		*tol = 0.03 // quantization bound pinned by TestGoldenInt8
+	}
 
 	raw, err := os.ReadFile(*goldenPath)
 	if err != nil {
@@ -103,7 +115,7 @@ func cmdValidate(args []string) error {
 	if len(golden.Cases) == 0 {
 		return fmt.Errorf("golden %s: no cases — refusing to report success on an empty reference", *goldenPath)
 	}
-	emb, err := rembed.Load(*modelDir)
+	emb, err := rembed.Load(*modelDir, int8Opts(*useInt8)...)
 	if err != nil {
 		return err
 	}
@@ -154,6 +166,7 @@ func cmdBench(args []string) error {
 	modelDir := fs.String("model", "models/all-MiniLM-L6-v2", "model directory")
 	runs := fs.Int("runs", 30, "measured runs")
 	warmup := fs.Int("warmup", 5, "discarded warm-up runs")
+	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
 	text := fs.String("text", "The quick brown fox jumps over the lazy dog.", "input text")
 	asJSON := fs.Bool("json", false, "emit machine-readable per-run latencies (for bench/compare.py)")
 	_ = fs.Parse(args)
@@ -161,7 +174,7 @@ func cmdBench(args []string) error {
 		return fmt.Errorf("bench: -runs must be > 0 and -warmup >= 0 (got %d, %d)", *runs, *warmup)
 	}
 
-	emb, err := rembed.Load(*modelDir)
+	emb, err := rembed.Load(*modelDir, int8Opts(*useInt8)...)
 	if err != nil {
 		return err
 	}

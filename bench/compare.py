@@ -27,11 +27,14 @@ DEFAULT_TEXT = "The quick brown fox jumps over the lazy dog."
 
 
 def bench_ours(binary: str, model_dir: str, text: str, runs: int, warmup: int,
-               expect_seq: int) -> list[float]:
+               expect_seq: int, int8: bool = False) -> list[float]:
     """Per-run embed latencies (seconds) from the Go engine, in-process there."""
+    cmd = [binary, "bench", "-model", model_dir, "-runs", str(runs), "-warmup", str(warmup),
+           "-text", text, "-json"]
+    if int8:
+        cmd.append("-int8")
     out = subprocess.run(
-        [binary, "bench", "-model", model_dir, "-runs", str(runs), "-warmup", str(warmup),
-         "-text", text, "-json"],
+        cmd,
         check=True, capture_output=True, text=True, cwd=REPO_ROOT,
     ).stdout
     payload = json.loads(out)
@@ -45,21 +48,23 @@ def bench_ours(binary: str, model_dir: str, text: str, runs: int, warmup: int,
     return payload["runs_sec"]
 
 
-def bench_onnx(model_id: str, text: str, runs: int, warmup: int, threads: int) -> list[float]:
+def bench_onnx(model_id: str, text: str, runs: int, warmup: int, threads: int,
+               onnx_file: str = "onnx/model.onnx") -> list[float]:
     import onnxruntime as ort
     from huggingface_hub import hf_hub_download
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_id)
     so = ort.SessionOptions()
-    # Pin ORT's pools: the Go engine is single-threaded until M2, so the
-    # like-for-like baseline is 1; pass --onnx-threads 0 for ORT's default
-    # all-cores pool (report which one a number came from!).
+    # ORT thread pool control. Since M2 the Go engine is multithreaded, so
+    # the like-for-like default is ORT's own default all-cores pool (0);
+    # pin to 1 for single-core kernel-quality comparisons (report which
+    # configuration a number came from!).
     if threads > 0:
         so.intra_op_num_threads = threads
         so.inter_op_num_threads = 1
     sess = ort.InferenceSession(
-        hf_hub_download(model_id, "onnx/model.onnx"), so, providers=["CPUExecutionProvider"]
+        hf_hub_download(model_id, onnx_file), so, providers=["CPUExecutionProvider"]
     )
     input_names = {i.name for i in sess.get_inputs()}
     enc = tok(text, truncation=True, max_length=512)
@@ -96,8 +101,12 @@ def main() -> None:
     ap.add_argument("--text", default=DEFAULT_TEXT)
     ap.add_argument("--runs", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--onnx-threads", type=int, default=1,
-                    help="ORT intra-op threads (1 = like-for-like vs single-threaded Go; 0 = ORT default pool)")
+    ap.add_argument("--ours-int8", action="store_true",
+                    help="run the Go engine with weight-only int8 (-int8)")
+    ap.add_argument("--onnx-file", default="onnx/model.onnx",
+                    help="ONNX graph to benchmark (e.g. onnx/model_quint8_avx2.onnx for ORT's int8)")
+    ap.add_argument("--onnx-threads", type=int, default=0,
+                    help="ORT intra-op threads (0 = default pool, like-for-like since M2's parallelism; 1 = single-core kernel comparison)")
     args = ap.parse_args()
     if args.runs <= 0 or args.warmup < 0:
         raise SystemExit("--runs must be > 0 and --warmup >= 0")
@@ -116,11 +125,11 @@ def main() -> None:
     for order in ("us-then-onnx", "onnx-then-us"):
         print(f"order: {order}")
         if order == "us-then-onnx":
-            results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup, hf_seq))
-            results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup, args.onnx_threads))
+            results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup, hf_seq, args.ours_int8))
+            results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup, args.onnx_threads, args.onnx_file))
         else:
-            results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup, args.onnx_threads))
-            results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup, hf_seq))
+            results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup, args.onnx_threads, args.onnx_file))
+            results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup, hf_seq, args.ours_int8))
         summarize("ours", results["ours"][-1])
         summarize("onnx", results["onnx"][-1])
 

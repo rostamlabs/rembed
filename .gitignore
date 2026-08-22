@@ -17,3 +17,8 @@ models/.venv/
 
 # OMC session state (local tooling)
 .omc/
+
+# Python binding build artifacts
+python/rembed/librembed.so
+python/rembed/librembed.h
+python/rembed/__pycache__/

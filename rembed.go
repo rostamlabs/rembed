@@ -18,16 +18,57 @@ import (
 )
 
 // Embedder turns texts into fixed-size embedding vectors. It is safe for
-// concurrent use.
+// concurrent use. Latency is the default optimization target: each Embed
+// call fans out across up to GOMAXPROCS cores and keeps a spinning worker
+// pool for its duration, which trades idle-core burn for wall time — see
+// WithWorkers to cap that for throughput-saturated servers.
 type Embedder struct {
 	cfg model.Config
 	tok *tokenizer.Tokenizer
 	m   *model.Model
 }
 
+// Option configures Load.
+type Option func(*loadOptions)
+
+type loadOptions struct {
+	int8    bool
+	workers int
+}
+
+// WithInt8 selects weight-only int8 inference: transformer dense weights
+// are quantized at load (per-output-channel symmetric scales; activations
+// stay float32), cutting per-embed weight traffic ~4× (~42 MB → ~10.5 MB
+// for MiniLM). Token embeddings stay fp32, so RESIDENT model memory drops
+// ~1.5×, not 4×. Embeddings differ slightly from fp32 — see the int8
+// golden test for the measured bound. On CPUs without AVX2+FMA the engine
+// silently falls back to fp32; check Quantized() when the mode matters.
+func WithInt8() Option {
+	return func(o *loadOptions) { o.int8 = true }
+}
+
+// WithWorkers caps the number of CPU workers one Embed call uses.
+// The default (0) uses GOMAXPROCS, minimizing single-request latency by
+// keeping every core busy — including a spinning fork-join pool that burns
+// idle-core cycles for the duration of each call (~10× the useful CPU at
+// low concurrency). A server saturating many concurrent Embed calls should
+// set a small cap; WithWorkers(1) is fully serial with zero spinning.
+//
+// The cap governs the packed SIMD path (every matmul on amd64+AVX2) and
+// the attention/GELU fan-outs. The unpacked fallback matmul (non-amd64, or
+// weight shapes the packer rejects) currently parallelizes via an uncapped
+// ParallelFor and may exceed the cap there.
+func WithWorkers(n int) Option {
+	return func(o *loadOptions) { o.workers = n }
+}
+
 // Load opens a model directory produced by models/convert.py, containing
 // model.safetensors, vocab.txt, and manifest.json.
-func Load(modelDir string) (*Embedder, error) {
+func Load(modelDir string, opts ...Option) (*Embedder, error) {
+	var o loadOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	cfg, err := model.LoadConfig(filepath.Join(modelDir, "manifest.json"))
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
@@ -41,7 +82,7 @@ func Load(modelDir string) (*Embedder, error) {
 		// otherwise produce silently wrong (or per-call failing) embeddings.
 		return nil, fmt.Errorf("rembed: vocab.txt has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 	}
-	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg)
+	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, o.int8, o.workers)
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
@@ -81,6 +122,11 @@ func (e *Embedder) Tokenize(text string) []int64 {
 
 // Model returns the model name from the manifest.
 func (e *Embedder) Model() string { return e.cfg.Name }
+
+// Quantized reports whether the weight-only int8 path is actually active
+// (WithInt8 requested AND every dense weight packed as int8 — the engine
+// falls back to fp32 per-matrix when the CPU or a shape cannot take it).
+func (e *Embedder) Quantized() bool { return e.m.Quantized() }
 
 // Dim returns the embedding dimensionality.
 func (e *Embedder) Dim() int { return e.cfg.HiddenSize }

@@ -28,6 +28,28 @@ This writes `models/all-MiniLM-L6-v2/{model.safetensors, vocab.txt, manifest.jso
 and regenerates `testdata/golden.json` (ONNX Runtime reference outputs used
 by the validation harness).
 
+## Python
+
+The same in-process engine is callable from Python through a C-shared
+build (ctypes, ~µs call overhead; the Go library itself stays cgo-free —
+the shared object is a separate artifact for foreign callers):
+
+```sh
+python/build.sh   # needs a C toolchain; produces python/rembed/librembed.so
+```
+
+```python
+import sys; sys.path.insert(0, "python")
+from rembed import Embedder
+
+emb = Embedder("models/all-MiniLM-L6-v2")           # fp32
+emb = Embedder("models/all-MiniLM-L6-v2", int8=True)  # weight-only int8
+vecs = emb.embed(["hello world"])                    # (n, dim) float32 numpy
+```
+
+Validated against the same golden reference as the Go tests
+(`python/test_rembed.py`); vectors cross the ABI bit-identically.
+
 ## CLI
 
 ```sh

@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/rand"
 	"runtime"
+	"sync/atomic"
 	"testing"
 )
 
@@ -34,10 +35,29 @@ func TestMatMulNaiveSmall(t *testing.T) {
 
 // kernels lists every matmul body; each must pass the float64 cross-check
 // below — it is the per-kernel safety net of the optimization ladder.
-var kernels = map[string]MatMulFunc{
-	"naive":   MatMulNaive,
-	"blocked": MatMulBlocked,
-}
+// exact marks kernels whose k-accumulation order matches naive (bit-identical
+// on non-FMA-fusing targets); the SIMD kernel reduces 8 lanes horizontally,
+// so it is held to the relative-tolerance check only.
+var kernels = func() map[string]struct {
+	fn    MatMulFunc
+	exact bool
+} {
+	m := map[string]struct {
+		fn    MatMulFunc
+		exact bool
+	}{
+		"naive":    {MatMulNaive, true},
+		"blocked":  {MatMulBlocked, true},
+		"parallel": {MatMulParallel, true},
+	}
+	if hasSIMD {
+		m["simd"] = struct {
+			fn    MatMulFunc
+			exact bool
+		}{MatMulSIMD, false}
+	}
+	return m
+}()
 
 // TestMatMulAgainstFloat64Reference cross-checks every kernel body against a
 // float64 reference on random matrices, over shapes that exercise the
@@ -53,6 +73,14 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 		{2 * blockM, 8, 4},    // exact tile boundaries
 		{2*blockM + 7, 33, 7}, // multiple full i-tiles PLUS both remainders
 		{3, 5, blockN - 1},    // n smaller than the micro-kernel
+		// Shapes that clear MatMulParallel's per-unit gate with awkward
+		// column remainders, so the parallel path's partial final column
+		// block is pinned (the model's own dims are all 64-aligned and
+		// would never catch it):
+		{blockM, 384, 129},
+		{blockM + 6, 400, 191},
+		{2, 384, 384}, // tiny m through the parallel path (per-unit gate)
+		{5, 20, 9},    // SIMD path with k%8=4: vector loop + a multi-element scalar tail
 	}
 	rng := rand.New(rand.NewSource(42))
 	for _, sh := range shapes {
@@ -78,7 +106,7 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 		results := map[string][]float32{}
 		for name, kern := range kernels {
 			got := make([]float32, m*n)
-			kern(got, a, bT, m, k, n)
+			kern.fn(got, a, bT, m, k, n)
 			results[name] = got
 			// fp32 accumulation error grows with k and |value|, so the
 			// tolerance is relative: 1e-5 · (1 + |want|).
@@ -88,18 +116,25 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 				}
 			}
 		}
-		// Cross-kernel check against naive: same accumulation order over k,
-		// so bit-identical where the compiler does not fuse mul+add (amd64);
-		// within tight fp32 tolerance elsewhere. This is a far stronger net
-		// than the float64 tolerance alone.
-		exact := runtime.GOARCH == "amd64"
+		// Cross-kernel check against naive: exact kernels share naive's
+		// accumulation order, so they are bit-identical where the compiler
+		// does not fuse mul+add (amd64); every kernel — the SIMD one
+		// included — must stay within tight fp32 tolerance of naive. This
+		// is a far stronger net than the float64 tolerance alone.
+		bitwise := runtime.GOARCH == "amd64"
 		for name, got := range results {
 			ref := results["naive"]
+			// Reordered-accumulation kernels (SIMD lanes) legitimately
+			// differ from naive by more than exact ones can.
+			tol := 1e-6
+			if !kernels[name].exact {
+				tol = 1e-5
+			}
 			for i := range ref {
-				if exact && got[i] != ref[i] {
+				if bitwise && kernels[name].exact && got[i] != ref[i] {
 					t.Fatalf("%s %dx%dx%d: [%d]=%v differs from naive %v (expected bit-identical on amd64)", name, m, k, n, i, got[i], ref[i])
 				}
-				if d := math.Abs(float64(got[i] - ref[i])); d > 1e-6*(1+math.Abs(float64(ref[i]))) {
+				if d := math.Abs(float64(got[i] - ref[i])); d > tol*(1+math.Abs(float64(ref[i]))) {
 					t.Fatalf("%s %dx%dx%d: [%d]=%v vs naive %v (diff %g)", name, m, k, n, i, got[i], ref[i], d)
 				}
 			}
@@ -140,11 +175,18 @@ func TestLayerNorm(t *testing.T) {
 }
 
 func TestGELU(t *testing.T) {
-	x := []float32{0, 1, -1, 2}
+	// Reference in float64 with exact erf; the fast float32 erf is within
+	// ~3e-7, so 1e-6 absolute over this range.
+	x := make([]float32, 0, 100)
+	for v := float32(-6); v <= 6; v += 0.25 {
+		x = append(x, v)
+	}
+	want := make([]float32, len(x))
+	for i, v := range x {
+		want[i] = float32(0.5 * float64(v) * (1 + math.Erf(float64(v)/math.Sqrt2)))
+	}
 	GELU(x)
-	ref := func(v float64) float32 { return float32(0.5 * v * (1 + math.Erf(v/math.Sqrt2))) }
-	want := []float32{0, ref(1), ref(-1), ref(2)}
-	almostEqual(t, x, want, 1e-7, "gelu")
+	almostEqual(t, x, want, 1e-6, "gelu")
 }
 
 func TestL2Normalize(t *testing.T) {
@@ -168,7 +210,9 @@ func TestAddBiasAndAdd(t *testing.T) {
 // pass: the FFN panel at a large seq, and the skinny seq=12 projection that
 // the e2e bench text produces.
 func benchMatMul(b *testing.B, kern MatMulFunc) {
-	for _, sh := range [][3]int{{128, 384, 1536}, {12, 384, 384}} {
+	// FFN panel at large seq, the seq=12 projection, and the short-query
+	// projections that defend the per-unit parallelization gate.
+	for _, sh := range [][3]int{{128, 384, 1536}, {12, 384, 384}, {3, 384, 384}, {1, 384, 384}} {
 		m, k, n := sh[0], sh[1], sh[2]
 		b.Run(fmt.Sprintf("%dx%dx%d", m, k, n), func(b *testing.B) {
 			a := make([]float32, m*k)
@@ -188,5 +232,47 @@ func benchMatMul(b *testing.B, kern MatMulFunc) {
 	}
 }
 
-func BenchmarkMatMulNaive(b *testing.B)   { benchMatMul(b, MatMulNaive) }
-func BenchmarkMatMulBlocked(b *testing.B) { benchMatMul(b, MatMulBlocked) }
+func BenchmarkMatMulNaive(b *testing.B)    { benchMatMul(b, MatMulNaive) }
+func BenchmarkMatMulBlocked(b *testing.B)  { benchMatMul(b, MatMulBlocked) }
+func BenchmarkMatMulParallel(b *testing.B) { benchMatMul(b, MatMulParallel) }
+
+func BenchmarkMatMulSIMD(b *testing.B) {
+	if !hasSIMD {
+		b.Skip("no AVX2+FMA on this CPU")
+	}
+	benchMatMul(b, MatMulSIMD)
+}
+
+func TestParallelForCoversEveryUnitOnce(t *testing.T) {
+	// Sweep GOMAXPROCS so the atomic-counter path is exercised even when
+	// the test host has few cores, including units < workers.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
+	for _, procs := range []int{1, 2, 4, 16} {
+		runtime.GOMAXPROCS(procs)
+		for _, units := range []int{0, 1, 2, 3, 7, 64, 1000} {
+			hits := make([]atomic.Int32, units)
+			ParallelFor(units, func(u int) { hits[u].Add(1) })
+			for u := range hits {
+				if got := hits[u].Load(); got != 1 {
+					t.Fatalf("procs=%d units=%d: unit %d executed %d times", procs, units, u, got)
+				}
+			}
+		}
+	}
+}
+
+func TestParallelForPropagatesPanic(t *testing.T) {
+	// A worker panic must surface on the calling goroutine (where the
+	// host's recover can handle it), not kill the process.
+	defer func() {
+		if r := recover(); r != "boom" {
+			t.Fatalf("recovered %v, want \"boom\"", r)
+		}
+	}()
+	ParallelFor(64, func(u int) {
+		if u == 13 {
+			panic("boom")
+		}
+	})
+	t.Fatal("ParallelFor returned instead of panicking")
+}
