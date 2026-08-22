@@ -508,6 +508,12 @@ func TestEmbedConcurrentMatchesSerial(t *testing.T) {
 // buffer per call, fails that immediately). GC is pinned off so a
 // mid-measurement pool drain can't flake the run.
 func TestEmbedSteadyStateAllocs(t *testing.T) {
+	if raceDetectorEnabled {
+		// The detector's shadow memory and the pool's race-mode sleep
+		// polling both perturb alloc counts (measured 97 vs the 96 bound).
+		// The efficiency contract is enforced by every non-race run.
+		t.Skip("alloc counts are not meaningful under the race detector")
+	}
 	dir := modelDir(t)
 	emb, err := Load(dir)
 	if err != nil {
