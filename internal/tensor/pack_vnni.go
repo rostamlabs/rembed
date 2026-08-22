@@ -25,8 +25,8 @@ type PackedB8V struct {
 // preconditions as PackB8: n%16==0, n>=16, k>=1, finite weights, and the
 // CPU must have AVX-VNNI.
 func PackB8VNNI(bT []float32, k, n int) (*PackedB8V, error) {
-	if !hasVNNI {
-		return nil, fmt.Errorf("tensor: PackB8VNNI requires AVX-VNNI on this CPU")
+	if !hasVNNI && !hasVNNI512 {
+		return nil, fmt.Errorf("tensor: PackB8VNNI requires AVX-VNNI or AVX-512-VNNI on this CPU")
 	}
 	if n < 16 || n%16 != 0 {
 		return nil, fmt.Errorf("tensor: PackB8VNNI needs n%%16==0 and n>=16, got n=%d", n)
@@ -144,7 +144,13 @@ func MatMulPackedVNNI(dst, a []float32, pb *PackedB8V, m int, qa []uint8, rowSca
 		rp := u / colPanels
 		cp := u % colPanels
 		var acc [64]int32
-		gemm4x16vnni(&acc[0], 16, &qa[rp*4*aBytes], aBytes, &pb.data[cp*kg*64], kg)
+		// Two encodings of the same instruction, disjoint hardware: VEX
+		// for AVX-VNNI clients, EVEX for AVX-512-VNNI servers.
+		if hasVNNI {
+			gemm4x16vnni(&acc[0], 16, &qa[rp*4*aBytes], aBytes, &pb.data[cp*kg*64], kg)
+		} else {
+			gemm4x16vnni512(&acc[0], 16, &qa[rp*4*aBytes], aBytes, &pb.data[cp*kg*64], kg)
+		}
 		// Dequant epilogue: (acc − 128·colSum)·rowScale·colScale. int32
 		// wraparound in acc CANCELS exactly against the correction (both
 		// are exact mod 2^32; the true Σt·w is bounded by 128·128·k), so

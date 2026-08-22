@@ -423,3 +423,44 @@ margins here are 28-36%, far outside the noise band that made the M5
 verdict a sign-test. Weight-only int8 already sat at 0.89× of ONNX
 Runtime fp32; full int8 on VNNI hardware is decisively ahead. R8's
 pinned cloud box remains where the cross-engine magnitude gets settled.
+
+## R8 — Cloud-box cross-engine benchmark (2026-08-23)
+
+The first rembed-vs-ONNX-Runtime numbers from OFF the development
+laptop. Box: a 12-vCPU AMD EPYC Genoa (Zen 4) KVM guest, 2.0 GHz, 22 GB,
+Ubuntu 24.04 (kernel 6.8), single NUMA node — a cloud VM, honestly NOT
+the dedicated bare-metal machine the roadmap idealized. Hypervisor
+jitter is real and the harness's FLAG discipline was in charge
+throughout: every number below comes from bench/compare.py's
+both-orders/warm-up/median protocol, and anything the noise rules
+flagged is reported as parity, not victory.
+
+The box also closed R7's loose end: Zen 4 has AVX-512-VNNI but NOT
+AVX-VNNI, so the EVEX twin of the VNNI kernel (gemm4x16vnni512, Go's
+native VPDPBUSD mnemonics this time) was built and PROVEN here on real
+hardware — bit-exact against the integer reference, and its end-to-end
+full-int8 worst golden cosine is 0.991652, IDENTICAL to the last bit
+with the VEX path on Raptor Lake. Two encodings, two vendors, one
+integer computation. Full int8 now engages on every VNNI-capable CPU.
+
+mpnet-base (the stable workload on this VM; L6's sub-2 ms runs drown in
+hypervisor jitter), three independent rounds, 50-100 runs per order:
+
+| comparison | round ratios (ours/ORT) | verdict |
+|---|---|---|
+| fp32 vs ORT fp32 | 1.08 / 1.13 / 1.07 | parity (ORT nominally ahead, single digits, all FLAGged) |
+| full int8 vs ORT fp32 | 0.78 / 0.59 / 0.70 | **rembed ahead in 3/3 rounds, 22-41%** |
+| full int8 vs ORT qint8-avx512-vnni | 1.16 / 0.97 / 0.95 | parity with ORT's strongest int8 graph |
+
+The headline, stated carefully: on Zen 4 server hardware, pure-Go
+rembed fp32 is at parity with ONNX Runtime fp32; rembed full int8 beats
+ORT fp32 decisively (only one of three rounds was entirely flag-free —
+0.70× — but the sign never flipped); and against ORT's own hand-tuned
+AVX-512-VNNI int8 graphs, rembed trades blows at parity while its VNNI
+kernel is still 256-bit ymm. The obvious remaining headroom on 512-bit
+native parts is a zmm-wide kernel — future work, now with hardware that
+can test it.
+
+L6 on this VM: all four comparisons FLAG-parity (spreads 40-94% on
+sub-2 ms runs); full int8 vs ORT qint8-avx512-vnni measured 0.96×.
+Small-model latencies need quieter hardware than a shared KVM guest.

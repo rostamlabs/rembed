@@ -20,6 +20,12 @@ var (
 	// would need the EVEX form Go emits natively, an untested path this
 	// codebase refuses to ship until hardware is available (R8's box).
 	hasVNNI = hasSIMD && cpu.X86.HasAVXVNNI
+	// hasVNNI512 covers the complementary set: AVX-512-VNNI parts
+	// (Cascade/Ice Lake-SP, Zen 4) where Go's native EVEX VPDPBUSD is
+	// legal (AVX512VL needed for the ymm form). Together the two gates
+	// give full int8 on every VNNI-capable CPU, each with the one
+	// encoding its hardware accepts.
+	hasVNNI512 = hasSIMD && cpu.X86.HasAVX512VNNI && cpu.X86.HasAVX512VL
 )
 
 // dot4 computes dst[0..3] = dot(a, b0..b3) over k floats with 8-lane FMA
@@ -47,3 +53,9 @@ func gemm4x16i8(dst *float32, n int, pa *float32, pb *int8, k int, scales *float
 //
 //go:noescape
 func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int)
+
+// gemm4x16vnni512 is gemm4x16vnni with the EVEX (AVX-512-VNNI) encoding
+// (implemented in vnni512_amd64.s; requires AVX512-VNNI + AVX512VL).
+//
+//go:noescape
+func gemm4x16vnni512(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int)

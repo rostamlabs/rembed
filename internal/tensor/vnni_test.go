@@ -62,8 +62,8 @@ func vnniReference(dst, a, bT []float32, m, k, n int) {
 // reference bit-for-bit across shapes covering k%4 tails, multi-panel n,
 // row padding, and values that graze the u8 clamp rails.
 func TestMatMulPackedVNNIExact(t *testing.T) {
-	if !hasVNNI {
-		t.Skip("no AVX-VNNI on this CPU")
+	if !hasVNNI && !hasVNNI512 {
+		t.Skip("no AVX-VNNI or AVX-512-VNNI on this CPU")
 	}
 	rng := rand.New(rand.NewSource(99))
 	shapes := [][3]int{

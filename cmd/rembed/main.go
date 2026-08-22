@@ -45,6 +45,13 @@ func main() {
 	}
 }
 
+func quantOpts(useInt8, useInt8Act bool) []rembed.Option {
+	if useInt8Act {
+		return []rembed.Option{rembed.WithInt8Activations()}
+	}
+	return int8Opts(useInt8)
+}
+
 func int8Opts(useInt8 bool) []rembed.Option {
 	if useInt8 {
 		return []rembed.Option{rembed.WithInt8()}
@@ -62,12 +69,13 @@ func cmdEmbed(args []string) error {
 	modelDir := fs.String("model", "models/all-MiniLM-L6-v2", "model directory")
 	full := fs.Bool("full", false, "print full vectors as JSON instead of a preview")
 	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
+	useInt8Act := fs.Bool("int8act", false, "full int8 (u8 activations, needs VNNI)")
 	_ = fs.Parse(args)
 	texts := fs.Args()
 	if len(texts) == 0 {
 		return fmt.Errorf("embed: no texts given")
 	}
-	emb, err := rembed.Load(*modelDir, int8Opts(*useInt8)...)
+	emb, err := rembed.Load(*modelDir, quantOpts(*useInt8, *useInt8Act)...)
 	if err != nil {
 		return err
 	}
@@ -170,6 +178,7 @@ func cmdBench(args []string) error {
 	runs := fs.Int("runs", 30, "measured runs")
 	warmup := fs.Int("warmup", 5, "discarded warm-up runs")
 	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
+	useInt8Act := fs.Bool("int8act", false, "full int8 (u8 activations, needs VNNI)")
 	text := fs.String("text", "The quick brown fox jumps over the lazy dog.", "input text")
 	asJSON := fs.Bool("json", false, "emit machine-readable per-run latencies (for bench/compare.py)")
 	_ = fs.Parse(args)
@@ -177,7 +186,7 @@ func cmdBench(args []string) error {
 		return fmt.Errorf("bench: -runs must be > 0 and -warmup >= 0 (got %d, %d)", *runs, *warmup)
 	}
 
-	emb, err := rembed.Load(*modelDir, int8Opts(*useInt8)...)
+	emb, err := rembed.Load(*modelDir, quantOpts(*useInt8, *useInt8Act)...)
 	if err != nil {
 		return err
 	}

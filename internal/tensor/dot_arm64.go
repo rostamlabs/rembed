@@ -9,9 +9,10 @@ package tensor
 // WORD-encoded (the Go assembler lacks SXTL/SCVTF mnemonics) and verified
 // under qemu and CI like everything else.
 const (
-	hasVNNI  = false // x86-only; NEON int8 uses the widening pipeline
-	hasSIMD  = true
-	hasSIMD8 = true
+	hasVNNI    = false
+	hasVNNI512 = false // x86-only; NEON int8 uses the widening pipeline
+	hasSIMD    = true
+	hasSIMD8   = true
 )
 
 // dot4 computes dst[0..3] = dot(a, b0..b3) over k floats
@@ -36,4 +37,8 @@ func gemm4x16i8(dst *float32, n int, pa *float32, pb *int8, k int, scales *float
 
 func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int) {
 	panic("tensor: gemm4x16vnni is amd64-only")
+}
+
+func gemm4x16vnni512(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int) {
+	panic("tensor: gemm4x16vnni512 is amd64-only")
 }
