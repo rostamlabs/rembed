@@ -14,7 +14,9 @@
 // Go's assembler only emits the EVEX (AVX-512-VNNI) encoding for
 // VPDPBUSD, which FAULTS on AVX-VNNI-only CPUs (all consumer Alder/
 // Raptor Lake) — so the eight VPDPBUSD are hand-encoded in their VEX
-// (AVX-VNNI) form. Each encoding was generated field-by-field
+// (AVX-VNNI) form. The converse also holds: this VEX form #UDs on
+// AVX-512-VNNI-only parts (Cascade/Ice Lake-SP, Zen 4), which is why
+// hasVNNI gates on the AVX-VNNI CPUID bit specifically. Each encoding was generated field-by-field
 // (VEX.256.66.0F38.W0 50 /r) and verified byte-for-byte against GNU as's
 // {vex}-prefixed output.
 TEXT ·gemm4x16vnni(SB), NOSPLIT, $0-48

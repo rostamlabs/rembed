@@ -394,10 +394,22 @@ Correctness: the kernel is BIT-EXACT against a pure-Go integer
 reference over every shape class (there is no floating-point rounding to
 hide behind — the accumulation is integers until the epilogue), and
 serial vs parallel outputs are bit-identical (per-row quantization,
-disjoint tiles). Golden accuracy, measured and enforced: worst cosine
-0.9917 (MiniLM-L6), 0.9912 (mpnet), 0.9982 (multilingual MiniLM) — a
-real step below weight-only int8's ≥0.9978, which is why the mode is a
-separate opt-in (WithInt8Activations) rather than a WithInt8 upgrade.
+disjoint tiles). The review additionally proved the no-intermediate-
+saturation semantics adversarially (all four products maximal in every
+lane, k up to 1536: bit-exact), decoded all eight VEX byte sequences
+independently, and showed int32 accumulator wraparound CANCELS exactly
+in the zero-point correction — the true overflow limit is k > 131072,
+~85× past any transformer.
+
+Golden accuracy, measured per model and enforced in the golden matrix:
+worst cosine 0.9917 (MiniLM-L6), 0.9932 (L12), 0.9979 (L3), 0.9912
+(mpnet), 0.9982 (multilingual), 0.9991 (gte) — and 0.9747 for
+distilroberta, where RoBERTa's activation outliers (~2.7× larger row
+absmax, measured) defeat the per-row absmax scheme and short texts
+degrade most. That spread is why the mode is a separate opt-in
+(WithInt8Activations), never a WithInt8 upgrade, and why the README
+carries a per-model table with a RoBERTa warning instead of one blanket
+bound.
 
 Pinned same-machine A/B (taskset 0-11, medians of 200 after warmup):
 

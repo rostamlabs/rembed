@@ -13,8 +13,12 @@ var (
 	hasSIMD  = cpu.X86.HasAVX2 && cpu.X86.HasFMA
 	hasSIMD8 = hasSIMD
 	// hasVNNI gates the u8·s8 VPDPBUSD kernel. AVX-VNNI is the 256-bit
-	// VEX form (Alder Lake 2021 onward, plus every AVX-512-VNNI server
-	// part, which reports it too).
+	// VEX form: Alder Lake (2021) onward on client, Sapphire Rapids
+	// onward on server, Zen 5 onward on AMD. NOTE the trap the review
+	// caught: AVX-512-VNNI parts (Cascade/Ice Lake-SP, Zen 4) do NOT
+	// report AVX-VNNI, and our VEX encoding #UDs there — those CPUs
+	// would need the EVEX form Go emits natively, an untested path this
+	// codebase refuses to ship until hardware is available (R8's box).
 	hasVNNI = hasSIMD && cpu.X86.HasAVXVNNI
 )
 

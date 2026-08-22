@@ -92,6 +92,12 @@ func QuantizeRowU8(dst []uint8, a []float32) float32 {
 	if scale == 0 {
 		scale = 1
 	}
+	// float32 reciprocal ON PURPOSE, unlike the weight path's float64
+	// division: this runs per activation row per matmul (hot), weights
+	// quantize once at load (cold). The double-rounding hazard that
+	// float64 guards against needs subnormal-scale rows, which real
+	// activations never produce — and the test reference mirrors this
+	// exact expression, so bit-exactness is preserved either way.
 	inv := 1 / scale
 	for i, v := range a {
 		q := int32(math.RoundToEven(float64(v*inv))) + 128
@@ -139,7 +145,13 @@ func MatMulPackedVNNI(dst, a []float32, pb *PackedB8V, m int, qa []uint8, rowSca
 		cp := u % colPanels
 		var acc [64]int32
 		gemm4x16vnni(&acc[0], 16, &qa[rp*4*aBytes], aBytes, &pb.data[cp*kg*64], kg)
-		// Dequant epilogue: (acc − 128·colSum)·rowScale·colScale.
+		// Dequant epilogue: (acc − 128·colSum)·rowScale·colScale. int32
+		// wraparound in acc CANCELS exactly against the correction (both
+		// are exact mod 2^32; the true Σt·w is bounded by 128·128·k), so
+		// the real overflow limit is k > 131072 — ~85× past any
+		// transformer dimension. Unlike MatMulPacked8, dst's padding rows
+		// are left unwritten (the row >= m break); every consumer reads
+		// only seq rows.
 		for r := 0; r < 4; r++ {
 			row := rp*4 + r
 			if row >= m {

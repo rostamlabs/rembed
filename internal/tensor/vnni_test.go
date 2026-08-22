@@ -71,8 +71,17 @@ func TestMatMulPackedVNNIExact(t *testing.T) {
 		{4, 8, 16}, {5, 7, 48}, {7, 384, 384}, {12, 384, 1536},
 		{13, 129, 64}, {64, 100, 128},
 	}
-	pool := NewPool(0) // inline
-	defer pool.Stop()
+	// Both an inline pool (deterministic) and a real 4-worker pool: the
+	// review noted the exact test never exercised the parallel path.
+	for _, workers := range []int{0, 4} {
+		pool := NewPool(workers)
+		runShapes(t, rng, shapes, pool)
+		pool.Stop()
+	}
+}
+
+func runShapes(t *testing.T, rng *rand.Rand, shapes [][3]int, pool *Pool) {
+	t.Helper()
 	for _, sh := range shapes {
 		m, k, n := sh[0], sh[1], sh[2]
 		a := make([]float32, m*k)

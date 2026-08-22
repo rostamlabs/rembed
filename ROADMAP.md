@@ -81,7 +81,10 @@ ignores it.
 ## R7 — AVX-VNNI full int8 (u8 activations × s8 weights) ✅
 Done — adapted to real hardware: consumer Alder/Raptor Lake has no
 AVX-512, so the rung targets AVX-VNNI, the 256-bit VEX form of VPDPBUSD
-(present 2021 onward, and reported by every AVX-512-VNNI server too).
+(Alder Lake+ client, Sapphire Rapids+ server, Zen 5+). AVX-512-VNNI-only
+parts (Cascade/Ice Lake-SP, Zen 4) do NOT report it and take the
+weight-only fallback; the EVEX path is future work for hardware that can
+actually test it.
 Go's assembler only emits the EVEX encoding — which FAULTS without
 AVX-512 — so the eight VPDPBUSD are hand-encoded VEX bytes, generated
 field-by-field and verified against GNU as's {vex} output (the amd64
@@ -101,8 +104,12 @@ Measured (i9-13900H, pinned, medians of 200):
 | multilingual-MiniLM | — | — | 0.9982 |
 Weight-only int8 was already at 0.89× of ONNX Runtime fp32 (M5), so
 full int8 puts rembed decisively ahead on VNNI hardware. Accuracy is
-the honest cost: cosine ≥ 0.991 (enforced in TestGoldenInt8Activations)
-versus ≥ 0.9978 for weight-only — choose per workload.
+the honest cost, and it is PER-MODEL (each bound test-enforced in the
+golden matrix): ≥0.991 for the BERT MiniLMs and mpnet, ≥0.998 for
+multilingual and gte — but 0.9747 for distilroberta, whose activation
+outliers defeat the per-row absmax scheme (the review measured ~2.7×
+larger row absmax at the median). Full int8 is not recommended for
+RoBERTa-family checkpoints.
 
 ## R8 — Publishable benchmark + beyond-CPU
 A pinned cloud box turns the consistent sign-test wins over ONNX Runtime
