@@ -135,3 +135,34 @@ MiniLM-L6-v2 (`sentence-transformers/all-MiniLM-L6-v2`: 6 layers, 384-dim,
 12 heads, GELU, post-LN, mean pooling, L2 normalize), fp32, CPU. Deliver
 M0 → M2 with the harness. SIMD (M3) and int8 (M4) follow once the foundation
 is solid.
+
+## Outcome (v0.1.0)
+
+The ladder is complete; the plan above is preserved unedited, actuals in
+bench/RESULTS.md. Targets vs measured, all on the reference laptop
+(i9-13900H) against ONNX Runtime's default configuration:
+
+| rung | target | measured |
+|------|--------|----------|
+| M0 correctness | match ONNX within 1e-4 | 2.9e-7 (later 1.5e-7 with 11 golden cases) |
+| M1 alloc-free + blocked | 3–5× | 1.81× — the scalar-Go ceiling, documented |
+| M2 goroutines | 2–4× | 4.1× |
+| M3 AVX2 SIMD | within 2–3× of ONNX | 3.3× → then to parity in M4 |
+| M4 (packed GEMM, spin pool, fp32 fast math) | — | parity (1.05×) |
+| int8 (kickoff M4) | parity-ish with ONNX int8 | ahead of ORT fp32 (0.89×) and ORT quint8 (0.95×) |
+
+Deltas from the plan, all argued in commit messages and RESULTS.md: the
+dependency rule relaxed to stdlib+golang.org/x (accent-faithful
+tokenization needs x/text); the "one matmul signature" principle gained a
+second, packed-weight interface once weights-packed-at-load became the
+structural advantage; the kernel is hand-written plan9 asm rather than
+avo; Python bindings (a c-shared artifact — the Go library stays
+cgo-free) arrived ahead of the Rostam integration.
+
+Generality is validated on a second, never-tuned-for model
+(all-MiniLM-L12-v2: 12 layers): convert → load → fp32 within 1.9e-7 of
+its own ONNX reference, int8 within its pinned bounds, first try.
+
+Still open, deliberately: a pinned cloud box to turn the consistent
+sign-test wins over ONNX into a publishable magnitude claim, and the
+Rostam `-tags localembed` integration this engine was shaped for.
