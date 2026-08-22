@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"runtime"
 	"testing"
 )
 
@@ -44,13 +45,14 @@ var kernels = map[string]MatMulFunc{
 // (m > blockM with a partial last tile), and degenerate sizes.
 func TestMatMulAgainstFloat64Reference(t *testing.T) {
 	shapes := [][3]int{
-		{17, 33, 29},        // nothing divides anything
-		{1, 1, 1},           // degenerate
-		{12, 384, 384},      // MiniLM projection shape
-		{12, 384, 1536},     // MiniLM FFN shape (n % 4 == 0)
-		{blockM + 5, 16, 7}, // partial last i-tile AND n remainder
-		{2 * blockM, 8, 4},  // exact tile boundaries
-		{3, 5, blockN - 1},  // n smaller than the micro-kernel
+		{17, 33, 29},          // nothing divides anything
+		{1, 1, 1},             // degenerate
+		{12, 384, 384},        // MiniLM projection shape
+		{12, 384, 1536},       // MiniLM FFN shape (n % 4 == 0)
+		{blockM + 5, 16, 7},   // partial last i-tile AND n remainder
+		{2 * blockM, 8, 4},    // exact tile boundaries
+		{2*blockM + 7, 33, 7}, // multiple full i-tiles PLUS both remainders
+		{3, 5, blockN - 1},    // n smaller than the micro-kernel
 	}
 	rng := rand.New(rand.NewSource(42))
 	for _, sh := range shapes {
@@ -73,14 +75,32 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 				want[i*n+j] = float32(sum)
 			}
 		}
+		results := map[string][]float32{}
 		for name, kern := range kernels {
 			got := make([]float32, m*n)
 			kern(got, a, bT, m, k, n)
+			results[name] = got
 			// fp32 accumulation error grows with k and |value|, so the
 			// tolerance is relative: 1e-5 · (1 + |want|).
 			for i := range want {
 				if d := math.Abs(float64(got[i] - want[i])); d > 1e-5*(1+math.Abs(float64(want[i]))) {
 					t.Fatalf("%s %dx%dx%d: [%d]=%v want %v (diff %g)", name, m, k, n, i, got[i], want[i], d)
+				}
+			}
+		}
+		// Cross-kernel check against naive: same accumulation order over k,
+		// so bit-identical where the compiler does not fuse mul+add (amd64);
+		// within tight fp32 tolerance elsewhere. This is a far stronger net
+		// than the float64 tolerance alone.
+		exact := runtime.GOARCH == "amd64"
+		for name, got := range results {
+			ref := results["naive"]
+			for i := range ref {
+				if exact && got[i] != ref[i] {
+					t.Fatalf("%s %dx%dx%d: [%d]=%v differs from naive %v (expected bit-identical on amd64)", name, m, k, n, i, got[i], ref[i])
+				}
+				if d := math.Abs(float64(got[i] - ref[i])); d > 1e-6*(1+math.Abs(float64(ref[i]))) {
+					t.Fatalf("%s %dx%dx%d: [%d]=%v vs naive %v (diff %g)", name, m, k, n, i, got[i], ref[i], d)
 				}
 			}
 		}

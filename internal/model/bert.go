@@ -48,6 +48,11 @@ type Model struct {
 // scratch holds every intermediate buffer one Forward call needs. Buffers
 // keep their capacity between uses (via the pool), so steady-state forward
 // passes allocate nothing but the returned vector.
+//
+// Buffers only grow: one max-length (512-token) input inflates a scratch to
+// ~10 MB, and sync.Pool retains up to one scratch per P until GC drains it.
+// That is a deliberate trade (reuse over footprint) — revisit if rembed's
+// host process cares about worst-case resident memory.
 type scratch struct {
 	x, q, k, v      []float32 // [seq×H]
 	ctxOut, attnOut []float32 // [seq×H]
@@ -111,6 +116,13 @@ func Load(weightsPath string, cfg Config) (*Model, error) {
 	}
 
 	H, I := cfg.HiddenSize, cfg.IntermediateSize
+	// LoadConfig enforces this, but Forward's per-head writes cover ctxOut
+	// completely ONLY when it holds — and with pooled scratch a violation
+	// would read the previous call's residue, not zeros. Re-assert here so an
+	// unvalidated Config cannot reach that state.
+	if cfg.NumAttentionHeads <= 0 || H%cfg.NumAttentionHeads != 0 {
+		return nil, fmt.Errorf("weights %s: hidden_size %d not divisible by num_attention_heads %d", weightsPath, H, cfg.NumAttentionHeads)
+	}
 	m := &Model{cfg: cfg, matmul: tensor.Default()}
 	m.scratchPool.New = func() any { return new(scratch) }
 

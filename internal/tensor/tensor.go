@@ -54,9 +54,17 @@ const (
 // stays resident. Four independent accumulator chains give the FP units
 // ILP; a 2×4 variant measured ~7% SLOWER here (register spills — Go keeps
 // only so many of 8 accumulators + 6 temps live), so 1×4 it is until M3's
-// SIMD kernel. Accumulation order over k is unchanged from naive, so
-// per-element results are bit-identical.
+// SIMD kernel. Accumulation order over k matches naive, so results are
+// bit-identical wherever the compiler does not fuse mul+add (amd64 today),
+// and within fp32 rounding otherwise.
 func MatMulBlocked(dst, a, bT []float32, m, k, n int) {
+	if m*n > 0 {
+		// Fail fast on an undersized dst: the 4-wide stores below slice with
+		// an explicit upper bound, which bounds-checks against cap — on a
+		// pooled buffer with cap > len an undersized dst would otherwise be
+		// corrupted silently instead of panicking like the naive body does.
+		_ = dst[m*n-1]
+	}
 	for i0 := 0; i0 < m; i0 += blockM {
 		i1 := min(i0+blockM, m)
 		var j int
