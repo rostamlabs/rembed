@@ -210,8 +210,16 @@ func cmdBench(args []string) error {
 		for i, d := range durs {
 			runsSec[i] = d.Seconds()
 		}
-		// seq lets compare.py verify both engines tokenize to the same length.
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"runs_sec": runsSec, "seq": len(ids)})
+		// seq lets compare.py verify both engines tokenize to the same
+		// length; the quantization fields let it verify which mode
+		// ACTUALLY ran (the engine falls back silently by design, and a
+		// benchmark must not label fallback latencies as the full mode).
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"runs_sec":              runsSec,
+			"seq":                   len(ids),
+			"quantized":             emb.Quantized(),
+			"quantized_activations": emb.QuantizedActivations(),
+		})
 	}
 	slices.Sort(durs)
 	median := durs[len(durs)/2]

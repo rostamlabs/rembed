@@ -441,25 +441,37 @@ native VPDPBUSD mnemonics this time) was built and PROVEN here on real
 hardware — bit-exact against the integer reference, and its end-to-end
 full-int8 worst golden cosine is 0.991652, IDENTICAL to the last bit
 with the VEX path on Raptor Lake. Two encodings, two vendors, one
-integer computation. Full int8 now engages on every VNNI-capable CPU.
+integer computation. Full int8 now engages on every VNNI-capable CPU whose OS saves AVX-512
+state (macOS is the exception — x/sys disables AVX-512 there).
 
 mpnet-base (the stable workload on this VM; L6's sub-2 ms runs drown in
-hypervisor jitter), three independent rounds, 50-100 runs per order:
+hypervisor jitter), four independent rounds, 50-100 runs per order.
+Flag types matter and are disclosed per round: "order" = the harness's
+machine-unstable/rerun flag (order medians differ >10%), "noise" = the
+delta-within-spread flag whose rule is "treat as parity".
 
-| comparison | round ratios (ours/ORT) | verdict |
-|---|---|---|
-| fp32 vs ORT fp32 | 1.08 / 1.13 / 1.07 | parity (ORT nominally ahead, single digits, all FLAGged) |
-| full int8 vs ORT fp32 | 0.78 / 0.59 / 0.70 | **rembed ahead in 3/3 rounds, 22-41%** |
-| full int8 vs ORT qint8-avx512-vnni | 1.16 / 0.97 / 0.95 | parity with ORT's strongest int8 graph |
+| comparison | round ratios (ours/ORT) | flags per round | verdict |
+|---|---|---|---|
+| fp32 vs ORT fp32 | 1.08 / 1.13 / 1.07 | noise / noise / order+noise | parity (ORT nominally ahead, single digits) |
+| full int8 vs ORT fp32 | 0.78 / 0.59 / 0.70 / 0.75 | order+noise / order+noise / none / **none** | **ahead in 4/4 rounds; the two flag-free rounds say 0.70× and 0.75×** |
+| full int8 vs ORT qint8-avx512-vnni | 1.16 / 0.97 / 0.95 | order+order / noise / noise | parity with ORT's strongest int8 graph |
+
+The flag-free variance row (round 4, 100 runs per order, both orders —
+the checkable magnitudes DESIGN.md's variance rule asks for):
+
+| engine | median | p10 | p90 | spread |
+|---|---|---|---|---|
+| rembed full int8 | 5.910 ms | 5.619 | 6.628 | 17.1% |
+| ORT fp32 | 7.922 ms | 7.620 | 8.791 | 14.8% |
 
 The headline, stated carefully: on Zen 4 server hardware, pure-Go
 rembed fp32 is at parity with ONNX Runtime fp32; rembed full int8 beats
-ORT fp32 decisively (only one of three rounds was entirely flag-free —
-0.70× — but the sign never flipped); and against ORT's own hand-tuned
-AVX-512-VNNI int8 graphs, rembed trades blows at parity while its VNNI
-kernel is still 256-bit ymm. The obvious remaining headroom on 512-bit
-native parts is a zmm-wide kernel — future work, now with hardware that
-can test it.
+ORT fp32 in every round, and the two rounds with NO flags of either
+kind measured 0.70× and 0.75× — a clean 25-30% win, not a sign test
+this time; and against ORT's own hand-tuned AVX-512-VNNI int8 graphs,
+rembed trades blows at parity while its VNNI kernel is still 256-bit
+ymm. The obvious remaining headroom on 512-bit native parts is a
+zmm-wide kernel — future work, now with hardware that can test it.
 
 L6 on this VM: all four comparisons FLAG-parity (spreads 40-94% on
 sub-2 ms runs); full int8 vs ORT qint8-avx512-vnni measured 0.96×.

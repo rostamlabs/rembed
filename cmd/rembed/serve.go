@@ -30,6 +30,7 @@ func cmdServe(args []string) error {
 	modelRef := fs.String("model", "sentence-transformers/all-MiniLM-L6-v2", "model directory or Hugging Face id")
 	addr := fs.String("addr", ":8080", "listen address")
 	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
+	useInt8Act := fs.Bool("int8act", false, "full int8 (u8 activations, needs VNNI)")
 	workers := fs.Int("workers", 0, "CPU workers per request (0 = all cores; set low for many concurrent clients)")
 	maxBatch := fs.Int("max-batch", 256, "maximum texts per request")
 	_ = fs.Parse(args)
@@ -37,7 +38,7 @@ func cmdServe(args []string) error {
 		return fmt.Errorf("serve: -max-batch must be >= 1")
 	}
 
-	opts := int8Opts(*useInt8)
+	opts := quantOpts(*useInt8, *useInt8Act)
 	if *workers > 0 {
 		opts = append(opts, rembed.WithWorkers(*workers))
 	}

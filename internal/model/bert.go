@@ -180,7 +180,8 @@ const (
 // bound by streaming weights, at the cost of the weights' 8-bit rounding.
 // QuantFull additionally quantizes activations per row to u8 at matmul
 // time, letting VPDPBUSD do 4 multiply-accumulates per lane per
-// instruction — falling back to QuantWeights when the CPU lacks AVX-VNNI.
+// instruction — falling back to QuantWeights when the CPU lacks both
+// VNNI encodings (AVX-VNNI and AVX-512-VNNI).
 func newDense(raw, bias []float32, in, out int, quantize QuantMode) denseWeight {
 	if quantize == QuantFull {
 		if pb, err := tensor.PackB8VNNI(raw, in, out); err == nil {

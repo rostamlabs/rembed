@@ -27,7 +27,7 @@ DEFAULT_TEXT = "The quick brown fox jumps over the lazy dog."
 
 
 def bench_ours(binary: str, model_dir: str, text: str, runs: int, warmup: int,
-               expect_seq: int, int8: bool = False) -> list[float]:
+               expect_seq: int, int8: "bool | str" = False) -> list[float]:
     """Per-run embed latencies (seconds) from the Go engine, in-process there."""
     cmd = [binary, "bench", "-model", model_dir, "-runs", str(runs), "-warmup", str(warmup),
            "-text", text, "-json"]
@@ -47,6 +47,15 @@ def bench_ours(binary: str, model_dir: str, text: str, runs: int, warmup: int,
             f"seq mismatch: Go tokenized to {payload['seq']}, HF to {expect_seq} — "
             f"fix the tokenizer divergence before trusting any ratio"
         )
+    # The engine falls back silently by design; a benchmark must not
+    # label fallback latencies as the requested mode (same standard as
+    # the seq check above).
+    if int8 == "full" and not payload.get("quantized_activations"):
+        raise SystemExit("full int8 requested but the engine fell back "
+                         "(no VNNI on this CPU?) — refusing to mislabel the run")
+    if int8 is True and not payload.get("quantized"):
+        raise SystemExit("int8 requested but the engine fell back to fp32 — "
+                         "refusing to mislabel the run")
     return payload["runs_sec"]
 
 
@@ -124,16 +133,16 @@ def main() -> None:
         binary = str(REPO_ROOT / "bin" / "rembed")
         subprocess.run(["go", "build", "-o", binary, "./cmd/rembed"], check=True, cwd=REPO_ROOT)
 
-    print(f"seq={hf_seq}  onnx-threads={args.onnx_threads or 'default pool'}")
+    ours_label = "int8-full" if args.ours_int8act else ("int8-weights" if args.ours_int8 else "fp32")
+    print(f"seq={hf_seq}  ours={ours_label}  onnx-file={args.onnx_file}  onnx-threads={args.onnx_threads or 'default pool'}")
+    ours_mode = "full" if args.ours_int8act else args.ours_int8
     results: dict[str, list[list[float]]] = {"ours": [], "onnx": []}
     for order in ("us-then-onnx", "onnx-then-us"):
         print(f"order: {order}")
         if order == "us-then-onnx":
-            ours_mode = "full" if args.ours_int8act else args.ours_int8
             results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup, hf_seq, ours_mode))
             results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup, args.onnx_threads, args.onnx_file))
         else:
-            ours_mode = "full" if args.ours_int8act else args.ours_int8
             results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup, args.onnx_threads, args.onnx_file))
             results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup, hf_seq, ours_mode))
         summarize("ours", results["ours"][-1])

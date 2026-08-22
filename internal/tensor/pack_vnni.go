@@ -21,9 +21,10 @@ type PackedB8V struct {
 	scales []float32 // per-column dequant scale
 }
 
-// PackB8VNNI packs bT (HF [out,in] layout) for the VNNI kernel. Same
+// PackB8VNNI packs bT (HF [out,in] layout) for the VNNI kernels. Same
 // preconditions as PackB8: n%16==0, n>=16, k>=1, finite weights, and the
-// CPU must have AVX-VNNI.
+// CPU must have AVX-VNNI or AVX-512-VNNI (the layout serves both
+// encodings).
 func PackB8VNNI(bT []float32, k, n int) (*PackedB8V, error) {
 	if !hasVNNI && !hasVNNI512 {
 		return nil, fmt.Errorf("tensor: PackB8VNNI requires AVX-VNNI or AVX-512-VNNI on this CPU")
@@ -115,8 +116,8 @@ func QuantizeRowU8(dst []uint8, a []float32) float32 {
 	return scale
 }
 
-// MatMulPackedVNNI computes dst[m×n] = a[m×k]·Bᵀ using the AVX-VNNI
-// int8 kernel with per-row-quantized activations. qa must hold
+// MatMulPackedVNNI computes dst[m×n] = a[m×k]·Bᵀ using a VNNI int8
+// kernel (VEX or EVEX by CPU) with per-row-quantized activations. qa must hold
 // PackAPad(m)·kg·4 bytes and rowScales PackAPad(m) floats (scratch,
 // caller-owned); dst must be sized for PackAPad(m) rows. Work fans out
 // over the pool exactly like MatMulPacked.

@@ -132,3 +132,33 @@ func TestQuantizeRowU8Rails(t *testing.T) {
 		t.Fatalf("zero row scale = %v, want 1", s)
 	}
 }
+
+// TestVNNIEncodingsAgree runs the VEX and EVEX kernels directly on
+// identical inputs and requires identical int32 accumulators. It can only
+// run on hardware reporting BOTH encodings (Sapphire Rapids, Zen 5, or
+// Intel SDE) — everywhere else exactly one kernel is legal and the other
+// #UDs, so the test skips. This is the mechanical lock on twin drift:
+// the two .s files must stay in step forever, and on both-capable
+// hardware that is provable rather than absent-by-inspection.
+func TestVNNIEncodingsAgree(t *testing.T) {
+	if !hasVNNI || !hasVNNI512 {
+		t.Skip("needs BOTH AVX-VNNI and AVX-512-VNNI (SPR/Zen5/SDE)")
+	}
+	rng := rand.New(rand.NewSource(7))
+	for _, kg := range []int{1, 2, 13, 96, 384} {
+		qa := make([]uint8, 4*kg*4)
+		pb := make([]int8, kg*64)
+		for i := range qa {
+			qa[i] = uint8(rng.Intn(256))
+		}
+		for i := range pb {
+			pb[i] = int8(rng.Intn(256) - 128)
+		}
+		var vex, evex [64]int32
+		gemm4x16vnni(&vex[0], 16, &qa[0], kg*4, &pb[0], kg)
+		gemm4x16vnni512(&evex[0], 16, &qa[0], kg*4, &pb[0], kg)
+		if vex != evex {
+			t.Fatalf("kg=%d: VEX and EVEX kernels disagree", kg)
+		}
+	}
+}
