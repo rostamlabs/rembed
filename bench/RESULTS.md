@@ -284,3 +284,38 @@ sweep on the first run — the encodings are right.
 NO performance claims: qemu measures nothing. Real-ARM benchmarks (Apple
 Silicon / Graviton) are the follow-up; the structural expectation is
 ORT-competitive by the same weights-packed-at-load argument as amd64.
+
+## R4 — MPNet architecture (2026-08-22)
+
+Coverage rung, not a perf rung: all-mpnet-base-v2 — the most-downloaded
+sentence-transformers model — now runs end to end. Two architectural
+deltas over BERT: positions offset by pad_token_id+1 with no segment
+embedding, and a bucketed relative-position bias (one [32×heads] table
+shared by all 12 layers) added to attention scores before softmax.
+Because positions are contiguous, the bias collapses to a
+[heads×(2·seq−1)] delta table computed once per forward — HF
+materializes [heads×seq×seq].
+
+Validation against the repo's own ONNX export over the 12-case golden
+(the longest case is 324 tokens, so token pairs reach |j−i| ≥ 128 and
+the log-spaced far buckets plus the max-distance clamp are pinned end to
+end, not just in the unit test): maxAbsDiff 3.3e-7, worst per-text
+meanAbs 7.3e-8, cosine 1.000000000 — the same fidelity class as the
+BERT matrix (1.5e-7–1.9e-7). The adversarial review additionally
+validated against a LIVE HuggingFace MPNetModel forward pass at 4, 52,
+402, and 512 tokens: maxAbs ≤ 2.05e-6, cosine 1.0 throughout.
+Tokenization (WordPiece with <s>/</s> framing over the 4-shifted vocab)
+matches HF's MPNetTokenizer token-for-token on every golden case,
+including the accent/CJK/symbol torture cases. Weight-only int8 engages
+unchanged (768-dim projections pack cleanly): cosine ≥ 0.9978 vs the
+golden — the measured worst case is 0.997874 on the punctuation text,
+now test-enforced in the golden matrix. (An earlier draft claimed
+0.9989, measured on only 2 texts; the review caught it.)
+
+The bucket function ports HF's float32 log computation to float64 —
+verified to pick identical buckets for every |distance| ≤ 1000
+(exhaustive check), double the 512-token maximum.
+
+No benchmark entry: the forward pass is the same kernel ladder; MPNet
+just runs 12 layers × 768 hidden instead of MiniLM's 6 × 384. R8 (pinned
+cloud box) remains where cross-model magnitude claims get made.

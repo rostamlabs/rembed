@@ -86,14 +86,16 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/rembed
-          key: rembed-models-v1
+          key: rembed-models-v2
       - name: fetch models via the hub loader
         run: |
           go run ./cmd/rembed embed -model sentence-transformers/all-MiniLM-L6-v2 "warm" > /dev/null
           go run ./cmd/rembed embed -model BAAI/bge-small-en-v1.5 "warm" > /dev/null
+          go run ./cmd/rembed embed -model sentence-transformers/all-mpnet-base-v2 "warm" > /dev/null
       - name: golden suite (fp32, int8, cls, allocs, concurrency)
         run: |
           export REMBED_MODEL_DIR=~/.cache/rembed/sentence-transformers--all-MiniLM-L6-v2
           export REMBED_MODEL_BGE=~/.cache/rembed/BAAI--bge-small-en-v1.5
+          export REMBED_MODEL_MPNET=~/.cache/rembed/sentence-transformers--all-mpnet-base-v2
           go test -v -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" . 2>&1 | tail -30
           go test -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" .

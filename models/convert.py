@@ -45,6 +45,37 @@ GOLDEN_TEXTS = [
     "covers more position embeddings than the short inputs do, including a "
     "second clause with commas, numbers like 8675309, and ordinary prose "
     "about nothing in particular that keeps going for a while longer.",
+    # ~400 tokens: long enough that token pairs reach |j-i| >= 128, pinning
+    # the log-spaced far buckets AND the max-distance clamp of relative-
+    # position-bias models (MPNet) end to end — the shorter cases never
+    # leave the near-exact buckets.
+    "The history of mechanical computation stretches back further than most "
+    "people assume, beginning with devices like the antikythera mechanism, "
+    "a bronze assembly of interlocking gears recovered from a shipwreck in "
+    "the aegean sea that modeled the motions of the sun and moon with "
+    "startling precision. centuries later, charles babbage designed his "
+    "difference engine to tabulate polynomial functions automatically, and "
+    "ada lovelace, studying his more ambitious analytical engine, wrote what "
+    "many consider the first published algorithm, recognizing that a machine "
+    "manipulating symbols could do far more than arithmetic. the twentieth "
+    "century accelerated everything: alan turing formalized the notion of "
+    "computability with an abstract machine reading and writing symbols on "
+    "an infinite tape, claude shannon showed that boolean algebra could "
+    "describe switching circuits, and the engineers of eniac soldered "
+    "seventeen thousand vacuum tubes into a room-sized calculator for "
+    "artillery tables. transistors replaced tubes, integrated circuits "
+    "replaced discrete transistors, and the number of components on a chip "
+    "doubled with such regularity that the trend acquired a name and became "
+    "a planning assumption for an entire industry. software grew alongside "
+    "the hardware, from hand-assembled machine code through fortran and lisp "
+    "to operating systems that shared a single expensive processor among "
+    "many impatient users. networks stitched the machines together, first "
+    "across campuses, then across continents, until a physicist at cern "
+    "proposed a system of linked hypertext documents that anyone could "
+    "publish to and anyone could read, and the resulting web rearranged "
+    "commerce, journalism, friendship, and memory itself within a single "
+    "human generation, leaving us to wonder what the next doubling will "
+    "rearrange next.",
 ]
 
 
@@ -124,8 +155,17 @@ def main() -> None:
     pooling = json.loads(fetch("1_Pooling/config.json").read_text())
     modules = json.loads(fetch("modules.json").read_text())
 
-    if config.get("model_type") != "bert":
-        raise SystemExit(f"model_type={config.get('model_type')!r}: only BERT-family models are supported")
+    model_type = config.get("model_type")
+    if model_type not in ("bert", "mpnet"):
+        raise SystemExit(f"model_type={model_type!r}: only bert and mpnet models are supported")
+    if model_type == "mpnet":
+        # HF's MPNet code hardcodes num_buckets=32 and padding_idx=1
+        # regardless of config; the Go loader refuses anything else, so
+        # refuse at export time too.
+        if config.get("relative_attention_num_buckets") != 32:
+            raise SystemExit("mpnet: relative_attention_num_buckets must be 32 (HF hardcodes it)")
+        if config.get("pad_token_id", 1) != 1:
+            raise SystemExit("mpnet: pad_token_id must be 1 (HF hardcodes padding_idx=1)")
     # The Go engine hardcodes exact-erf GELU and absolute position embeddings;
     # anything else would produce a valid-looking model dir that computes the
     # wrong thing, so refuse at export time.
@@ -165,6 +205,12 @@ def main() -> None:
         "pooling": pool_mode,
         "normalize": normalize,
     }
+    if model_type == "mpnet":
+        # Positions are offset by pad_token_id+1 (fairseq convention), and
+        # attention adds a shared bucketed relative-position bias.
+        manifest["model_type"] = "mpnet"
+        manifest["relative_attention_num_buckets"] = config["relative_attention_num_buckets"]
+        manifest["pad_token_id"] = config.get("pad_token_id", 1)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"wrote {out}/[model.safetensors vocab.txt manifest.json]")
 
@@ -173,9 +219,13 @@ def main() -> None:
     sess = ort.InferenceSession(fetch("onnx/model.onnx"), providers=["CPUExecutionProvider"])
     input_names = {i.name for i in sess.get_inputs()}
 
+    max_len = manifest["max_position_embeddings"]
+    if model_type == "mpnet":
+        max_len -= config.get("pad_token_id", 1) + 1
+
     golden = []
     for text in GOLDEN_TEXTS:
-        enc = tokenizer(text, truncation=True, max_length=manifest["max_position_embeddings"])
+        enc = tokenizer(text, truncation=True, max_length=max_len)
         ids = np.array([enc["input_ids"]], dtype=np.int64)
         mask = np.array([enc["attention_mask"]], dtype=np.int64)
         feeds = {"input_ids": ids, "attention_mask": mask}
@@ -202,7 +252,7 @@ def main() -> None:
         # validating EmbedTokens (no pooling, no normalization).
         tcases = []
         for text in GOLDEN_TEXTS[:3]:
-            enc = tokenizer(text, truncation=True, max_length=manifest["max_position_embeddings"])
+            enc = tokenizer(text, truncation=True, max_length=max_len)
             ids = np.array([enc["input_ids"]], dtype=np.int64)
             feeds = {"input_ids": ids, "attention_mask": np.array([enc["attention_mask"]], dtype=np.int64)}
             if "token_type_ids" in input_names:

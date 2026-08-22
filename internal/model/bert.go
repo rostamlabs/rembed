@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package model implements the BERT encoder forward pass:
+// Package model implements the BERT-family encoder forward pass:
 // embeddings(token+position+segment) → N layers (self-attention + FFN,
-// post-LayerNorm) → mean pooling → L2 normalize.
+// post-LayerNorm) → mean pooling → L2 normalize. MPNet shares the entire
+// pipeline with two deltas: positions are offset by pad_token_id+1 and
+// there is no segment embedding, and every layer's attention scores add a
+// shared bucketed relative-position bias before softmax.
 package model
 
 import (
@@ -41,22 +44,56 @@ type layer struct {
 	outLNg, outLNb   []float32   // [H]
 }
 
-// Model is a loaded BERT encoder ready to embed token-id sequences.
-// It is safe for concurrent use: the matmul kernel is bound once at Load,
-// and per-call scratch comes from an internal pool.
+// Model is a loaded BERT-family encoder ready to embed token-id
+// sequences. It is safe for concurrent use: the matmul kernel is bound
+// once at Load, and per-call scratch comes from an internal pool.
 type Model struct {
 	cfg     Config
 	workers int // fan-out cap per Forward; 0 = GOMAXPROCS
+	posOff  int // position-embedding row offset (0 for BERT, pad+1 for MPNet)
 
 	wordEmb []float32 // [vocab×H]
 	posEmb  []float32 // [maxPos×H]
-	typeEmb []float32 // [types×H]; segment 0 is the only one used
+	typeEmb []float32 // [types×H]; segment 0 is the only one used; nil for MPNet
 	embLNg  []float32 // [H]
 	embLNb  []float32 // [H]
+
+	// relBias is MPNet's relative-position bias table [buckets×heads],
+	// shared by every layer; nil for BERT.
+	relBias []float32
 
 	layers []layer
 
 	scratchPool sync.Pool // *scratch, buffers grown on demand
+}
+
+// relMaxDistance is the bucketing horizon of MPNet's relative-position
+// bias. HF hardcodes it (relative_position_bucket's default; it is not in
+// config.json), so rembed does too.
+const relMaxDistance = 128
+
+// relPosBucket maps a relative position (memory j − context i) to a bias
+// bucket — HF's MPNetEncoder.relative_position_bucket with its n =
+// −relative_position sign flip folded in. Distances up to maxExact-1 get
+// their own bucket; larger ones share logarithmically-spaced buckets up to
+// relMaxDistance; the sign selects the table's two halves. HF computes the
+// log in float32 — float64 here picks identical buckets for every
+// |distance| ≤ 1000 (checked exhaustively), far past the 512-position max.
+func relPosBucket(rel, numBuckets int) int {
+	n := -rel
+	half := numBuckets / 2
+	ret := 0
+	if n < 0 {
+		ret = half
+		n = -n
+	}
+	maxExact := half / 2
+	if n < maxExact {
+		return ret + n
+	}
+	v := maxExact + int(math.Log(float64(n)/float64(maxExact))/
+		math.Log(float64(relMaxDistance)/float64(maxExact))*float64(half-maxExact))
+	return ret + min(v, half-1)
 }
 
 // scratch holds every intermediate buffer one Forward call needs. Buffers
@@ -89,6 +126,7 @@ type scratch struct {
 	scores     []float32    // [heads×seq×seq]
 	qh, kh, ch []float32    // [heads][seq×dh] = [seq×H]
 	vhT        []float32    // [heads][dh×seq] = [H×seq]
+	biasDelta  []float32    // [heads×(2seq−1)] MPNet rel-pos bias by (j−i); nil-length for BERT
 }
 
 // grow reslices buf to n floats, reallocating only when capacity is short.
@@ -150,18 +188,21 @@ func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch
 }
 
 // Load builds a Model from a safetensors file and a validated Config.
-// Tensor names follow HuggingFace BertModel conventions, with or without a
-// leading "bert." prefix. quantize selects weight-only int8 inference (see
-// newDense).
+// Tensor names follow HuggingFace BertModel/MPNetModel conventions, with
+// or without a leading "bert."/"mpnet." prefix. quantize selects
+// weight-only int8 inference (see newDense).
 func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, error) {
 	tensors, err := safetensors.Load(weightsPath)
 	if err != nil {
 		return nil, err
 	}
 	prefix := ""
-	if _, ok := tensors["bert.embeddings.word_embeddings.weight"]; ok {
-		prefix = "bert."
+	for _, p := range []string{"bert.", "mpnet."} {
+		if _, ok := tensors[p+"embeddings.word_embeddings.weight"]; ok {
+			prefix = p
+		}
 	}
+	mpnet := cfg.ModelType == "mpnet"
 	get := func(name string, wantShape ...int) ([]float32, error) {
 		t, ok := tensors[prefix+name]
 		if !ok {
@@ -186,7 +227,7 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 	if cfg.NumAttentionHeads <= 0 || H%cfg.NumAttentionHeads != 0 {
 		return nil, fmt.Errorf("weights %s: hidden_size %d not divisible by num_attention_heads %d", weightsPath, H, cfg.NumAttentionHeads)
 	}
-	m := &Model{cfg: cfg, workers: workers}
+	m := &Model{cfg: cfg, workers: workers, posOff: cfg.PositionOffset()}
 	m.scratchPool.New = func() any { return new(scratch) }
 
 	type load struct {
@@ -218,7 +259,11 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 			ffn1W, ffn1B           []float32
 			ffn2W, ffn2B           []float32
 		}
-		for _, ld := range []load{
+		// MPNet names its attention projections attn.{q,k,v,o} and hangs
+		// the post-attention LayerNorm directly off `attention.`; BERT
+		// spells them out under attention.self / attention.output. The FFN
+		// halves share names.
+		attn := []load{
 			{&raw.qW, p + "attention.self.query.weight", []int{H, H}},
 			{&raw.qB, p + "attention.self.query.bias", []int{H}},
 			{&raw.kW, p + "attention.self.key.weight", []int{H, H}},
@@ -229,13 +274,29 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 			{&raw.attnOutB, p + "attention.output.dense.bias", []int{H}},
 			{&l.attnLNg, p + "attention.output.LayerNorm.weight", []int{H}},
 			{&l.attnLNb, p + "attention.output.LayerNorm.bias", []int{H}},
+		}
+		if mpnet {
+			attn = []load{
+				{&raw.qW, p + "attention.attn.q.weight", []int{H, H}},
+				{&raw.qB, p + "attention.attn.q.bias", []int{H}},
+				{&raw.kW, p + "attention.attn.k.weight", []int{H, H}},
+				{&raw.kB, p + "attention.attn.k.bias", []int{H}},
+				{&raw.vW, p + "attention.attn.v.weight", []int{H, H}},
+				{&raw.vB, p + "attention.attn.v.bias", []int{H}},
+				{&raw.attnOutW, p + "attention.attn.o.weight", []int{H, H}},
+				{&raw.attnOutB, p + "attention.attn.o.bias", []int{H}},
+				{&l.attnLNg, p + "attention.LayerNorm.weight", []int{H}},
+				{&l.attnLNb, p + "attention.LayerNorm.bias", []int{H}},
+			}
+		}
+		for _, ld := range append(attn, []load{
 			{&raw.ffn1W, p + "intermediate.dense.weight", []int{I, H}},
 			{&raw.ffn1B, p + "intermediate.dense.bias", []int{I}},
 			{&raw.ffn2W, p + "output.dense.weight", []int{H, I}},
 			{&raw.ffn2B, p + "output.dense.bias", []int{H}},
 			{&l.outLNg, p + "output.LayerNorm.weight", []int{H}},
 			{&l.outLNb, p + "output.LayerNorm.bias", []int{H}},
-		} {
+		}...) {
 			data, err := get(ld.name, ld.shape...)
 			if err != nil {
 				return nil, err
@@ -253,6 +314,18 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 		l.attnOut = newDense(raw.attnOutW, raw.attnOutB, H, H, quantize)
 		l.ffn1 = newDense(raw.ffn1W, raw.ffn1B, H, I, quantize)
 		l.ffn2 = newDense(raw.ffn2W, raw.ffn2B, I, H, quantize)
+	}
+
+	if mpnet {
+		// MPNet has no segment embedding; instead every layer shares one
+		// bucketed relative-position bias table over the heads.
+		relBias, err := get("encoder.relative_attention_bias.weight",
+			cfg.RelativeAttentionNumBuckets, cfg.NumAttentionHeads)
+		if err != nil {
+			return nil, err
+		}
+		m.relBias = relBias
+		return m, nil
 	}
 
 	// token_type_embeddings may have any first dimension; only row 0 is used.
@@ -374,8 +447,8 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	if seq == 0 {
 		return nil, fmt.Errorf("empty token sequence")
 	}
-	if seq > m.cfg.MaxPositionEmbeddings {
-		return nil, fmt.Errorf("sequence length %d exceeds max position embeddings %d", seq, m.cfg.MaxPositionEmbeddings)
+	if seq > m.cfg.MaxSeqLen() {
+		return nil, fmt.Errorf("sequence length %d exceeds the model's maximum %d", seq, m.cfg.MaxSeqLen())
 	}
 	H := m.cfg.HiddenSize
 	heads := m.cfg.NumAttentionHeads
@@ -409,7 +482,9 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	s.pool = tensor.NewPool(s.fanout - 1)
 	defer s.pool.Stop()
 
-	// Embeddings: word + position + segment(0), then LayerNorm.
+	// Embeddings: word + position (+ segment 0 for BERT; MPNet has no
+	// segment table and offsets positions past its padding rows), then
+	// LayerNorm.
 	x := s.x
 	for i, id := range ids {
 		if id < 0 || int(id) >= m.cfg.VocabSize {
@@ -417,13 +492,35 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 		}
 		row := x[i*H : i*H+H]
 		w := m.wordEmb[int(id)*H : int(id)*H+H]
-		p := m.posEmb[i*H : i*H+H]
-		t := m.typeEmb[:H]
-		for j := range row {
-			row[j] = w[j] + p[j] + t[j]
+		p := m.posEmb[(i+m.posOff)*H : (i+m.posOff)*H+H]
+		if m.typeEmb != nil {
+			t := m.typeEmb[:H]
+			for j := range row {
+				row[j] = w[j] + p[j] + t[j]
+			}
+		} else {
+			for j := range row {
+				row[j] = w[j] + p[j]
+			}
 		}
 	}
 	tensor.LayerNorm(x, m.embLNg, m.embLNb, seq, H, eps)
+
+	// MPNet's relative-position bias depends only on j−i (positions are
+	// contiguous), so one [heads×(2seq−1)] delta table — computed once per
+	// forward, shared by every layer — replaces the [heads×seq×seq] tensor
+	// HF materializes.
+	if m.relBias != nil {
+		nDelta := 2*seq - 1
+		s.biasDelta = grow(s.biasDelta, heads*nDelta)
+		nb := m.cfg.RelativeAttentionNumBuckets
+		for d := -(seq - 1); d <= seq-1; d++ {
+			b := relPosBucket(d, nb)
+			for h := range heads {
+				s.biasDelta[h*nDelta+d+seq-1] = m.relBias[b*heads+h]
+			}
+		}
+	}
 
 	qkv := s.qkv
 	ctxOut, attnOut := s.ctxOut, s.attnOut
@@ -469,8 +566,24 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 			// scheduler and make allocation counts depend on seq.
 			// scores = Qh·Khᵀ / √dh; Kh as bT gives exactly Qh·Khᵀ.
 			tensor.MatMulSerial(sc, qhH, khH, seq, dh, seq)
-			for i := range sc {
-				sc[i] *= scale
+			if m.relBias != nil {
+				// MPNet: scores/√dh + bias(j−i), matching HF's order
+				// (scale first, then add). The explicit float32 conversion
+				// forces the product to round before the add — without it
+				// the compiler fuses an FMA on arm64, and results stop
+				// being bit-identical across architectures.
+				bd := s.biasDelta[h*(2*seq-1):]
+				for i := range seq {
+					row := sc[i*seq : i*seq+seq]
+					bdi := bd[seq-1-i:] // index j-i+seq-1 = (seq-1-i)+j
+					for j := range row {
+						row[j] = float32(row[j]*scale) + bdi[j]
+					}
+				}
+			} else {
+				for i := range sc {
+					sc[i] *= scale
+				}
 			}
 			tensor.Softmax(sc, seq, seq)
 			// ch = probs·Vh, with Vhᵀ as the bT operand; then gather into

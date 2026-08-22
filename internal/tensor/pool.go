@@ -5,6 +5,7 @@ package tensor
 import (
 	"runtime"
 	"sync/atomic"
+	"time"
 )
 
 // Pool is a spinning fork-join pool for a latency-critical SEQUENCE of
@@ -25,8 +26,10 @@ import (
 // worker panic kill the host process, and Run must not return (or unwind)
 // while workers may still touch the caller's buffers.
 //
-// NOTE: the race detector makes spinning pathologically slow (~10,000×
-// per fan-out); keep any pool stress test's round count tiny under -race.
+// NOTE: under the race detector the idle loops poll with a micro-sleep
+// instead of spinning (see raceEnabled) — hot spinning there was measured
+// at ~125× a serial forward pass, which made any weights-present -race run
+// of the full suite blow the test timeout.
 //
 // Concurrency contract: one Run at a time (the forward pass is a single
 // orchestrator); distinct concurrent forward passes each own their own
@@ -64,7 +67,13 @@ func (p *Pool) worker() {
 			if p.stop.Load() {
 				return
 			}
-			if i%(1<<14) == 0 {
+			if raceEnabled {
+				// Hot spinning is pathological under the race detector
+				// (measured: a 2-second forward pass that takes 17 ms
+				// serial). Micro-sleep polling keeps the same concurrency
+				// while the detector watches; latency is irrelevant there.
+				time.Sleep(20 * time.Microsecond)
+			} else if i%(1<<14) == 0 {
 				// Stay preemptible without giving up the spin's latency.
 				runtime.Gosched()
 			}
@@ -122,7 +131,9 @@ func (p *Pool) Run(units int, fn func(u int)) {
 	p.cur.Store(t) // release: workers' acquire-load of cur sees fn/units
 	runTask(t)
 	for i := 0; t.completed.Load() < t.units; i++ {
-		if i%(1<<14) == 0 && i > 0 {
+		if raceEnabled {
+			time.Sleep(5 * time.Microsecond)
+		} else if i%(1<<14) == 0 && i > 0 {
 			runtime.Gosched()
 		}
 	}
