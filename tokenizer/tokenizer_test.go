@@ -127,6 +127,73 @@ func TestNewMissingSpecialTokenErrors(t *testing.T) {
 	}
 }
 
+func TestEncodeStripsAccentsWhenLowercasing(t *testing.T) {
+	// HF couples accent stripping to do_lower_case: "café" must tokenize as
+	// "cafe", both for precomposed é and for e + combining acute.
+	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "cafe", "resume"}
+	tok, _ := New(writeVocab(t, vocab), true, "", "", "")
+	for _, text := range []string{"café résumé", "cafe\u0301 re\u0301sume\u0301"} {
+		ids, _ := tok.Encode(text, MaxSeqLen)
+		want := []int64{2, 4, 5, 3} // [CLS] cafe resume [SEP]
+		if !equalIDs(ids, want) {
+			t.Fatalf("Encode(%q)=%v want %v", text, ids, want)
+		}
+	}
+	// Without lowercasing, accents are preserved (HF strip_accents=None).
+	tokCased, _ := New(writeVocab(t, []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "café"}), false, "", "", "")
+	ids, _ := tokCased.Encode("café", MaxSeqLen)
+	if !equalIDs(ids, []int64{2, 4, 3}) {
+		t.Fatalf("cased Encode(café)=%v want [2 4 3]", ids)
+	}
+}
+
+func TestEncodeCJKIdeographsSplitIndividually(t *testing.T) {
+	// HF space-pads CJK ideographs: each is its own word, never merged into
+	// one [UNK] run. 你=4 好=5, 界 unknown → [UNK]=1.
+	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "你", "好"}
+	tok, _ := New(writeVocab(t, vocab), true, "", "", "")
+	ids, _ := tok.Encode("你好界", MaxSeqLen)
+	want := []int64{2, 4, 5, 1, 3}
+	if !equalIDs(ids, want) {
+		t.Fatalf("ids=%v want %v", ids, want)
+	}
+}
+
+func TestEncodeNonASCIISymbolsAreNotSeparators(t *testing.T) {
+	// BERT's _is_punctuation treats ASCII symbols ($) as separators but NOT
+	// non-ASCII symbols (€): "€100" is one word → € + ##100, while "$100"
+	// splits into $ + 100 (no continuation).
+	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "€", "##100", "$", "100"}
+	tok, _ := New(writeVocab(t, vocab), true, "", "", "")
+	ids, _ := tok.Encode("€100 $100", MaxSeqLen)
+	want := []int64{2, 4, 5, 6, 7, 3}
+	if !equalIDs(ids, want) {
+		t.Fatalf("ids=%v want %v", ids, want)
+	}
+}
+
+func TestEncodeDropsReplacementChar(t *testing.T) {
+	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello"}
+	tok, _ := New(writeVocab(t, vocab), true, "", "", "")
+	// U+FFFD is dropped in place (HF _clean_text), so "hel�lo" = "hello".
+	ids, _ := tok.Encode("hel�lo", MaxSeqLen)
+	if !equalIDs(ids, []int64{2, 4, 3}) {
+		t.Fatalf("ids=%v want [2 4 3]", ids)
+	}
+}
+
+func equalIDs(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestEncodeUnknownAndTruncate(t *testing.T) {
 	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello"}
 	tok, _ := New(writeVocab(t, vocab), true, "", "", "")

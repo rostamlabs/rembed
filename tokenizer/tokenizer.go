@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // MaxSeqLen is the default maximum sequence length (BERT position-embedding
@@ -72,12 +74,44 @@ func New(vocabPath string, lowerCase bool, clsTok, sepTok, unkTok string) (*Toke
 // VocabSize returns the number of entries in the loaded vocab.
 func (t *Tokenizer) VocabSize() int { return len(t.vocab) }
 
+// isBertPunct mirrors HF's _is_punctuation: the four ASCII non-alphanumeric
+// ranges are always separators (even symbols like $ or +); beyond ASCII only
+// Unicode category P counts. Non-ASCII symbols (€ £ ° →) are NOT separators
+// in BERT, so they stay attached to the surrounding word's WordPiece run.
+func isBertPunct(r rune) bool {
+	if r < 0x80 {
+		return (r >= 33 && r <= 47) || (r >= 58 && r <= 64) || (r >= 91 && r <= 96) || (r >= 123 && r <= 126)
+	}
+	return unicode.IsPunct(r)
+}
+
+// isCJKIdeograph mirrors HF's _is_chinese_char: CJK Unified Ideographs (and
+// extensions/compat blocks) are space-padded so each ideograph is its own
+// word. Hiragana/katakana/hangul are deliberately NOT included, matching HF.
+func isCJKIdeograph(r rune) bool {
+	switch {
+	case r >= 0x4E00 && r <= 0x9FFF,
+		r >= 0x3400 && r <= 0x4DBF,
+		r >= 0x20000 && r <= 0x2A6DF,
+		r >= 0x2A700 && r <= 0x2B73F,
+		r >= 0x2B740 && r <= 0x2B81F,
+		r >= 0x2B820 && r <= 0x2CEAF,
+		r >= 0xF900 && r <= 0xFAFF,
+		r >= 0x2F800 && r <= 0x2FA1F:
+		return true
+	}
+	return false
+}
+
 // basicTokens splits on whitespace and separates punctuation, mirroring BERT's
-// BasicTokenizer (control-char strip, optional lowercase). CJK handling is out
-// of scope for the MVP English models.
+// BasicTokenizer: clean (drop control chars and U+FFFD), space-pad CJK
+// ideographs, optional lowercase + accent stripping (NFD, drop combining
+// marks — HF couples stripping to do_lower_case), then whitespace/punct split.
 func (t *Tokenizer) basicTokens(text string) []string {
 	if t.lowerCase {
-		text = strings.ToLower(text)
+		// HF lowercases each token then strips accents; doing it text-wide is
+		// equivalent because neither step creates or destroys separators.
+		text = norm.NFD.String(strings.ToLower(text))
 	}
 	var out []string
 	var cur strings.Builder
@@ -89,11 +123,18 @@ func (t *Tokenizer) basicTokens(text string) []string {
 	}
 	for _, r := range text {
 		switch {
+		case t.lowerCase && unicode.Is(unicode.Mn, r):
+			// accent stripping: drop combining marks exposed by NFD
+		case r == 0xFFFD:
+			// drop, mirroring HF _clean_text
 		case unicode.IsSpace(r):
 			flush()
 		case unicode.IsControl(r):
 			// drop
-		case unicode.IsPunct(r) || unicode.IsSymbol(r):
+		case isCJKIdeograph(r):
+			flush()
+			out = append(out, string(r))
+		case isBertPunct(r):
 			flush()
 			out = append(out, string(r))
 		default:

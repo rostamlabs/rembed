@@ -61,11 +61,19 @@ the engine can later slot in behind it:
    (IsSpace checked before IsControl), greedy longest-match WordPiece with
    `##` continuations, [CLS]/[SEP]/[UNK], configurable special tokens, and
    truncation to 512 tokens. Its unit tests come along in the port.
+   Post-port, the basic tokenizer was brought to full HF BasicTokenizer
+   fidelity (all pinned by golden cases): accent stripping via NFD +
+   combining-mark removal when lowercasing, CJK-ideograph space-padding,
+   BERT's exact punctuation predicate (ASCII symbol ranges split; non-ASCII
+   symbols like € do NOT), and U+FFFD removal.
 
 ## Resolved in this session (small choices the kickoff left open)
 
-- Module path `github.com/rostamlabs/rembed`, Go 1.26, **zero third-party Go
-  dependencies** for v1 (avo appears at M3 as a build-time codegen tool only).
+- Module path `github.com/rostamlabs/rembed`, Go 1.26. Dependency rule:
+  **stdlib plus `golang.org/x` only** for v1 — `golang.org/x/text` provides
+  the NFD normalization that HF-faithful accent stripping requires; nothing
+  cgo, nothing outside the Go project (avo appears at M3 as a build-time
+  codegen tool only).
 - v1 embeds each text independently (no cross-text padding/batching): the
   sequence length is the text's own token count, which matches the per-text
   ONNX reference run exactly and keeps masking trivial. Batching across texts
@@ -78,10 +86,12 @@ the engine can later slot in behind it:
   do_lower_case, special tokens, pooling strategy, normalize flag.
 - Golden reference comes from ONNX Runtime **in Python** (models ship
   `onnx/model.onnx` on HuggingFace): convert.py runs fixed inputs through
-  onnxruntime, applies mean pooling + L2 normalize in numpy, and writes
-  `testdata/golden.json` with, per input: the text, the HF-tokenizer input
-  ids, and the final embedding. Storing the ids separately lets a failure be
-  attributed to the tokenizer vs the numerics immediately. Model weights
+  onnxruntime, applies mean pooling (+ L2 normalize iff the manifest says so)
+  in numpy, and writes `testdata/golden.json` with, per input: the text, the
+  HF-tokenizer input ids, and the final embedding. Storing the ids separately
+  lets a failure be attributed to the tokenizer vs the numerics immediately.
+  The input set deliberately covers accents, non-ASCII symbols, and CJK — the
+  classes where a naive tokenizer silently diverges from HF. Model weights
   (~90 MB) are never committed; tests that need them skip when the model dir
   is absent.
 
