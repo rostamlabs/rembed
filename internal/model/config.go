@@ -14,6 +14,7 @@ import (
 // sentence-transformers pooling config.
 type Config struct {
 	Name                  string  `json:"name"`
+	ModelType             string  `json:"model_type,omitempty"` // "" or "bert", or "mpnet"
 	HiddenSize            int     `json:"hidden_size"`
 	NumHiddenLayers       int     `json:"num_hidden_layers"`
 	NumAttentionHeads     int     `json:"num_attention_heads"`
@@ -27,6 +28,28 @@ type Config struct {
 	UnkToken              string  `json:"unk_token"`
 	Pooling               string  `json:"pooling"`   // "mean" or "cls"
 	Normalize             bool    `json:"normalize"` // L2-normalize the pooled vector
+
+	// MPNet only. Positions are offset by PadTokenID+1 (fairseq
+	// convention: position ids start at padding_idx+1), and every layer's
+	// attention scores share one bucketed relative-position bias table.
+	RelativeAttentionNumBuckets int `json:"relative_attention_num_buckets,omitempty"`
+	PadTokenID                  int `json:"pad_token_id,omitempty"`
+}
+
+// PositionOffset is the value added to a token's index to form its
+// position-embedding row: 0 for BERT, PadTokenID+1 for MPNet (rows 0 and 1
+// of its position table are the padding slots and are never used).
+func (c *Config) PositionOffset() int {
+	if c.ModelType == "mpnet" {
+		return c.PadTokenID + 1
+	}
+	return 0
+}
+
+// MaxSeqLen is the longest token sequence the model can encode — the
+// position-table size minus the offset rows MPNet reserves.
+func (c *Config) MaxSeqLen() int {
+	return c.MaxPositionEmbeddings - c.PositionOffset()
 }
 
 // LoadConfig reads and sanity-checks a manifest.json.
@@ -54,6 +77,18 @@ func validate(c *Config, source string) error {
 	}
 	if c.Pooling != "mean" && c.Pooling != "cls" {
 		return fmt.Errorf("%s: pooling %q unsupported (mean or cls)", source, c.Pooling)
+	}
+	switch c.ModelType {
+	case "", "bert":
+	case "mpnet":
+		if c.RelativeAttentionNumBuckets <= 0 {
+			return fmt.Errorf("%s: model_type mpnet requires relative_attention_num_buckets", source)
+		}
+		if c.PadTokenID < 0 || c.MaxSeqLen() <= 0 {
+			return fmt.Errorf("%s: pad_token_id %d leaves no usable positions (max_position_embeddings %d)", source, c.PadTokenID, c.MaxPositionEmbeddings)
+		}
+	default:
+		return fmt.Errorf("%s: model_type %q unsupported (bert or mpnet)", source, c.ModelType)
 	}
 	if c.LayerNormEps == 0 {
 		c.LayerNormEps = 1e-12

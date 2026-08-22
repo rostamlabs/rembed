@@ -124,8 +124,11 @@ def main() -> None:
     pooling = json.loads(fetch("1_Pooling/config.json").read_text())
     modules = json.loads(fetch("modules.json").read_text())
 
-    if config.get("model_type") != "bert":
-        raise SystemExit(f"model_type={config.get('model_type')!r}: only BERT-family models are supported")
+    model_type = config.get("model_type")
+    if model_type not in ("bert", "mpnet"):
+        raise SystemExit(f"model_type={model_type!r}: only bert and mpnet models are supported")
+    if model_type == "mpnet" and not config.get("relative_attention_num_buckets"):
+        raise SystemExit("mpnet config.json lacks relative_attention_num_buckets")
     # The Go engine hardcodes exact-erf GELU and absolute position embeddings;
     # anything else would produce a valid-looking model dir that computes the
     # wrong thing, so refuse at export time.
@@ -165,6 +168,12 @@ def main() -> None:
         "pooling": pool_mode,
         "normalize": normalize,
     }
+    if model_type == "mpnet":
+        # Positions are offset by pad_token_id+1 (fairseq convention), and
+        # attention adds a shared bucketed relative-position bias.
+        manifest["model_type"] = "mpnet"
+        manifest["relative_attention_num_buckets"] = config["relative_attention_num_buckets"]
+        manifest["pad_token_id"] = config.get("pad_token_id", 1)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"wrote {out}/[model.safetensors vocab.txt manifest.json]")
 
@@ -173,9 +182,13 @@ def main() -> None:
     sess = ort.InferenceSession(fetch("onnx/model.onnx"), providers=["CPUExecutionProvider"])
     input_names = {i.name for i in sess.get_inputs()}
 
+    max_len = manifest["max_position_embeddings"]
+    if model_type == "mpnet":
+        max_len -= config.get("pad_token_id", 1) + 1
+
     golden = []
     for text in GOLDEN_TEXTS:
-        enc = tokenizer(text, truncation=True, max_length=manifest["max_position_embeddings"])
+        enc = tokenizer(text, truncation=True, max_length=max_len)
         ids = np.array([enc["input_ids"]], dtype=np.int64)
         mask = np.array([enc["attention_mask"]], dtype=np.int64)
         feeds = {"input_ids": ids, "attention_mask": mask}
@@ -202,7 +215,7 @@ def main() -> None:
         # validating EmbedTokens (no pooling, no normalization).
         tcases = []
         for text in GOLDEN_TEXTS[:3]:
-            enc = tokenizer(text, truncation=True, max_length=manifest["max_position_embeddings"])
+            enc = tokenizer(text, truncation=True, max_length=max_len)
             ids = np.array([enc["input_ids"]], dtype=np.int64)
             feeds = {"input_ids": ids, "attention_mask": np.array([enc["attention_mask"]], dtype=np.int64)}
             if "token_type_ids" in input_names:

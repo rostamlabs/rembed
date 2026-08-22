@@ -33,8 +33,14 @@ gemm4x16i8, and dot4 to NEON (FMLA-by-element removes even the broadcast
 step; 32 vector registers fit the whole 4×16 tile). Verified under
 qemu-aarch64 locally and in CI, benchmarked on real ARM when available.
 
-## R4 — MPNet architecture (all-mpnet-base-v2)
-The most popular sentence-transformers model rembed cannot run. Needs:
+## R4 — MPNet architecture (all-mpnet-base-v2) ✅
+Done: model_type=mpnet end to end — offset positions (pad_token_id+1),
+no segment table, and the shared bucketed relative-position bias added
+to every layer's attention scores (computed once per forward as a
+[heads×(2·seq−1)] delta table since positions are contiguous).
+Validated against the repo's ONNX export: maxAbsDiff 3.3e-7, cosine
+1.0 over the 11-case golden; int8 cosine ≥ 0.9989 vs fp32. The
+original scope, for the record — needed:
 relative position bias added to attention scores (bucketed, shared
 across layers) on top of absolute embeddings, RoBERTa-style position
 offsets, MPNet special tokens (the tokenizer already supports custom

@@ -41,15 +41,29 @@ func DeriveConfig(dir, name string) (Config, error) {
 		VocabSize             int      `json:"vocab_size"`
 		MaxPositionEmbeddings int      `json:"max_position_embeddings"`
 		LayerNormEps          *float32 `json:"layer_norm_eps"`
+		RelAttnNumBuckets     int      `json:"relative_attention_num_buckets"`
+		PadTokenID            *int     `json:"pad_token_id"`
 	}
 	if err := readJSON("config.json", &hf); err != nil {
 		return c, err
 	}
-	// The engine hardcodes the BERT encoder, exact-erf GELU, and absolute
-	// positions; anything else would produce a valid-looking wrong answer,
-	// so refuse loudly here (mirrors convert.py's export-time guards).
-	if hf.ModelType != "bert" {
-		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports BERT-family encoders", dir, hf.ModelType)
+	// The engine hardcodes two encoder architectures, exact-erf GELU, and
+	// absolute position embeddings; anything else would produce a
+	// valid-looking wrong answer, so refuse loudly here (mirrors
+	// convert.py's export-time guards).
+	switch hf.ModelType {
+	case "bert":
+	case "mpnet":
+		if hf.RelAttnNumBuckets <= 0 {
+			return c, fmt.Errorf("model dir %s: mpnet config.json lacks relative_attention_num_buckets", dir)
+		}
+		if hf.PadTokenID == nil {
+			// Every MPNet checkpoint sets it (HF's default is 1), and
+			// guessing wrong shifts every position embedding.
+			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
+		}
+	default:
+		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert and mpnet encoders", dir, hf.ModelType)
 	}
 	if hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
 		return c, fmt.Errorf("model dir %s: hidden_act=%q — only exact GELU is supported", dir, hf.HiddenAct)
@@ -104,6 +118,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 
 	c = Config{
 		Name:                  name,
+		ModelType:             hf.ModelType,
 		HiddenSize:            hf.HiddenSize,
 		NumHiddenLayers:       hf.NumHiddenLayers,
 		NumAttentionHeads:     hf.NumAttentionHeads,
@@ -119,6 +134,10 @@ func DeriveConfig(dir, name string) (Config, error) {
 	}
 	if hf.LayerNormEps != nil {
 		c.LayerNormEps = *hf.LayerNormEps
+	}
+	if hf.ModelType == "mpnet" {
+		c.RelativeAttentionNumBuckets = hf.RelAttnNumBuckets
+		c.PadTokenID = *hf.PadTokenID
 	}
 	return c, validate(&c, dir)
 }

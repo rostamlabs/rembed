@@ -291,6 +291,9 @@ func TestGoldenMatrix(t *testing.T) {
 		{"testdata/golden-all-MiniLM-L12-v2.json", "models/all-MiniLM-L12-v2", "REMBED_MODEL_L12", 1e-4, 0, 1e-5},
 		{"testdata/golden-paraphrase-MiniLM-L3-v2.json", "models/paraphrase-MiniLM-L3-v2", "REMBED_MODEL_L3", 1e-4, 0, 1e-5},
 		{"testdata/golden-gte-small.json", "models/gte-small", "REMBED_MODEL_GTE", 2e-3, 0.9999, 2e-4},
+		// MPNet exercises the second architecture end to end: offset
+		// positions, no segment table, shared relative-position bias.
+		{"testdata/golden-all-mpnet-base-v2.json", "models/all-mpnet-base-v2", "REMBED_MODEL_MPNET", 1e-4, 0, 1e-5},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {
@@ -312,7 +315,12 @@ func TestGoldenMatrix(t *testing.T) {
 			if len(golden.Cases) == 0 {
 				t.Fatal("empty golden")
 			}
-			emb, err := Load(dir)
+			// Serial on purpose: this is a numerics test, and worker count
+			// does not change results (TestWithWorkersSerialMatchesDefault
+			// pins that). The spinning pool is pathologically slow under
+			// -race, and five models × eleven texts of it was most of the
+			// race suite's budget.
+			emb, err := Load(dir, WithWorkers(1))
 			if err != nil {
 				t.Fatal(err)
 			}

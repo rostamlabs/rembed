@@ -150,9 +150,10 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 // sequence length) simultaneously — size servers with WithWorkers.
 func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
-	// The manifest owns the sequence ceiling (position-embedding count);
-	// tokenizer.MaxSeqLen is only that package's standalone default.
-	maxLen := e.cfg.MaxPositionEmbeddings
+	// The manifest owns the sequence ceiling (the position-embedding count,
+	// minus the offset rows MPNet reserves); tokenizer.MaxSeqLen is only
+	// that package's standalone default.
+	maxLen := e.cfg.MaxSeqLen()
 
 	if len(texts) <= 1 {
 		for i, text := range texts {
@@ -232,7 +233,7 @@ type TokenEmbeddings struct {
 // of long inputs is ~200 MB of hidden states.
 func (e *Embedder) EmbedTokens(ctx context.Context, texts []string) ([]TokenEmbeddings, error) {
 	out := make([]TokenEmbeddings, len(texts))
-	maxLen := e.cfg.MaxPositionEmbeddings
+	maxLen := e.cfg.MaxSeqLen()
 	if len(texts) <= 1 {
 		for i, text := range texts {
 			if err := ctx.Err(); err != nil {
@@ -277,7 +278,7 @@ func (e *Embedder) EmbedTokens(ctx context.Context, texts []string) ([]TokenEmbe
 // validation harness (attributing golden mismatches to tokenization vs
 // numerics) and debugging; it is not a stable part of the embedding API.
 func (e *Embedder) Tokenize(text string) []int64 {
-	ids, _ := e.tok.Encode(text, e.cfg.MaxPositionEmbeddings)
+	ids, _ := e.tok.Encode(text, e.cfg.MaxSeqLen())
 	return ids
 }
 
