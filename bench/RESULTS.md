@@ -476,3 +476,34 @@ zmm-wide kernel — future work, now with hardware that can test it.
 L6 on this VM: all four comparisons FLAG-parity (spreads 40-94% on
 sub-2 ms runs); full int8 vs ORT qint8-avx512-vnni measured 0.96×.
 Small-model latencies need quieter hardware than a shared KVM guest.
+
+## zmm fp32 kernel (2026-08-23)
+
+The fp32 counterpart of the VNNI-width story: gemm4x32, the AVX-512
+twin of gemm4x16 — same 4-row micro-tile doubled to two zmm per row,
+over 32-column B panels that PackB now builds automatically on AVX-512
+hardware (every BERT-family dim divides by 32). Per-element accumulation
+order is unchanged, so output is BIT-IDENTICAL to the ymm kernel —
+pinned by TestPackedPanelWidthsAgree on the Zen 4 box, along with the
+full packed sweep and golden battery over the 32-wide layout.
+
+Measured honestly at kernel level on the Zen 4 box (serial pool, 200
+iterations × 3 repeats, ymm vs zmm on identical packed data):
+
+| shape | ymm (w16) | zmm (w32) | delta |
+|---|---|---|---|
+| 28×768×2304 (qkv) | ~1.04 ms | ~1.02 ms | wash |
+| 28×768×3072 (ffn1) | ~1.39 ms | ~1.28 ms | ~6% |
+| 28×3072×768 (ffn2) | ~1.40 ms | ~1.27 ms | ~8% |
+| 160×768×3072 (long-seq ffn1) | 7.56 ms (stable) | 6.87 ms (stable) | **9.5%** |
+
+Exactly what the kernel header predicts for Zen 4: 512-bit FMAs are
+double-pumped through 256-bit ports there, so peak FLOPs are unchanged
+and the win is front-end relief — half the instructions per k step —
+worth 5-10% on large shapes and nothing on small ones. End-to-end that
+is ~6% on mpnet, below this VM's noise floor, and the ORT fp32 rematch
+accordingly showed no movement (1.14×/1.18×, first round flagged). The
+2× peak-FLOPs story belongs to Intel server parts with two native
+512-bit FMA units (Sapphire Rapids+), where this same kernel is the
+enabler — hardware to measure that is the open item. Never slower,
+bit-identical, kept.

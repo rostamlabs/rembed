@@ -11,6 +11,7 @@ const (
 	hasSIMD8   = false
 	hasVNNI    = false
 	hasVNNI512 = false
+	hasAVX512  = false
 )
 
 // The native kernels are never called when hasSIMD/hasSIMD8 are false;
@@ -33,4 +34,8 @@ func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int) {
 
 func gemm4x16vnni512(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int) {
 	panic("tensor: gemm4x16vnni512 is amd64-only")
+}
+
+func gemm4x32(dst *float32, n int, pa, pb *float32, k int) {
+	panic("tensor: gemm4x32 is amd64-only")
 }
