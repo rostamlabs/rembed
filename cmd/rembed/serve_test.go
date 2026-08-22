@@ -85,11 +85,11 @@ func TestServeEmbeddings(t *testing.T) {
 
 	// Error paths use the OpenAI error envelope with actionable messages.
 	for body, wantSub := range map[string]string{
-		`{"input": []}`:           "empty",
-		`{"input": [[1,2,3]]}`:    "array of strings",
-		`{"input": 42}`:           "array of strings",
-		`{}`:                      "missing input",
-		`not json`:                "invalid JSON",
+		`{"input": []}`:        "empty",
+		`{"input": [[1,2,3]]}`: "array of strings",
+		`{"input": 42}`:        "array of strings",
+		`{}`:                   "missing input",
+		`not json`:             "invalid JSON",
 		`{"input": ["a","b","c","d","e","f","g","h","i"]}`: "max-batch",
 	} {
 		rec, out := post(t, h, body)
