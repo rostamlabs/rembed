@@ -7,15 +7,28 @@ import (
 	"testing"
 )
 
-// TestExpf32AgainstFloat64 pins the fast exp to ~2e-7 relative error over
-// the range Softmax and GELU actually use (softmax inputs are ≤ 0 after
-// max-subtraction; GELU feeds -x²).
+// TestExpf32AgainstFloat64 pins the fast exp at its real, measured bounds:
+// ~2e-7 relative near zero, degrading with |x| as the two-part range
+// reduction cancels (~4e-6 at |x|≈85). The review that corrected an
+// optimistic "~2e-7 everywhere" claim is why both tiers are pinned.
 func TestExpf32AgainstFloat64(t *testing.T) {
 	for x := float32(-87); x <= 88; x += 0.001 {
 		got := float64(expf32(x))
 		want := math.Exp(float64(x))
-		if rel := math.Abs(got-want) / want; rel > 5e-7 {
-			t.Fatalf("expf32(%v)=%g want %g (rel %g)", x, got, want, rel)
+		bound := 5e-6
+		if x > -20 && x < 20 {
+			bound = 5e-7
+		}
+		if rel := math.Abs(got-want) / want; rel > bound {
+			t.Fatalf("expf32(%v)=%g want %g (rel %g > %g)", x, got, want, rel, bound)
+		}
+	}
+	// The (88.03, 88.72] region has finite float32 results even though the
+	// exponent reassembly needs 2^128 — the split-scale path must not
+	// return +Inf there.
+	for _, x := range []float32{88.1, 88.5, 88.7} {
+		if v := float64(expf32(x)); math.IsInf(v, 1) {
+			t.Fatalf("expf32(%v)=+Inf, want finite", x)
 		}
 	}
 	// Clamp regions.

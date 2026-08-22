@@ -51,9 +51,14 @@ func PackAPad(m int) int { return (m + 3) &^ 3 }
 // packA4 packs a ([m×k] row-major) into 4-row k-major panels
 // (dst[ip*k*4 + p*4 + r]), zero-filling pad rows so the kernel's extra
 // output rows are deterministic zeros.
-func packA4(dst, a []float32, m, k int) {
+func packA4(dst, a []float32, m, k int, pool *Pool) {
 	mPad := PackAPad(m)
-	for ip := range mPad / 4 {
+	rowPanels := mPad / 4
+	// The pack is a cache-hostile stride-4 scatter and, run serially before
+	// the fan-out, it measured 21% of the whole ffn2 matmul at seq=512 — a
+	// hard Amdahl ceiling. Row panels are independent, so fan them out too
+	// (tiny inputs stay inline; the pack for 3 panels is a few µs).
+	packOne := func(ip int) {
 		panel := dst[ip*k*4 : ip*k*4+k*4]
 		for r := range 4 {
 			i := ip*4 + r
@@ -69,6 +74,13 @@ func packA4(dst, a []float32, m, k int) {
 			}
 		}
 	}
+	if pool == nil || rowPanels < 8 {
+		for ip := range rowPanels {
+			packOne(ip)
+		}
+		return
+	}
+	pool.Run(rowPanels, packOne)
 }
 
 // MatMulPacked computes dst[m×N] = a[m×K] · Bᵀ from a pre-packed weight
@@ -87,7 +99,7 @@ func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *P
 	k, n := pb.K, pb.N
 	_ = dst[mPad*n-1] // fail fast before the asm writes anything
 	_ = aPack[mPad*k-1]
-	packA4(aPack, a, m, k)
+	packA4(aPack, a, m, k, pool)
 
 	rowPanels := mPad / 4
 	colPanels := n / 16
@@ -129,13 +141,16 @@ func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *P
 // once and reused across every row panel of the chunk.
 func gemmChunk(dst, aPack []float32, pb *PackedB, ip0, ip1, jp0, jp1, k, n int) {
 	for jp := jp0; jp < jp1; jp++ {
-		pbPanel := &pb.data[jp*k*16]
+		// Reslice every operand to exactly what the asm touches, matching
+		// the dst discipline — a raw &s[i] checks only the first element.
+		bp := pb.data[jp*k*16 : (jp+1)*k*16]
 		for ip := ip0; ip < ip1; ip++ {
+			ap := aPack[ip*k*4 : (ip+1)*k*4]
 			off := ip*4*n + jp*16
 			// Reslice so every float the asm writes (3 full rows of stride
 			// n plus the final 16-wide row) is bounds-checked up front.
 			d := dst[off : off+3*n+16]
-			gemm4x16(&d[0], n, &aPack[ip*k*4], pbPanel, k)
+			gemm4x16(&d[0], n, &ap[0], &bp[0], k)
 		}
 	}
 }
