@@ -18,8 +18,7 @@ import (
 )
 
 // Embedder turns texts into fixed-size embedding vectors. It is safe for
-// concurrent use... once M1 lands; at M0 each call allocates its own scratch,
-// so concurrent Embed calls are already safe, just not fast.
+// concurrent use.
 type Embedder struct {
 	cfg model.Config
 	tok *tokenizer.Tokenizer
@@ -37,6 +36,11 @@ func Load(modelDir string) (*Embedder, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
+	if tok.VocabSize() != cfg.VocabSize {
+		// A vocab.txt and model.safetensors from different models would
+		// otherwise produce silently wrong (or per-call failing) embeddings.
+		return nil, fmt.Errorf("rembed: vocab.txt has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
+	}
 	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
@@ -50,7 +54,9 @@ func Load(modelDir string) (*Embedder, error) {
 // context is checked between texts.
 func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
-	maxLen := min(e.cfg.MaxPositionEmbeddings, tokenizer.MaxSeqLen)
+	// The manifest owns the sequence ceiling (position-embedding count);
+	// tokenizer.MaxSeqLen is only that package's standalone default.
+	maxLen := e.cfg.MaxPositionEmbeddings
 	for i, text := range texts {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -65,10 +71,11 @@ func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, erro
 	return out, nil
 }
 
-// Tokenize exposes the tokenizer's input_ids for one text — used by the
-// validation harness to attribute mismatches to tokenization vs numerics.
+// Tokenize exposes the tokenizer's input_ids for one text. It exists for the
+// validation harness (attributing golden mismatches to tokenization vs
+// numerics) and debugging; it is not a stable part of the embedding API.
 func (e *Embedder) Tokenize(text string) []int64 {
-	ids, _ := e.tok.Encode(text, min(e.cfg.MaxPositionEmbeddings, tokenizer.MaxSeqLen))
+	ids, _ := e.tok.Encode(text, e.cfg.MaxPositionEmbeddings)
 	return ids
 }
 

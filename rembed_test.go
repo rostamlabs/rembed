@@ -48,6 +48,9 @@ func TestGoldenAgainstONNXReference(t *testing.T) {
 	if err := json.Unmarshal(raw, &golden); err != nil {
 		t.Fatal(err)
 	}
+	if len(golden.Cases) == 0 {
+		t.Fatal("golden file has no cases — an empty reference must not pass")
+	}
 	emb, err := Load(dir)
 	if err != nil {
 		t.Fatal(err)

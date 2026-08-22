@@ -26,24 +26,40 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TEXT = "The quick brown fox jumps over the lazy dog."
 
 
-def bench_ours(binary: str, model_dir: str, text: str, runs: int, warmup: int) -> list[float]:
+def bench_ours(binary: str, model_dir: str, text: str, runs: int, warmup: int,
+               expect_seq: int) -> list[float]:
     """Per-run embed latencies (seconds) from the Go engine, in-process there."""
     out = subprocess.run(
         [binary, "bench", "-model", model_dir, "-runs", str(runs), "-warmup", str(warmup),
          "-text", text, "-json"],
         check=True, capture_output=True, text=True, cwd=REPO_ROOT,
     ).stdout
-    return json.loads(out)["runs_sec"]
+    payload = json.loads(out)
+    # Both engines must tokenize to the same length or the ratio compares
+    # different workloads.
+    if payload["seq"] != expect_seq:
+        raise SystemExit(
+            f"seq mismatch: Go tokenized to {payload['seq']}, HF to {expect_seq} — "
+            f"fix the tokenizer divergence before trusting any ratio"
+        )
+    return payload["runs_sec"]
 
 
-def bench_onnx(model_id: str, text: str, runs: int, warmup: int) -> list[float]:
+def bench_onnx(model_id: str, text: str, runs: int, warmup: int, threads: int) -> list[float]:
     import onnxruntime as ort
     from huggingface_hub import hf_hub_download
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_id)
+    so = ort.SessionOptions()
+    # Pin ORT's pools: the Go engine is single-threaded until M2, so the
+    # like-for-like baseline is 1; pass --onnx-threads 0 for ORT's default
+    # all-cores pool (report which one a number came from!).
+    if threads > 0:
+        so.intra_op_num_threads = threads
+        so.inter_op_num_threads = 1
     sess = ort.InferenceSession(
-        hf_hub_download(model_id, "onnx/model.onnx"), providers=["CPUExecutionProvider"]
+        hf_hub_download(model_id, "onnx/model.onnx"), so, providers=["CPUExecutionProvider"]
     )
     input_names = {i.name for i in sess.get_inputs()}
     enc = tok(text, truncation=True, max_length=512)
@@ -80,22 +96,31 @@ def main() -> None:
     ap.add_argument("--text", default=DEFAULT_TEXT)
     ap.add_argument("--runs", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=5)
+    ap.add_argument("--onnx-threads", type=int, default=1,
+                    help="ORT intra-op threads (1 = like-for-like vs single-threaded Go; 0 = ORT default pool)")
     args = ap.parse_args()
+    if args.runs <= 0 or args.warmup < 0:
+        raise SystemExit("--runs must be > 0 and --warmup >= 0")
+
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer
+    hf_seq = len(AutoTokenizer.from_pretrained(args.model_id)(args.text, truncation=True, max_length=512)["input_ids"])
 
     binary = args.binary
     if binary is None:
         binary = str(REPO_ROOT / "bin" / "rembed")
         subprocess.run(["go", "build", "-o", binary, "./cmd/rembed"], check=True, cwd=REPO_ROOT)
 
+    print(f"seq={hf_seq}  onnx-threads={args.onnx_threads or 'default pool'}")
     results: dict[str, list[list[float]]] = {"ours": [], "onnx": []}
     for order in ("us-then-onnx", "onnx-then-us"):
         print(f"order: {order}")
         if order == "us-then-onnx":
-            results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup))
-            results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup))
+            results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup, hf_seq))
+            results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup, args.onnx_threads))
         else:
-            results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup))
-            results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup))
+            results["onnx"].append(bench_onnx(args.model_id, args.text, args.runs, args.warmup, args.onnx_threads))
+            results["ours"].append(bench_ours(binary, args.model_dir, args.text, args.runs, args.warmup, hf_seq))
         summarize("ours", results["ours"][-1])
         summarize("onnx", results["onnx"][-1])
 

@@ -24,10 +24,10 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Fixed golden inputs. ASCII-only on purpose: the Go tokenizer does not strip
-# accents (HF's BasicTokenizer does when lowercasing), so accented inputs
-# would fail on tokenization, not numerics. That gap is documented in
-# DESIGN.md; revisit if non-English models are ever in scope.
+# Fixed golden inputs. Deliberately includes the historically-divergent
+# tokenizer classes — accents (stripped when lowercasing), non-ASCII symbols
+# (NOT separators in BERT), and CJK ideographs (space-padded) — so the golden
+# set pins HF-fidelity of the tokenizer, not just the numerics.
 GOLDEN_TEXTS = [
     "hello world",
     "The quick brown fox jumps over the lazy dog.",
@@ -36,6 +36,9 @@ GOLDEN_TEXTS = [
     "embedding inference engines should be boring, predictable, and fast",
     "punctuation, splitting: does it (really) work?! yes -- it does...",
     "supercalifragilisticexpialidocious antidisestablishmentarianism pseudopseudohypoparathyroidism",
+    "café résumé naïve déjà vu at the sørensen-müller café",
+    "€100 costs $5, or ±43 at 20° ± 3°",
+    "你好世界 mixed with english text",
     "In 2024, the model processed 1,234,567 queries at 99.9% availability, "
     "averaging 3.14 ms per request across 42 regions. "
     "This sentence exists to push the sequence length up so the golden set "
@@ -63,11 +66,20 @@ def sanity_check_safetensors(path: Path) -> None:
         raise SystemExit(f"{path}: non-F32 tensors (unsupported by the Go loader): {bad}")
 
 
-def mean_pool_normalize(last_hidden: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """[seq, H] token embeddings + [seq] attention mask -> normalized [H]."""
+def mean_pool(last_hidden: np.ndarray, mask: np.ndarray, normalize: bool) -> np.ndarray:
+    """[seq, H] token embeddings + [seq] attention mask -> pooled [H].
+
+    `normalize` must be the manifest's flag: the Go engine honors it, so the
+    golden must too, or the reference itself becomes wrong.
+    """
     m = mask.astype(np.float32)[:, None]
     pooled = (last_hidden * m).sum(axis=0) / np.maximum(m.sum(), 1e-9)
-    return pooled / np.linalg.norm(pooled)
+    if normalize:
+        n = np.linalg.norm(pooled)
+        if n == 0:
+            raise SystemExit("golden case pooled to a zero vector; refusing to divide")
+        pooled = pooled / n
+    return pooled
 
 
 def main() -> None:
@@ -100,9 +112,24 @@ def main() -> None:
 
     if config.get("model_type") != "bert":
         raise SystemExit(f"model_type={config.get('model_type')!r}: only BERT-family models are supported")
-    if not pooling.get("pooling_mode_mean_tokens"):
-        raise SystemExit(f"unsupported pooling config (v1 supports mean): {pooling}")
-    normalize = any("Normalize" in m.get("type", "") for m in modules)
+    # The Go engine hardcodes exact-erf GELU and absolute position embeddings;
+    # anything else would produce a valid-looking model dir that computes the
+    # wrong thing, so refuse at export time.
+    if config.get("hidden_act", "gelu") != "gelu":
+        raise SystemExit(f"hidden_act={config.get('hidden_act')!r}: only exact GELU is supported")
+    if config.get("position_embedding_type", "absolute") != "absolute":
+        raise SystemExit(f"position_embedding_type={config.get('position_embedding_type')!r}: only absolute is supported")
+    if not pooling.get("pooling_mode_mean_tokens") or any(
+        pooling.get(k) for k in ("pooling_mode_cls_token", "pooling_mode_max_tokens", "pooling_mode_lasttoken")
+    ):
+        raise SystemExit(f"unsupported pooling config (v1 supports mean only): {pooling}")
+    # Any ST module beyond Transformer/Pooling/Normalize (e.g. a Dense head)
+    # would make the real model differ from what rembed computes.
+    known = ("models.Transformer", "models.Pooling", "models.Normalize")
+    unknown = [m["type"] for m in modules if not m.get("type", "").endswith(known)]
+    if unknown:
+        raise SystemExit(f"unsupported sentence-transformers modules: {unknown}")
+    normalize = any(m.get("type", "").endswith("models.Normalize") for m in modules)
 
     manifest = {
         "name": args.model_id,
@@ -137,7 +164,7 @@ def main() -> None:
         if "token_type_ids" in input_names:
             feeds["token_type_ids"] = np.zeros_like(ids)
         (last_hidden,) = sess.run(["last_hidden_state"], feeds)
-        emb = mean_pool_normalize(last_hidden[0], mask[0])
+        emb = mean_pool(last_hidden[0], mask[0], normalize)
         golden.append(
             {
                 "text": text,

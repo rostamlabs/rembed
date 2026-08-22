@@ -59,21 +59,28 @@ func TestLoadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLoadSkipsNonF32(t *testing.T) {
-	// Non-F32 tensors (e.g. BERT's I64 position_ids buffer) are skipped, not
-	// fatal; F32 tensors in the same file still load.
-	header := `{"buf":{"dtype":"I64","shape":[1],"data_offsets":[0,8]},` +
+func TestLoadSkipsPositionIDsBufferOnly(t *testing.T) {
+	// BERT's I64 position_ids buffer is skipped, not fatal; F32 tensors in
+	// the same file still load.
+	header := `{"embeddings.position_ids":{"dtype":"I64","shape":[1],"data_offsets":[0,8]},` +
 		`"w":{"dtype":"F32","shape":[1],"data_offsets":[8,12]}}`
 	data := append(make([]byte, 8), f32bytes(7)...)
 	tensors, err := Load(writeFile(t, header, data))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := tensors["buf"]; ok {
-		t.Fatal("non-F32 tensor should be skipped")
+	if _, ok := tensors["embeddings.position_ids"]; ok {
+		t.Fatal("position_ids buffer should be skipped")
 	}
 	if w := tensors["w"]; len(w.Data) != 1 || w.Data[0] != 7 {
 		t.Fatalf("w=%v", tensors["w"])
+	}
+
+	// Any OTHER non-F32 tensor (e.g. an fp16 weight) must fail loudly with
+	// the dtype as the reason, not surface later as "missing tensor".
+	badHeader := `{"embeddings.word_embeddings.weight":{"dtype":"F16","shape":[1],"data_offsets":[0,2]}}`
+	if _, err := Load(writeFile(t, badHeader, []byte{0, 0})); err == nil {
+		t.Fatal("expected dtype error for non-F32 weight")
 	}
 }
 

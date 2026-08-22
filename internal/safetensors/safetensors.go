@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 )
 
 // Tensor is one named weight: Shape and its row-major F32 data.
@@ -66,11 +67,14 @@ func Load(path string) (map[string]Tensor, error) {
 			return nil, fmt.Errorf("safetensors %s: bad entry %q: %w", path, name, err)
 		}
 		if e.Dtype != "F32" {
-			// Skip non-F32 tensors (e.g. the I64 position_ids buffer BERT
-			// checkpoints carry). Real weights are all F32 in the supported
-			// models; a missing weight surfaces as a clear error in the
-			// model loader.
-			continue
+			// The I64 position_ids buffer BERT checkpoints carry is not a
+			// weight; skip it. Any OTHER non-F32 tensor means an unsupported
+			// checkpoint (e.g. fp16) — fail here with the real reason rather
+			// than as a confusing "missing tensor" later.
+			if strings.HasSuffix(name, "position_ids") {
+				continue
+			}
+			return nil, fmt.Errorf("safetensors %s: tensor %q has dtype %s; only F32 is supported", path, name, e.Dtype)
 		}
 		start, end := e.DataOffsets[0], e.DataOffsets[1]
 		if start > end || end > uint64(len(data)) {

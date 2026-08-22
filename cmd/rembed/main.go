@@ -89,6 +89,7 @@ func cmdValidate(args []string) error {
 	modelDir := fs.String("model", "models/all-MiniLM-L6-v2", "model directory")
 	goldenPath := fs.String("golden", "testdata/golden.json", "golden reference file")
 	tol := fs.Float64("tol", 1e-4, "max abs difference tolerance")
+	force := fs.Bool("force", false, "proceed even if the golden was generated for a different model")
 	_ = fs.Parse(args)
 
 	raw, err := os.ReadFile(*goldenPath)
@@ -99,11 +100,17 @@ func cmdValidate(args []string) error {
 	if err := json.Unmarshal(raw, &golden); err != nil {
 		return fmt.Errorf("golden %s: %w", *goldenPath, err)
 	}
+	if len(golden.Cases) == 0 {
+		return fmt.Errorf("golden %s: no cases — refusing to report success on an empty reference", *goldenPath)
+	}
 	emb, err := rembed.Load(*modelDir)
 	if err != nil {
 		return err
 	}
 	if emb.Model() != golden.Model {
+		if !*force {
+			return fmt.Errorf("golden is for %q but model dir is %q (use -force to compare anyway)", golden.Model, emb.Model())
+		}
 		fmt.Printf("note: golden is for %q, model dir is %q\n", golden.Model, emb.Model())
 	}
 
@@ -118,6 +125,9 @@ func cmdValidate(args []string) error {
 		vecs, err := emb.Embed(context.Background(), []string{c.Text})
 		if err != nil {
 			return err
+		}
+		if len(c.Embedding) != len(vecs[0]) {
+			return fmt.Errorf("golden %q has dim %d but model produced dim %d", c.Text, len(c.Embedding), len(vecs[0]))
 		}
 		maxDiff := 0.0
 		for i, want := range c.Embedding {
@@ -147,6 +157,9 @@ func cmdBench(args []string) error {
 	text := fs.String("text", "The quick brown fox jumps over the lazy dog.", "input text")
 	asJSON := fs.Bool("json", false, "emit machine-readable per-run latencies (for bench/compare.py)")
 	_ = fs.Parse(args)
+	if *runs <= 0 || *warmup < 0 {
+		return fmt.Errorf("bench: -runs must be > 0 and -warmup >= 0 (got %d, %d)", *runs, *warmup)
+	}
 
 	emb, err := rembed.Load(*modelDir)
 	if err != nil {
@@ -172,7 +185,8 @@ func cmdBench(args []string) error {
 		for i, d := range durs {
 			runsSec[i] = d.Seconds()
 		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"runs_sec": runsSec})
+		// seq lets compare.py verify both engines tokenize to the same length.
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"runs_sec": runsSec, "seq": len(ids)})
 	}
 	slices.Sort(durs)
 	median := durs[len(durs)/2]
