@@ -53,6 +53,11 @@ Validated end-to-end against each model's own ONNX Runtime reference:
 | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | mean | F32 | 7e-7 | cosine ≥ 0.9995 |
 | thenlper/gte-small | mean | F16 | 2e-3 maxAbs + cosine ≥ 0.9999 + meanAbs ≤ 2e-4 (the repo's ONNX export is fp32 while its safetensors are f16, so maxAbs is dominated by the checkpoint's own rounding; the cosine/mean bounds are what actually constrain rembed) | — |
 
+On CPUs with AVX-VNNI (Intel 2021+, AMD Zen 5), `WithInt8Activations`
+selects full int8 inference — u8 activations × s8 weights via VPDPBUSD —
+for a further ~1.3× over weight-only int8 at a measured accuracy trade
+(cosine ≥ 0.991 vs ≥ 0.9978; both test-enforced).
+
 Expected compatible (same architecture, no ONNX export on the Hub to
 validate against): the e5 family, larger BGE/GTE sizes, and other
 BERT-based sentence-transformers checkpoints. Caveat for retrieval

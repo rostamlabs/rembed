@@ -12,6 +12,10 @@ import "golang.org/x/sys/cpu"
 var (
 	hasSIMD  = cpu.X86.HasAVX2 && cpu.X86.HasFMA
 	hasSIMD8 = hasSIMD
+	// hasVNNI gates the u8·s8 VPDPBUSD kernel. AVX-VNNI is the 256-bit
+	// VEX form (Alder Lake 2021 onward, plus every AVX-512-VNNI server
+	// part, which reports it too).
+	hasVNNI = hasSIMD && cpu.X86.HasAVXVNNI
 )
 
 // dot4 computes dst[0..3] = dot(a, b0..b3) over k floats with 8-lane FMA
@@ -33,3 +37,9 @@ func gemm4x16(dst *float32, n int, pa, pb *float32, k int)
 //
 //go:noescape
 func gemm4x16i8(dst *float32, n int, pa *float32, pb *int8, k int, scales *float32)
+
+// gemm4x16vnni accumulates dst[4×16] int32 += u8(qa)·s8(pb) over kg
+// groups of 4 k-values (implemented in vnni_amd64.s; requires AVX-VNNI).
+//
+//go:noescape
+func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int)

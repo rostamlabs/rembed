@@ -49,6 +49,7 @@ type Option func(*loadOptions)
 
 type loadOptions struct {
 	int8    bool
+	int8act bool
 	workers int
 }
 
@@ -61,6 +62,18 @@ type loadOptions struct {
 // silently falls back to fp32; check Quantized() when the mode matters.
 func WithInt8() Option {
 	return func(o *loadOptions) { o.int8 = true }
+}
+
+// WithInt8Activations selects FULL int8 inference on CPUs with AVX-VNNI
+// (Alder Lake 2021+, and AVX-512-VNNI servers): weights per-channel int8
+// AND activations quantized per row to u8 at matmul time, so VPDPBUSD
+// does four multiply-accumulates per lane per instruction. Accuracy
+// trades a little further than weight-only int8 — see the measured bound
+// in the golden test — and the engine falls back to weight-only int8
+// (then fp32) where VNNI or a shape is unavailable; check
+// QuantizedActivations() when the mode matters. Implies WithInt8.
+func WithInt8Activations() Option {
+	return func(o *loadOptions) { o.int8, o.int8act = true, true }
 }
 
 // WithWorkers caps the number of CPU workers one Embed call uses.
@@ -164,7 +177,14 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 	case tok.VocabSize() != cfg.VocabSize:
 		return nil, fmt.Errorf("rembed: vocab has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 	}
-	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, o.int8, o.workers)
+	quant := model.QuantNone
+	switch {
+	case o.int8act:
+		quant = model.QuantFull
+	case o.int8:
+		quant = model.QuantWeights
+	}
+	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, quant, o.workers)
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
@@ -318,10 +338,15 @@ func (e *Embedder) Tokenize(text string) []int64 {
 // Model returns the model name from the manifest.
 func (e *Embedder) Model() string { return e.cfg.Name }
 
-// Quantized reports whether the weight-only int8 path is actually active
-// (WithInt8 requested AND every dense weight packed as int8 — the engine
-// falls back to fp32 per-matrix when the CPU or a shape cannot take it).
+// Quantized reports whether an int8 path is actually active (WithInt8 or
+// WithInt8Activations requested AND every dense weight packed as int8 —
+// the engine falls back to fp32 per-matrix when the CPU or a shape
+// cannot take it).
 func (e *Embedder) Quantized() bool { return e.m.Quantized() }
+
+// QuantizedActivations reports whether the full u8-activation VNNI path
+// is active for every dense weight.
+func (e *Embedder) QuantizedActivations() bool { return e.m.QuantizedActivations() }
 
 // Dim returns the embedding dimensionality.
 func (e *Embedder) Dim() int { return e.cfg.HiddenSize }

@@ -24,11 +24,12 @@ import (
 // raw slice is dropped so weights are never held twice. Otherwise raw keeps
 // HuggingFace's [out, in] layout, exactly the bT operand of MatMulFunc.
 type denseWeight struct {
-	packed  *tensor.PackedB
-	packed8 *tensor.PackedB8
-	raw     []float32
-	bias    []float32
-	in, out int
+	packed   *tensor.PackedB
+	packed8  *tensor.PackedB8
+	packed8v *tensor.PackedB8V // VNNI u8·s8 path (weights AND activations int8)
+	raw      []float32
+	bias     []float32
+	in, out  int
 }
 
 // layer holds one encoder layer's weights. Q/K/V are fused into a single
@@ -127,6 +128,8 @@ type scratch struct {
 	qh, kh, ch []float32    // [heads][seq×dh] = [seq×H]
 	vhT        []float32    // [heads][dh×seq] = [H×seq]
 	biasDelta  []float32    // [heads×(2seq−1)] MPNet rel-pos bias by (j−i); nil-length for BERT
+	qact       []uint8      // [mPad×kgMax·4] VNNI-quantized activations
+	ascales    []float32    // [mPad] per-row activation scales
 }
 
 // grow reslices buf to n floats, reallocating only when capacity is short.
@@ -152,15 +155,39 @@ func (s *scratch) resize(seq, H, I, dh int) {
 	s.kh = grow(s.kh, seq*H)
 	s.ch = grow(s.ch, seq*H)
 	s.vhT = grow(s.vhT, H*seq)
+	kgMax := (max(H, I) + 3) / 4
+	if cap(s.qact) < mPad*kgMax*4 {
+		s.qact = make([]uint8, mPad*kgMax*4)
+	}
+	s.qact = s.qact[:mPad*kgMax*4]
+	s.ascales = grow(s.ascales, mPad)
 }
+
+// QuantMode selects how a model's dense weights (and optionally
+// activations) are quantized at load.
+type QuantMode int
+
+const (
+	QuantNone    QuantMode = iota
+	QuantWeights           // weight-only int8, fp32 activations (M5)
+	QuantFull              // int8 weights + u8 activations on VNNI (R7)
+)
 
 // newDense builds a denseWeight, packing eagerly where the SIMD gemm can
 // consume it and keeping the raw bT layout otherwise. Only one layout is
-// ever retained. quantize selects weight-only int8 (per-channel symmetric;
-// activations stay float32): 4× less weight traffic on a pass bound by
-// streaming weights, at the cost of the weights' 8-bit rounding.
-func newDense(raw, bias []float32, in, out int, quantize bool) denseWeight {
-	if quantize {
+// ever retained. QuantWeights selects weight-only int8 (per-channel
+// symmetric; activations stay float32): 4× less weight traffic on a pass
+// bound by streaming weights, at the cost of the weights' 8-bit rounding.
+// QuantFull additionally quantizes activations per row to u8 at matmul
+// time, letting VPDPBUSD do 4 multiply-accumulates per lane per
+// instruction — falling back to QuantWeights when the CPU lacks AVX-VNNI.
+func newDense(raw, bias []float32, in, out int, quantize QuantMode) denseWeight {
+	if quantize == QuantFull {
+		if pb, err := tensor.PackB8VNNI(raw, in, out); err == nil {
+			return denseWeight{packed8v: pb, bias: bias, in: in, out: out}
+		}
+	}
+	if quantize >= QuantWeights {
 		if pb, err := tensor.PackB8(raw, in, out); err == nil {
 			return denseWeight{packed8: pb, bias: bias, in: in, out: out}
 		}
@@ -174,7 +201,11 @@ func newDense(raw, bias []float32, in, out int, quantize bool) denseWeight {
 // applyDense computes dst = x·Wᵀ + bias for seq rows. dst must be sized for
 // PackAPad(seq) rows (scratch is); x must hold exactly seq×in floats.
 func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch) {
-	if w.packed8 != nil {
+	if w.packed8v != nil {
+		mPad := tensor.PackAPad(seq)
+		kg := (w.in + 3) / 4
+		tensor.MatMulPackedVNNI(dst, x, w.packed8v, seq, s.qact[:mPad*kg*4], s.ascales[:mPad], s.pool)
+	} else if w.packed8 != nil {
 		tensor.MatMulPacked8(dst, x, w.packed8, seq, s.aPack[:tensor.PackAPad(seq)*w.in], s.pool)
 	} else if w.packed != nil {
 		tensor.MatMulPacked(dst, x, w.packed, seq, s.aPack[:tensor.PackAPad(seq)*w.in], s.pool)
@@ -189,9 +220,9 @@ func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch
 
 // Load builds a Model from a safetensors file and a validated Config.
 // Tensor names follow HuggingFace BertModel/MPNetModel conventions, with
-// or without a leading "bert."/"mpnet." prefix. quantize selects
-// weight-only int8 inference (see newDense).
-func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, error) {
+// or without a leading "bert."/"mpnet." prefix. quantize selects the int8
+// mode (see newDense).
+func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Model, error) {
 	tensors, err := safetensors.Load(weightsPath)
 	if err != nil {
 		return nil, err
@@ -350,15 +381,31 @@ func (m *Model) Config() Config { return m.cfg }
 // Workers returns the configured fan-out cap (0 = GOMAXPROCS).
 func (m *Model) Workers() int { return m.workers }
 
-// Quantized reports whether EVERY dense weight actually took the int8
-// path. Quantization can silently fall back per-matrix (no AVX2, or an
-// out-dim not divisible by 16) — callers who requested int8 can check the
-// mode took effect instead of discovering fp32 memory and speed later.
+// Quantized reports whether EVERY dense weight actually took an int8
+// path (weight-only or full). Quantization can silently fall back
+// per-matrix (no AVX2, or an out-dim not divisible by 16) — callers who
+// requested int8 can check the mode took effect instead of discovering
+// fp32 memory and speed later.
 func (m *Model) Quantized() bool {
 	for i := range m.layers {
 		l := &m.layers[i]
 		for _, w := range []*denseWeight{&l.qkv, &l.attnOut, &l.ffn1, &l.ffn2} {
-			if w.packed8 == nil {
+			if w.packed8 == nil && w.packed8v == nil {
+				return false
+			}
+		}
+	}
+	return len(m.layers) > 0
+}
+
+// QuantizedActivations reports whether EVERY dense weight took the VNNI
+// u8-activation path (QuantFull requested AND AVX-VNNI present AND every
+// shape packed).
+func (m *Model) QuantizedActivations() bool {
+	for i := range m.layers {
+		l := &m.layers[i]
+		for _, w := range []*denseWeight{&l.qkv, &l.attnOut, &l.ffn1, &l.ffn2} {
+			if w.packed8v == nil {
 				return false
 			}
 		}

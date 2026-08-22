@@ -108,6 +108,74 @@ func TestEmbedContextCancellation(t *testing.T) {
 // ONNX reference: weight-only per-channel quantization measured worst
 // maxAbsDiff 0.0126 and worst cosine 0.99906 across the golden set; the
 // bounds below leave ~2× headroom without letting real degradation hide.
+// TestGoldenInt8Activations pins the FULL int8 mode (VNNI: u8 activations
+// × s8 weights): accuracy against the ONNX golden at the measured bound
+// (worst case 0.991652 on this model; the bound leaves margin), an error
+// large enough that a silently-disabled feature cannot pass (the R4-era
+// inverted-test lesson), and bit-identity between serial and parallel —
+// per-row quantization and disjoint tiles make worker count invisible.
+func TestGoldenInt8Activations(t *testing.T) {
+	dir := modelDir(t)
+	raw, err := os.ReadFile("testdata/golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden goldenFile
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	if len(golden.Cases) == 0 {
+		t.Fatal("golden file has no cases")
+	}
+	emb, err := Load(dir, WithInt8Activations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !emb.QuantizedActivations() {
+		t.Skip("AVX-VNNI unavailable on this CPU; nothing to assert")
+	}
+	serial, err := Load(dir, WithInt8Activations(), WithWorkers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var worstCos = 1.0
+	var maxErr float64
+	for _, c := range golden.Cases {
+		v, err := emb.Embed(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sv, err := serial.Embed(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range v[0] {
+			if v[0][i] != sv[0][i] {
+				t.Fatalf("%.40q: parallel[%d]=%v differs from serial %v", c.Text, i, v[0][i], sv[0][i])
+			}
+		}
+		var dot float64
+		for i, want := range c.Embedding {
+			dot += float64(v[0][i]) * float64(want)
+			if d := math.Abs(float64(v[0][i] - want)); d > maxErr {
+				maxErr = d
+			}
+		}
+		if dot < worstCos {
+			worstCos = dot
+		}
+		if dot < 0.991 {
+			t.Errorf("%.40q: cosine %.6f below the full-int8 bound 0.991", c.Text, dot)
+		}
+	}
+	// A full-int8 run that matches fp32 too well means the mode is not
+	// actually engaged.
+	if maxErr < 1e-4 {
+		t.Fatalf("full-int8 output within %.2g of the fp32 golden — is the VNNI path actually active?", maxErr)
+	}
+	t.Logf("full-int8 worst cosine %.6f, maxAbs %.4g", worstCos, maxErr)
+}
+
 func TestGoldenInt8(t *testing.T) {
 	dir := modelDir(t)
 	raw, err := os.ReadFile("testdata/golden.json")

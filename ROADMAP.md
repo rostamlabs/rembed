@@ -78,12 +78,31 @@ sentencepiece.bpe.model FILE, not tokenizer_class — older exports omit
 the field, and their stale do_lower_case=true is ignored exactly as HF
 ignores it.
 
-## R7 — int8 depth: AVX-512-VNNI and activation quantization
-VNNI (VPDPBUSD) computes int8×int8→int32 4-wide-per-lane — on capable
-CPUs this roughly doubles int8 throughput over the current
-dequantize-then-FMA scheme. Static activation quantization is measured
-territory: adopt only if it beats weight-only on the harness (ORT's
-dynamic-quant overhead is why weight-only currently wins at short seq).
+## R7 — AVX-VNNI full int8 (u8 activations × s8 weights) ✅
+Done — adapted to real hardware: consumer Alder/Raptor Lake has no
+AVX-512, so the rung targets AVX-VNNI, the 256-bit VEX form of VPDPBUSD
+(present 2021 onward, and reported by every AVX-512-VNNI server too).
+Go's assembler only emits the EVEX encoding — which FAULTS without
+AVX-512 — so the eight VPDPBUSD are hand-encoded VEX bytes, generated
+field-by-field and verified against GNU as's {vex} output (the amd64
+mirror of R3's ARM WORD-encoding story). Activations quantize per row
+to u8 with the +128 offset trick (correction = 128·colSum, precomputed
+at pack time); weights are the same per-channel symmetric int8 as M5.
+The kernel is BIT-EXACT against a pure-Go integer reference (integer
+math has no rounding to hide behind), and serial/parallel outputs are
+bit-identical. Opt-in via WithInt8Activations, falling back to
+weight-only int8 then fp32; QuantizedActivations() reports engagement.
+
+Measured (i9-13900H, pinned, medians of 200):
+| model | vs weight-int8 | vs fp32 | worst golden cosine |
+|---|---|---|---|
+| MiniLM-L6 | 1.36× | 1.41× | 0.9917 |
+| mpnet-base | 1.28× | 1.44× | 0.9912 |
+| multilingual-MiniLM | — | — | 0.9982 |
+Weight-only int8 was already at 0.89× of ONNX Runtime fp32 (M5), so
+full int8 puts rembed decisively ahead on VNNI hardware. Accuracy is
+the honest cost: cosine ≥ 0.991 (enforced in TestGoldenInt8Activations)
+versus ≥ 0.9978 for weight-only — choose per workload.
 
 ## R8 — Publishable benchmark + beyond-CPU
 A pinned cloud box turns the consistent sign-test wins over ONNX Runtime
