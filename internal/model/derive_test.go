@@ -60,16 +60,28 @@ func TestDeriveConfigFromHFFiles(t *testing.T) {
 		t.Fatalf("derived %+v", c)
 	}
 
-	// Missing modules.json: normalize=false, not an error.
+	// Refusals: missing modules.json (silent normalize=false would shift
+	// every downstream cosine threshold), unsupported/unknown pooling,
+	// alien module, wrong arch, unset do_lower_case.
 	dir = writeHFDir(t, `{"pooling_mode_mean_tokens":true}`, "")
-	if c, err = DeriveConfig(dir, "x"); err != nil || c.Normalize {
-		t.Fatalf("c=%+v err=%v", c, err)
+	if _, err = DeriveConfig(dir, "x"); err == nil {
+		t.Fatal("expected error for missing modules.json")
 	}
-
-	// Refusals: unsupported pooling, alien module, wrong arch.
-	dir = writeHFDir(t, `{"pooling_mode_max_tokens":true}`, "")
+	stPlain := `[{"type":"sentence_transformers.models.Transformer"},{"type":"sentence_transformers.models.Pooling"}]`
+	dir = writeHFDir(t, `{"pooling_mode_max_tokens":true}`, stPlain)
 	if _, err = DeriveConfig(dir, "x"); err == nil {
 		t.Fatal("expected error for max pooling")
+	}
+	dir = writeHFDir(t, `{"pooling_mode_mean_tokens":true,"pooling_mode_shiny_new_mode":true}`, stPlain)
+	if _, err = DeriveConfig(dir, "x"); err == nil {
+		t.Fatal("expected error for unknown pooling mode (allowlist)")
+	}
+	dir = writeHFDir(t, `{"pooling_mode_mean_tokens":true}`, stPlain)
+	if err := os.WriteFile(filepath.Join(dir, "tokenizer_config.json"), []byte(`{"cls_token":"[CLS]"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = DeriveConfig(dir, "x"); err == nil {
+		t.Fatal("expected error for unset do_lower_case")
 	}
 	dir = writeHFDir(t, `{"pooling_mode_mean_tokens":true}`,
 		`[{"type":"sentence_transformers.models.Dense"}]`)

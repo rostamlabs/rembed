@@ -77,20 +77,29 @@ func DeriveConfig(dir, name string) (Config, error) {
 		return c, fmt.Errorf("model dir %s: %w", dir, err)
 	}
 
+	// The tokenizer couples lowercasing to accent stripping, so guessing
+	// this wrong yields plausible-but-wrong embeddings. Every surveyed
+	// BERT/ST repo sets the field explicitly; refuse rather than guess.
+	if tok.DoLowerCase == nil {
+		return c, fmt.Errorf("model dir %s: tokenizer_config.json does not set do_lower_case — set it there or provide a manifest.json", dir)
+	}
+
+	// modules.json is required: silently assuming "no Normalize module"
+	// for a repo that has one would shift every downstream cosine
+	// threshold (convert.py enforces the same).
 	normalize := false
 	var modules []struct {
 		Type string `json:"type"`
 	}
-	if err := readJSON("modules.json", &modules); err == nil {
-		for _, m := range modules {
-			if strings.HasSuffix(m.Type, "models.Normalize") {
-				normalize = true
-			} else if !strings.HasSuffix(m.Type, "models.Transformer") && !strings.HasSuffix(m.Type, "models.Pooling") {
-				return c, fmt.Errorf("model dir %s: unsupported sentence-transformers module %q", dir, m.Type)
-			}
+	if err := readJSON("modules.json", &modules); err != nil {
+		return c, fmt.Errorf("model dir %s: modules.json: %w", dir, err)
+	}
+	for _, m := range modules {
+		if strings.HasSuffix(m.Type, "models.Normalize") {
+			normalize = true
+		} else if !strings.HasSuffix(m.Type, "models.Transformer") && !strings.HasSuffix(m.Type, "models.Pooling") {
+			return c, fmt.Errorf("model dir %s: unsupported sentence-transformers module %q", dir, m.Type)
 		}
-	} else if !os.IsNotExist(err) {
-		return c, err
 	}
 
 	c = Config{
@@ -101,7 +110,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 		IntermediateSize:      hf.IntermediateSize,
 		VocabSize:             hf.VocabSize,
 		MaxPositionEmbeddings: hf.MaxPositionEmbeddings,
-		DoLowerCase:           tok.DoLowerCase == nil || *tok.DoLowerCase,
+		DoLowerCase:           *tok.DoLowerCase,
 		ClsToken:              tok.ClsToken,
 		SepToken:              tok.SepToken,
 		UnkToken:              tok.UnkToken,
@@ -115,25 +124,43 @@ func DeriveConfig(dir, name string) (Config, error) {
 }
 
 // poolingMode maps a 1_Pooling/config.json onto rembed's pooling
-// strategies, refusing combinations the engine does not compute.
+// strategies. The check is an ALLOWLIST over every pooling_mode_* key —
+// truthy in the JSON sense, so a future or nonstandard mode (or "1"
+// instead of true) refuses loudly instead of being silently ignored.
 func poolingMode(p map[string]any) (string, error) {
-	truthy := func(k string) bool {
-		v, ok := p[k].(bool)
-		return ok && v
+	truthy := func(v any) bool {
+		switch x := v.(type) {
+		case bool:
+			return x
+		case float64:
+			return x != 0
+		case string:
+			return x != "" && x != "false" && x != "False"
+		default:
+			return false
+		}
 	}
-	mean := truthy("pooling_mode_mean_tokens")
-	cls := truthy("pooling_mode_cls_token")
-	other := truthy("pooling_mode_max_tokens") || truthy("pooling_mode_lasttoken") ||
-		truthy("pooling_mode_mean_sqrt_len_tokens") || truthy("pooling_mode_weightedmean_tokens")
+	var mean, cls bool
+	for k, v := range p {
+		if !strings.HasPrefix(k, "pooling_mode_") || !truthy(v) {
+			continue
+		}
+		switch k {
+		case "pooling_mode_mean_tokens":
+			mean = true
+		case "pooling_mode_cls_token":
+			cls = true
+		default:
+			return "", fmt.Errorf("unsupported pooling mode %q (rembed supports mean or cls)", k)
+		}
+	}
 	switch {
-	case other, mean && cls:
-		return "", fmt.Errorf("unsupported pooling config %v (rembed supports mean or cls)", p)
+	case mean && cls, !mean && !cls:
+		return "", fmt.Errorf("unsupported pooling config %v (rembed supports exactly one of mean or cls)", p)
 	case mean:
 		return "mean", nil
-	case cls:
-		return "cls", nil
 	default:
-		return "", fmt.Errorf("no supported pooling mode in %v", p)
+		return "cls", nil
 	}
 }
 

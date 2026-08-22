@@ -25,7 +25,7 @@ type Config struct {
 	ClsToken              string  `json:"cls_token"`
 	SepToken              string  `json:"sep_token"`
 	UnkToken              string  `json:"unk_token"`
-	Pooling               string  `json:"pooling"`   // "mean" is the only v1 strategy
+	Pooling               string  `json:"pooling"`   // "mean" or "cls"
 	Normalize             bool    `json:"normalize"` // L2-normalize the pooled vector
 }
 

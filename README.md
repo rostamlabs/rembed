@@ -40,11 +40,15 @@ Validated end-to-end against each model's own ONNX Runtime reference:
 | sentence-transformers/all-MiniLM-L12-v2 | mean | F32 | 1.9e-7 | in bounds |
 | sentence-transformers/paraphrase-MiniLM-L3-v2 | mean | F32 | < 1e-4 | — |
 | BAAI/bge-small-en-v1.5 | cls | F32 | < 1e-4 | in bounds |
-| thenlper/gte-small | mean | F16 | 2e-3 (= the f16 weights' own rounding vs the fp32 ONNX export) | — |
+| thenlper/gte-small | mean | F16 | 2e-3 maxAbs + cosine ≥ 0.9999 + meanAbs ≤ 2e-4 (the repo's ONNX export is fp32 while its safetensors are f16, so maxAbs is dominated by the checkpoint's own rounding; the cosine/mean bounds are what actually constrain rembed) | — |
 
 Expected compatible (same architecture, no ONNX export on the Hub to
 validate against): the e5 family, larger BGE/GTE sizes, and other
-BERT-based sentence-transformers checkpoints. Not supported: MPNet,
+BERT-based sentence-transformers checkpoints. Caveat for retrieval
+models: e5 requires "query: "/"passage: " prefixes and some models
+(e.g. arctic) declare prompt handling in their pooling config — rembed
+embeds exactly the text you pass and does not add prefixes; add them
+yourself or retrieval quality silently degrades. Not supported: MPNet,
 RoBERTa/XLM-R (different architectures/tokenizers).
 
 ## Dev: golden reference generation

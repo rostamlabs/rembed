@@ -89,8 +89,17 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("model_id", nargs="?", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--out", type=Path, default=None, help="model dir to write")
-    ap.add_argument("--golden", type=Path, default=REPO_ROOT / "testdata" / "golden.json")
+    ap.add_argument("--golden", type=Path, default=None,
+                    help="golden output path (default: testdata/golden.json for the default model, "
+                         "testdata/golden-<model>.json otherwise — never silently overwriting "
+                         "another model's golden)")
     args = ap.parse_args()
+    if args.golden is None:
+        short = args.model_id.split("/")[-1]
+        if args.model_id == "sentence-transformers/all-MiniLM-L6-v2":
+            args.golden = REPO_ROOT / "testdata" / "golden.json"
+        else:
+            args.golden = REPO_ROOT / "testdata" / f"golden-{short}.json"
 
     from huggingface_hub import hf_hub_download
     import onnxruntime as ort

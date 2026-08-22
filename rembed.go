@@ -70,19 +70,40 @@ func WithWorkers(n int) Option {
 //     Hugging Face repo checkout (config.json + 1_Pooling/... — the
 //     manifest is derived on the fly);
 //   - a Hugging Face model id like "sentence-transformers/all-MiniLM-L6-v2"
-//     (optionally prefixed "hf:"): the files are downloaded straight from
-//     the Hub in pure Go into $REMBED_CACHE (default: the user cache dir)
-//     and reused on later loads. Set HF_TOKEN for gated repos.
+//     (or explicitly "hf:org/name", which always means the Hub): the files
+//     are downloaded straight from the Hub in pure Go into $REMBED_CACHE
+//     (default: the user cache dir) and reused on later loads. Set
+//     HF_TOKEN for gated repos.
+//
+// A ref that could be BOTH — an org/name that does not exist locally but
+// whose first segment IS a local directory (e.g. a missing
+// "models/all-MiniLM-L6-v2") — is treated as a missing LOCAL path: a typo
+// must fail as one, not turn into silent network egress carrying HF_TOKEN.
+// Use the "hf:" prefix to force the Hub in that situation.
 func Load(ref string, opts ...Option) (*Embedder, error) {
 	var o loadOptions
 	for _, opt := range opts {
 		opt(&o)
 	}
 	name := strings.TrimPrefix(ref, "hf:")
+	forceHub := strings.HasPrefix(ref, "hf:")
 	modelDir := name
-	if fi, statErr := os.Stat(modelDir); statErr != nil || !fi.IsDir() {
+	fi, statErr := os.Stat(modelDir)
+	switch {
+	case !forceHub && statErr == nil && fi.IsDir():
+		// local directory
+	case !forceHub && statErr != nil && !os.IsNotExist(statErr):
+		return nil, fmt.Errorf("rembed: %q: %w", ref, statErr)
+	default:
 		if !hub.IsModelID(name) {
-			return nil, fmt.Errorf("rembed: %q is neither a model directory nor a Hugging Face model id", ref)
+			return nil, fmt.Errorf("rembed: %q is neither a model directory nor a Hugging Face model id (org/name)", ref)
+		}
+		if !forceHub {
+			if parent := filepath.Dir(name); parent != "." {
+				if pfi, err := os.Stat(parent); err == nil && pfi.IsDir() {
+					return nil, fmt.Errorf("rembed: model directory %q does not exist (its parent does — assuming a local path; use %q to load from the Hugging Face Hub)", name, "hf:"+name)
+				}
+			}
 		}
 		cache, err := hub.CacheDir()
 		if err != nil {
