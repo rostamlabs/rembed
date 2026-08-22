@@ -1,0 +1,16 @@
+# Model weights and converter workspace (never commit weights)
+models/*/
+models/.venv/
+*.safetensors
+*.onnx
+
+# Build artifacts
+/rembed
+/bin/
+*.test
+*.out
+*.prof
+
+# Editors
+.idea/
+.vscode/

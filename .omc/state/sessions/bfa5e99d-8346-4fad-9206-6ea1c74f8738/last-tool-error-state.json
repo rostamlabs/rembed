@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"find /home/vahid/projects/rostam -name \\\"tokenizer*.go\\\" -not -path \\\"*/vendor/*\\\" 2>/dev/null; ls /home/vahid/projects/rostam/semcache/local/ 2>/dev/null\",\"description\":\"Locate WordPiece ...",
+  "error": "Exit code 2\n/home/vahid/projects/rostam/vector/analysis/tokenizer_test.go\n/home/vahid/projects/rostam/vector/analysis/tokenizer.go\n/home/vahid/projects/rostam/.claude/worktrees/agent-a004a9fafa446e5a4/vector/analysis/tokenizer_test.go\n/home/vahid/projects/rostam/.claude/worktrees/agent-a004a9fafa446e5a4/vector/analysis/tokenizer.go\n/home/vahid/projects/rostam/.claude/worktrees/agent-a134c08630233e89d/vector/analysis/tokenizer_test.go\n/home/vahid/projects/rostam/.claude/worktrees/agent-a134c08630...",
+  "timestamp": "2026-08-22T07:50:47.702Z",
+  "retry_count": 2
+}
