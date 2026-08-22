@@ -8,13 +8,14 @@ package model
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/rostamlabs/rembed/internal/safetensors"
 	"github.com/rostamlabs/rembed/internal/tensor"
 )
 
 // layer holds one encoder layer's weights. Linear weights keep HuggingFace's
-// [out, in] layout, which is exactly the bT operand of tensor.MatMul.
+// [out, in] layout, which is exactly the bT operand of the matmul kernel.
 type layer struct {
 	qW, qB             []float32 // [H×H], [H]
 	kW, kB             []float32
@@ -27,8 +28,11 @@ type layer struct {
 }
 
 // Model is a loaded BERT encoder ready to embed token-id sequences.
+// It is safe for concurrent use: the matmul kernel is bound once at Load,
+// and per-call scratch comes from an internal pool.
 type Model struct {
-	cfg Config
+	cfg    Config
+	matmul tensor.MatMulFunc
 
 	wordEmb []float32 // [vocab×H]
 	posEmb  []float32 // [maxPos×H]
@@ -37,6 +41,50 @@ type Model struct {
 	embLNb  []float32 // [H]
 
 	layers []layer
+
+	scratchPool sync.Pool // *scratch, buffers grown on demand
+}
+
+// scratch holds every intermediate buffer one Forward call needs. Buffers
+// keep their capacity between uses (via the pool), so steady-state forward
+// passes allocate nothing but the returned vector.
+//
+// Buffers only grow: one max-length (512-token) input inflates a scratch to
+// ~10 MB, and sync.Pool retains up to one scratch per P until GC drains it.
+// That is a deliberate trade (reuse over footprint) — revisit if rembed's
+// host process cares about worst-case resident memory.
+type scratch struct {
+	x, q, k, v      []float32 // [seq×H]
+	ctxOut, attnOut []float32 // [seq×H]
+	ffnOut          []float32 // [seq×H]
+	ffnHidden       []float32 // [seq×I]
+	scores          []float32 // [seq×seq]
+	qh, kh, ch      []float32 // [seq×dh]
+	vhT             []float32 // [dh×seq]
+}
+
+// grow reslices buf to n floats, reallocating only when capacity is short.
+func grow(buf []float32, n int) []float32 {
+	if cap(buf) < n {
+		return make([]float32, n)
+	}
+	return buf[:n]
+}
+
+func (s *scratch) resize(seq, H, I, dh int) {
+	s.x = grow(s.x, seq*H)
+	s.q = grow(s.q, seq*H)
+	s.k = grow(s.k, seq*H)
+	s.v = grow(s.v, seq*H)
+	s.ctxOut = grow(s.ctxOut, seq*H)
+	s.attnOut = grow(s.attnOut, seq*H)
+	s.ffnOut = grow(s.ffnOut, seq*H)
+	s.ffnHidden = grow(s.ffnHidden, seq*I)
+	s.scores = grow(s.scores, seq*seq)
+	s.qh = grow(s.qh, seq*dh)
+	s.kh = grow(s.kh, seq*dh)
+	s.ch = grow(s.ch, seq*dh)
+	s.vhT = grow(s.vhT, dh*seq)
 }
 
 // Load builds a Model from a safetensors file and a validated Config.
@@ -68,7 +116,15 @@ func Load(weightsPath string, cfg Config) (*Model, error) {
 	}
 
 	H, I := cfg.HiddenSize, cfg.IntermediateSize
-	m := &Model{cfg: cfg}
+	// LoadConfig enforces this, but Forward's per-head writes cover ctxOut
+	// completely ONLY when it holds — and with pooled scratch a violation
+	// would read the previous call's residue, not zeros. Re-assert here so an
+	// unvalidated Config cannot reach that state.
+	if cfg.NumAttentionHeads <= 0 || H%cfg.NumAttentionHeads != 0 {
+		return nil, fmt.Errorf("weights %s: hidden_size %d not divisible by num_attention_heads %d", weightsPath, H, cfg.NumAttentionHeads)
+	}
+	m := &Model{cfg: cfg, matmul: tensor.Default()}
+	m.scratchPool.New = func() any { return new(scratch) }
 
 	type load struct {
 		dst   *[]float32
@@ -145,8 +201,12 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 	I := m.cfg.IntermediateSize
 	eps := m.cfg.LayerNormEps
 
+	s := m.scratchPool.Get().(*scratch)
+	defer m.scratchPool.Put(s)
+	s.resize(seq, H, I, dh)
+
 	// Embeddings: word + position + segment(0), then LayerNorm.
-	x := make([]float32, seq*H)
+	x := s.x
 	for i, id := range ids {
 		if id < 0 || int(id) >= m.cfg.VocabSize {
 			return nil, fmt.Errorf("token id %d out of vocab range %d", id, m.cfg.VocabSize)
@@ -161,30 +221,22 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 	}
 	tensor.LayerNorm(x, m.embLNg, m.embLNb, seq, H, eps)
 
-	// Scratch buffers (M0 allocates freely; M1 makes this alloc-free).
-	q := make([]float32, seq*H)
-	k := make([]float32, seq*H)
-	v := make([]float32, seq*H)
-	ctxOut := make([]float32, seq*H)
-	attnOut := make([]float32, seq*H)
-	scores := make([]float32, seq*seq)
-	qh := make([]float32, seq*dh)
-	kh := make([]float32, seq*dh)
-	vhT := make([]float32, dh*seq)
-	ch := make([]float32, seq*dh)
-	ffnHidden := make([]float32, seq*I)
-	ffnOut := make([]float32, seq*H)
+	q, k, v := s.q, s.k, s.v
+	ctxOut, attnOut := s.ctxOut, s.attnOut
+	scores := s.scores
+	qh, kh, vhT, ch := s.qh, s.kh, s.vhT, s.ch
+	ffnHidden, ffnOut := s.ffnHidden, s.ffnOut
 	scale := float32(1 / math.Sqrt(float64(dh)))
 
 	for li := range m.layers {
 		l := &m.layers[li]
 
 		// Q, K, V projections.
-		tensor.MatMul(q, x, l.qW, seq, H, H)
+		m.matmul(q, x, l.qW, seq, H, H)
 		tensor.AddBias(q, l.qB, seq, H)
-		tensor.MatMul(k, x, l.kW, seq, H, H)
+		m.matmul(k, x, l.kW, seq, H, H)
 		tensor.AddBias(k, l.kB, seq, H)
-		tensor.MatMul(v, x, l.vW, seq, H, H)
+		m.matmul(v, x, l.vW, seq, H, H)
 		tensor.AddBias(v, l.vB, seq, H)
 
 		// Scaled dot-product attention, one head at a time.
@@ -200,29 +252,29 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 				}
 			}
 			// scores = Qh·Khᵀ / √dh; Kh as bT gives exactly Qh·Khᵀ.
-			tensor.MatMul(scores, qh, kh, seq, dh, seq)
+			m.matmul(scores, qh, kh, seq, dh, seq)
 			for i := range scores {
 				scores[i] *= scale
 			}
 			tensor.Softmax(scores, seq, seq)
 			// ch = probs·Vh, with Vhᵀ as the bT operand.
-			tensor.MatMul(ch, scores, vhT, seq, seq, dh)
+			m.matmul(ch, scores, vhT, seq, seq, dh)
 			for i := range seq {
 				copy(ctxOut[i*H+off:i*H+off+dh], ch[i*dh:i*dh+dh])
 			}
 		}
 
 		// Attention output projection + residual + LayerNorm.
-		tensor.MatMul(attnOut, ctxOut, l.attnOutW, seq, H, H)
+		m.matmul(attnOut, ctxOut, l.attnOutW, seq, H, H)
 		tensor.AddBias(attnOut, l.attnOutB, seq, H)
 		tensor.Add(x, attnOut)
 		tensor.LayerNorm(x, l.attnLNg, l.attnLNb, seq, H, eps)
 
 		// FFN: GELU(x·W1ᵀ+b1)·W2ᵀ+b2 + residual + LayerNorm.
-		tensor.MatMul(ffnHidden, x, l.ffn1W, seq, H, I)
+		m.matmul(ffnHidden, x, l.ffn1W, seq, H, I)
 		tensor.AddBias(ffnHidden, l.ffn1B, seq, I)
 		tensor.GELU(ffnHidden)
-		tensor.MatMul(ffnOut, ffnHidden, l.ffn2W, seq, I, H)
+		m.matmul(ffnOut, ffnHidden, l.ffn2W, seq, I, H)
 		tensor.AddBias(ffnOut, l.ffn2B, seq, H)
 		tensor.Add(x, ffnOut)
 		tensor.LayerNorm(x, l.outLNg, l.outLNb, seq, H, eps)

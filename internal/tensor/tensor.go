@@ -15,9 +15,10 @@ import "math"
 // contiguous rows.
 type MatMulFunc func(dst, a, bT []float32, m, k, n int)
 
-// MatMul is the active matmul kernel. Model code calls only this; ladder
-// rungs swap the body (and benchmarks A/B the named implementations below).
-var MatMul MatMulFunc = MatMulNaive
+// Default returns the best matmul body for this platform. Model code binds
+// it ONCE at load time (a mutable package variable would race with in-flight
+// forward passes); benchmarks A/B the named implementations directly.
+func Default() MatMulFunc { return MatMulBlocked }
 
 // MatMulNaive is the M0 reference body: three plain loops, dot products of
 // contiguous rows.
@@ -31,6 +32,70 @@ func MatMulNaive(dst, a, bT []float32, m, k, n int) {
 				sum += ar[p] * br[p]
 			}
 			dst[i*n+j] = sum
+		}
+	}
+}
+
+// Blocking parameters for MatMulBlocked.
+const (
+	// blockM: A-panel rows per tile. 64 rows × 512 floats × 4 B ≈ 128 KB
+	// worst-case (k=I=1536 gives 384 KB — still L2-resident), so the panel
+	// is reused from cache across every bT row of the tile.
+	blockM = 64
+	// blockN: bT rows per micro-kernel pass. 4 independent accumulator
+	// chains give the FP units ILP, and each loaded a[p] is reused 4×.
+	blockN = 4
+)
+
+// MatMulBlocked is the M1 body: cache-blocked with a 1×4 register
+// micro-kernel. The naive body streams ALL of bT from memory for every row
+// of A (m × n×k floats); here the j-loop is outermost within an A-tile, so
+// bT streams through cache once per tile of blockM rows and the A panel
+// stays resident. Four independent accumulator chains give the FP units
+// ILP; a 2×4 variant measured ~7% SLOWER here (register spills — Go keeps
+// only so many of 8 accumulators + 6 temps live), so 1×4 it is until M3's
+// SIMD kernel. Accumulation order over k matches naive, so results are
+// bit-identical wherever the compiler does not fuse mul+add (amd64 today),
+// and within fp32 rounding otherwise.
+func MatMulBlocked(dst, a, bT []float32, m, k, n int) {
+	if m*n > 0 {
+		// Fail fast on an undersized dst: the 4-wide stores below slice with
+		// an explicit upper bound, which bounds-checks against cap — on a
+		// pooled buffer with cap > len an undersized dst would otherwise be
+		// corrupted silently instead of panicking like the naive body does.
+		_ = dst[m*n-1]
+	}
+	for i0 := 0; i0 < m; i0 += blockM {
+		i1 := min(i0+blockM, m)
+		var j int
+		for j = 0; j+blockN <= n; j += blockN {
+			b0 := bT[(j+0)*k : (j+0)*k+k]
+			b1 := bT[(j+1)*k : (j+1)*k+k]
+			b2 := bT[(j+2)*k : (j+2)*k+k]
+			b3 := bT[(j+3)*k : (j+3)*k+k]
+			for i := i0; i < i1; i++ {
+				ar := a[i*k : i*k+k]
+				var s0, s1, s2, s3 float32
+				for p, av := range ar {
+					s0 += av * b0[p]
+					s1 += av * b1[p]
+					s2 += av * b2[p]
+					s3 += av * b3[p]
+				}
+				d := dst[i*n+j : i*n+j+4]
+				d[0], d[1], d[2], d[3] = s0, s1, s2, s3
+			}
+		}
+		for ; j < n; j++ { // n % blockN remainder columns
+			br := bT[j*k : j*k+k]
+			for i := i0; i < i1; i++ {
+				ar := a[i*k : i*k+k]
+				var s float32
+				for p, av := range ar {
+					s += av * br[p]
+				}
+				dst[i*n+j] = s
+			}
 		}
 	}
 }

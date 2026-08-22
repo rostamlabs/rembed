@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"runtime/debug"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -94,6 +96,58 @@ func TestEmbedContextCancellation(t *testing.T) {
 	cancel()
 	if _, err := emb.Embed(ctx, []string{"hello"}); err == nil {
 		t.Fatal("expected context error")
+	}
+}
+
+// TestEmbedSteadyStateAllocs pins the M1 alloc-free property. The real
+// invariant lives at the Forward level: after warm-up, a forward pass
+// allocates ONLY the returned vector, so its alloc count must be identical
+// for a short and a near-max-length input (M0, which allocated every scratch
+// buffer per call, fails that immediately). GC is pinned off so a
+// mid-measurement pool drain can't flake the run.
+func TestEmbedSteadyStateAllocs(t *testing.T) {
+	dir := modelDir(t)
+	emb, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	short := emb.Tokenize("The quick brown fox jumps over the lazy dog.")
+	long := emb.Tokenize(strings.Repeat("embedding inference engines should be boring and fast ", 60))
+	if len(long) < 400 {
+		t.Fatalf("long input only tokenized to %d tokens", len(long))
+	}
+	// 3 runs each: with GC pinned off the count is deterministic, and the
+	// seq=512 forward passes are ~2s apiece.
+	forwardAllocs := func(ids []int64) float64 {
+		if _, err := emb.m.Forward(ids); err != nil { // warm this size class
+			t.Fatal(err)
+		}
+		return testing.AllocsPerRun(3, func() {
+			if _, err := emb.m.Forward(ids); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	// Warm the long size first so the short runs reuse grown buffers too.
+	aLong := forwardAllocs(long)
+	aShort := forwardAllocs(short)
+	if aShort != aLong || aShort > 2 {
+		t.Fatalf("Forward allocs must be tiny and independent of seq: short=%v long=%v (want equal, <= 2)", aShort, aLong)
+	}
+
+	// End-to-end sanity: tokenizer allocations scale with token count, so
+	// only the short text gets an absolute bound (steady state measured 29).
+	ctx := context.Background()
+	texts := []string{"The quick brown fox jumps over the lazy dog."}
+	embedAllocs := testing.AllocsPerRun(20, func() {
+		if _, err := emb.Embed(ctx, texts); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if embedAllocs > 32 {
+		t.Fatalf("steady-state Embed does %v allocs/op, want <= 32", embedAllocs)
 	}
 }
 
