@@ -216,6 +216,65 @@ func TestGoldenCLSPooling(t *testing.T) {
 	}
 }
 
+// TestGoldenTokens validates EmbedTokens — per-token hidden states —
+// against ONNX Runtime's last_hidden_state for the committed token-level
+// golden. This is the raw, unpooled output, so nothing downstream
+// (pooling, normalization) can mask a defect here.
+func TestGoldenTokens(t *testing.T) {
+	dir := modelDir(t)
+	raw, err := os.ReadFile("testdata/golden-tokens.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden struct {
+		Model string `json:"model"`
+		Cases []struct {
+			Text     string      `json:"text"`
+			InputIDs []int64     `json:"input_ids"`
+			Hidden   [][]float32 `json:"hidden"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	if len(golden.Cases) == 0 {
+		t.Fatal("empty token golden")
+	}
+	emb, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range golden.Cases {
+		res, err := emb.EmbedTokens(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		te := res[0]
+		if !slices.Equal(te.IDs, c.InputIDs) {
+			t.Errorf("%.40q: tokenizer mismatch", c.Text)
+			continue
+		}
+		if len(te.Vectors) != len(c.Hidden) {
+			t.Fatalf("%.40q: %d token vectors, want %d", c.Text, len(te.Vectors), len(c.Hidden))
+		}
+		var maxd float64
+		for i, wantRow := range c.Hidden {
+			for j, want := range wantRow {
+				if d := math.Abs(float64(te.Vectors[i][j] - want)); d > maxd {
+					maxd = d
+				}
+			}
+		}
+		// Raw hidden states have magnitudes up to ~10 (unnormalized), so
+		// the tolerance is the golden rule's 1e-4 relative to that scale.
+		if maxd > 1e-3 {
+			t.Errorf("%.40q: token maxAbsDiff=%g > 1e-3", c.Text, maxd)
+		} else {
+			t.Logf("%.40q: %d tokens, maxAbsDiff=%.2e", c.Text, len(te.Vectors), maxd)
+		}
+	}
+}
+
 // TestGoldenMatrix makes every committed golden reproducible: each model
 // in the README matrix validates against its own ONNX-reference golden
 // when its model dir is present (env-overridable for CI). gte's bounds
@@ -492,6 +551,56 @@ func TestEmbedSteadyStateAllocs(t *testing.T) {
 	})
 	if embedAllocs > 96 {
 		t.Fatalf("steady-state Embed does %v allocs/op, want <= 96", embedAllocs)
+	}
+}
+
+// TestEmbedBatchMatchesSingle pins the R2 contract: the batched path must
+// be BIT-identical to embedding each text alone (worker counts change
+// scheduling, never results).
+func TestEmbedBatchMatchesSingle(t *testing.T) {
+	dir := modelDir(t)
+	emb, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	texts := []string{
+		"hello world",
+		"The quick brown fox jumps over the lazy dog.",
+		"a third, somewhat longer text to vary the sequence lengths in play",
+		"short", "and", "many", "more", "texts",
+	}
+	batch, err := emb.Embed(ctx, texts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, text := range texts {
+		one, err := emb.Embed(ctx, []string{text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(batch[i], one[0]) {
+			t.Fatalf("text %d: batch result diverged from single embed", i)
+		}
+	}
+}
+
+// BenchmarkEmbedBatch32 measures throughput-mode: 32 texts per call.
+func BenchmarkEmbedBatch32(b *testing.B) {
+	dir := modelDir(b)
+	emb, err := Load(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	texts := make([]string, 32)
+	for i := range texts {
+		texts[i] = "The quick brown fox jumps over the lazy dog."
+	}
+	for b.Loop() {
+		if _, err := emb.Embed(ctx, texts); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

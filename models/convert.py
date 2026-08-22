@@ -89,6 +89,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("model_id", nargs="?", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--out", type=Path, default=None, help="model dir to write")
+    ap.add_argument("--tokens-golden", type=Path, default=None,
+                    help="also write a token-level (last_hidden_state) golden here")
     ap.add_argument("--golden", type=Path, default=None,
                     help="golden output path (default: testdata/golden.json for the default model, "
                          "testdata/golden-<model>.json otherwise — never silently overwriting "
@@ -194,6 +196,26 @@ def main() -> None:
         json.dumps({"model": args.model_id, "cases": golden}, indent=1) + "\n"
     )
     print(f"wrote {args.golden} ({len(golden)} cases, dim {len(golden[0]['embedding'])})")
+
+    if args.tokens_golden:
+        # Token-level golden: raw last_hidden_state for a few SHORT texts,
+        # validating EmbedTokens (no pooling, no normalization).
+        tcases = []
+        for text in GOLDEN_TEXTS[:3]:
+            enc = tokenizer(text, truncation=True, max_length=manifest["max_position_embeddings"])
+            ids = np.array([enc["input_ids"]], dtype=np.int64)
+            feeds = {"input_ids": ids, "attention_mask": np.array([enc["attention_mask"]], dtype=np.int64)}
+            if "token_type_ids" in input_names:
+                feeds["token_type_ids"] = np.zeros_like(ids)
+            (last_hidden,) = sess.run(["last_hidden_state"], feeds)
+            tcases.append({
+                "text": text,
+                "input_ids": enc["input_ids"],
+                "hidden": [[float(f"{v:.8g}") for v in row] for row in last_hidden[0]],
+            })
+        args.tokens_golden.parent.mkdir(parents=True, exist_ok=True)
+        args.tokens_golden.write_text(json.dumps({"model": args.model_id, "cases": tcases}, indent=1) + "\n")
+        print(f"wrote {args.tokens_golden} ({len(tcases)} cases)")
 
 
 if __name__ == "__main__":

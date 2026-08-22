@@ -13,10 +13,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/rostamlabs/rembed/internal/hub"
 	"github.com/rostamlabs/rembed/internal/model"
+	"github.com/rostamlabs/rembed/internal/tensor"
 	"github.com/rostamlabs/rembed/tokenizer"
 )
 
@@ -137,23 +139,86 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 
 // Embed returns one embedding per input text, each of length Dim(),
 // L2-normalized when the model manifest says so (true for the
-// sentence-transformers models). Texts are embedded independently; the
-// context is checked between texts.
+// sentence-transformers models). Texts are embedded independently, and a
+// batch of several texts is fanned out ACROSS texts (each forward pass
+// serial or lightly parallel) — near-linear throughput scaling with zero
+// padding waste, and results bit-identical to embedding one at a time.
 func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
 	// The manifest owns the sequence ceiling (position-embedding count);
 	// tokenizer.MaxSeqLen is only that package's standalone default.
+	maxLen := e.cfg.MaxPositionEmbeddings
+
+	if len(texts) <= 1 {
+		for i, text := range texts {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			ids, _ := e.tok.Encode(text, maxLen)
+			vec, err := e.m.Forward(ids)
+			if err != nil {
+				return nil, fmt.Errorf("rembed: text %d: %w", i, err)
+			}
+			out[i] = vec
+		}
+		return out, nil
+	}
+
+	// Batch path: spread the machine across texts, splitting leftover
+	// parallelism inside each forward when texts are fewer than cores.
+	total := runtime.GOMAXPROCS(0)
+	if e.m.Workers() > 0 {
+		total = min(total, e.m.Workers())
+	}
+	across := min(total, len(texts))
+	within := max(1, total/across)
+	errs := make([]error, len(texts))
+	tensor.ParallelForCap(across, len(texts), func(i int) {
+		if err := ctx.Err(); err != nil {
+			errs[i] = err
+			return
+		}
+		ids, _ := e.tok.Encode(texts[i], maxLen)
+		vec, err := e.m.ForwardWorkers(ids, within)
+		if err != nil {
+			errs[i] = fmt.Errorf("rembed: text %d: %w", i, err)
+			return
+		}
+		out[i] = vec
+	})
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// TokenEmbeddings is one text's token-level output: the final encoder
+// layer's hidden state for every token (ONNX Runtime's last_hidden_state),
+// unpooled and unnormalized.
+type TokenEmbeddings struct {
+	IDs     []int64     // input token ids, including [CLS]/[SEP] framing
+	Vectors [][]float32 // len(IDs) rows of Dim()
+}
+
+// EmbedTokens returns per-token hidden states for each text — the raw
+// material for rerankers, late-interaction (ColBERT-style) retrieval, and
+// custom pooling. Embed remains the API for sentence vectors; nothing here
+// is pooled or normalized.
+func (e *Embedder) EmbedTokens(ctx context.Context, texts []string) ([]TokenEmbeddings, error) {
+	out := make([]TokenEmbeddings, len(texts))
 	maxLen := e.cfg.MaxPositionEmbeddings
 	for i, text := range texts {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		ids, _ := e.tok.Encode(text, maxLen)
-		vec, err := e.m.Forward(ids)
+		vecs, err := e.m.ForwardTokens(ids)
 		if err != nil {
 			return nil, fmt.Errorf("rembed: text %d: %w", i, err)
 		}
-		out[i] = vec
+		out[i] = TokenEmbeddings{IDs: ids, Vectors: vecs}
 	}
 	return out, nil
 }
