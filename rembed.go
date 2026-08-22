@@ -18,7 +18,10 @@ import (
 )
 
 // Embedder turns texts into fixed-size embedding vectors. It is safe for
-// concurrent use.
+// concurrent use. Latency is the default optimization target: each Embed
+// call fans out across up to GOMAXPROCS cores and keeps a spinning worker
+// pool for its duration, which trades idle-core burn for wall time — see
+// WithWorkers to cap that for throughput-saturated servers.
 type Embedder struct {
 	cfg model.Config
 	tok *tokenizer.Tokenizer
@@ -29,7 +32,8 @@ type Embedder struct {
 type Option func(*loadOptions)
 
 type loadOptions struct {
-	int8 bool
+	int8    bool
+	workers int
 }
 
 // WithInt8 selects weight-only int8 inference: weights are quantized at
@@ -38,6 +42,16 @@ type loadOptions struct {
 // slightly from fp32 — see the int8 golden test for the measured bound.
 func WithInt8() Option {
 	return func(o *loadOptions) { o.int8 = true }
+}
+
+// WithWorkers caps the number of CPU workers one Embed call uses.
+// The default (0) uses GOMAXPROCS, minimizing single-request latency by
+// keeping every core busy — including a spinning fork-join pool that burns
+// idle-core cycles for the duration of each call (~10× the useful CPU at
+// low concurrency). A server saturating many concurrent Embed calls should
+// set a small cap; WithWorkers(1) is fully serial with zero spinning.
+func WithWorkers(n int) Option {
+	return func(o *loadOptions) { o.workers = n }
 }
 
 // Load opens a model directory produced by models/convert.py, containing
@@ -60,7 +74,7 @@ func Load(modelDir string, opts ...Option) (*Embedder, error) {
 		// otherwise produce silently wrong (or per-call failing) embeddings.
 		return nil, fmt.Errorf("rembed: vocab.txt has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 	}
-	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, o.int8)
+	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, o.int8, o.workers)
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}

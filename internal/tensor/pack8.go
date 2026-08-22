@@ -76,7 +76,7 @@ func MatMulPacked8(dst, a []float32, pb *PackedB8, m int, aPack []float32, pool 
 	k, n := pb.K, pb.N
 	_ = dst[mPad*n-1] // fail fast before the asm writes anything
 	_ = aPack[mPad*k-1]
-	packA4(aPack, a, m, k)
+	packA4(aPack, a, m, k, pool)
 
 	rowPanels := mPad / 4
 	colPanels := n / 16
@@ -103,12 +103,15 @@ func MatMulPacked8(dst, a []float32, pb *PackedB8, m int, aPack []float32, pool 
 
 func gemm8Chunk(dst, aPack []float32, pb *PackedB8, ip0, ip1, jp0, jp1, k, n int) {
 	for jp := jp0; jp < jp1; jp++ {
-		pbPanel := &pb.data[jp*k*16]
-		scales := &pb.scales[jp*16]
+		// Reslice every operand to exactly what the asm touches (same
+		// discipline as gemmChunk).
+		bp := pb.data[jp*k*16 : (jp+1)*k*16]
+		sc := pb.scales[jp*16 : (jp+1)*16]
 		for ip := ip0; ip < ip1; ip++ {
+			ap := aPack[ip*k*4 : (ip+1)*k*4]
 			off := ip*4*n + jp*16
 			d := dst[off : off+3*n+16]
-			gemm4x16i8(&d[0], n, &aPack[ip*k*4], pbPanel, k, scales)
+			gemm4x16i8(&d[0], n, &ap[0], &bp[0], k, &sc[0])
 		}
 	}
 }

@@ -45,8 +45,9 @@ type layer struct {
 // It is safe for concurrent use: the matmul kernel is bound once at Load,
 // and per-call scratch comes from an internal pool.
 type Model struct {
-	cfg    Config
-	matmul tensor.MatMulFunc
+	cfg     Config
+	matmul  tensor.MatMulFunc
+	workers int // fan-out cap per Forward; 0 = GOMAXPROCS
 
 	wordEmb []float32 // [vocab×H]
 	posEmb  []float32 // [maxPos×H]
@@ -147,7 +148,7 @@ func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch
 // Tensor names follow HuggingFace BertModel conventions, with or without a
 // leading "bert." prefix. quantize selects weight-only int8 inference (see
 // newDense).
-func Load(weightsPath string, cfg Config, quantize bool) (*Model, error) {
+func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, error) {
 	tensors, err := safetensors.Load(weightsPath)
 	if err != nil {
 		return nil, err
@@ -180,7 +181,7 @@ func Load(weightsPath string, cfg Config, quantize bool) (*Model, error) {
 	if cfg.NumAttentionHeads <= 0 || H%cfg.NumAttentionHeads != 0 {
 		return nil, fmt.Errorf("weights %s: hidden_size %d not divisible by num_attention_heads %d", weightsPath, H, cfg.NumAttentionHeads)
 	}
-	m := &Model{cfg: cfg, matmul: tensor.Default()}
+	m := &Model{cfg: cfg, matmul: tensor.Default(), workers: workers}
 	m.scratchPool.New = func() any { return new(scratch) }
 
 	type load struct {
@@ -292,6 +293,9 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 	// every seq (the earlier seq-scaled cap was compensating for wake
 	// latency, not for parallelism itself).
 	s.fanout = runtime.GOMAXPROCS(0)
+	if m.workers > 0 {
+		s.fanout = min(s.fanout, m.workers)
+	}
 	s.pool = tensor.NewPool(s.fanout - 1)
 	defer s.pool.Stop()
 
