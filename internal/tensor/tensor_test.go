@@ -87,9 +87,13 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 		m, k, n := sh[0], sh[1], sh[2]
 		// fp32 accumulation error grows with k and |value| — and on arm64
 		// the compiler fuses mul+add even in the "naive" kernel, shifting
-		// accumulation slightly — so tolerances scale with √k like the
-		// packed sweep's.
-		tolF := max(1e-5, 1e-6*math.Sqrt(float64(k)))
+		// accumulation slightly — so on arm64 tolerances scale with √k
+		// like the packed sweep's. amd64 keeps the fixed 1e-5 net: its
+		// cause (FMA fusion of the reference) does not apply there.
+		tolF := 1e-5
+		if runtime.GOARCH == "arm64" {
+			tolF = max(tolF, 1e-6*math.Sqrt(float64(k)))
+		}
 		a := make([]float32, m*k)
 		bT := make([]float32, n*k)
 		for i := range a {

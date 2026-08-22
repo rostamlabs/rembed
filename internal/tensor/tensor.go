@@ -20,9 +20,9 @@ import (
 // contiguous rows.
 type MatMulFunc func(dst, a, bT []float32, m, k, n int)
 
-// Default returns the best matmul body for this platform: the AVX2+FMA
-// SIMD kernel where the CPU supports it, the scalar parallel kernel
-// otherwise. Model code binds it ONCE at load time (a mutable package
+// Default returns the best matmul body for this platform: the native
+// SIMD kernel (AVX2+FMA on amd64, NEON on arm64) where available, the
+// scalar parallel kernel otherwise. Model code binds it ONCE at load time (a mutable package
 // variable would race with in-flight forward passes); benchmarks A/B the
 // named implementations directly.
 func Default() MatMulFunc {

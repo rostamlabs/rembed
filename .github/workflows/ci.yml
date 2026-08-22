@@ -57,6 +57,11 @@ jobs:
       - name: install qemu-user
         run: sudo apt-get update -q && sudo apt-get install -y -q qemu-user-static
       - name: build arm64 test binaries
+        # The root package is deliberately omitted: its golden battery
+        # fetches real model weights over the network, which is painfully
+        # slow under qemu. The full root suite WAS run manually on arm64
+        # under qemu for the R3 PR; these four packages are the standing
+        # per-commit net (they cover every arm64 assembly kernel).
         run: |
           mkdir -p /tmp/arm64
           for pkg in ./internal/tensor ./internal/model ./internal/safetensors ./tokenizer; do

@@ -7,11 +7,17 @@
 //
 // NEON port of the amd64 dot kernel: dst[0..3] = dot(a, b0..b3) over k
 // floats. Four 4-lane accumulators; the k%4 tail uses scalar FMADDS into
-// separate scalar accumulators; the final lane reduction spills each
-// vector to the frame and sums with scalar FADDS (the Go assembler has no
-// float horizontal-add mnemonic). Accumulation order therefore differs
-// from the scalar kernels — within fp32 rounding, same contract as amd64.
-TEXT ·dot4(SB), NOSPLIT, $16-56
+// separate scalar accumulators; the final lane reduction extracts lanes
+// through GPRs (VMOV Vn.S[i] is UMOV; FMOVS Rn moves the bits back to an
+// FP register) and sums with scalar FADDS — the Go assembler has no float
+// horizontal-add mnemonic. Register-only reduction keeps the function
+// frameless: an earlier version spilled to (RSP), which in a $16 frame is
+// the saved-LR slot, not the locals — harmless to a leaf's execution but
+// it corrupts SIGPROF unwinding (runtime reads the innermost caller PC
+// from frame.sp), silently truncating CPU profile samples. Accumulation
+// order differs from the scalar kernels — within fp32 rounding, same
+// contract as amd64.
+TEXT ·dot4(SB), NOSPLIT, $0-56
 	MOVD dst+0(FP), R0
 	MOVD a+8(FP), R1
 	MOVD b0+16(FP), R2
@@ -63,48 +69,61 @@ tailloop:
 	BNE     tailloop
 
 reduce:
-	// Sum each accumulator's four lanes via a frame spill, add the scalar
-	// tail, store dst[c]. The temporaries are F16-F19: scalar Fn ALIASES
-	// Vn.S[0] on arm64, so using F1-F3 here would clobber the low lanes of
-	// the not-yet-reduced accumulators V1-V3 (found by the qemu sweep).
-	VST1  [V0.S4], (RSP)
-	FMOVS 0(RSP), F16
-	FMOVS 4(RSP), F17
-	FMOVS 8(RSP), F18
-	FMOVS 12(RSP), F19
+	// Sum each accumulator's four lanes lane-by-lane through R8-R11, add
+	// the scalar tail, store dst[c]. The FP temporaries are F16-F19:
+	// scalar Fn ALIASES Vn.S[0] on arm64, so using F1-F3 here would
+	// clobber the low lanes of the not-yet-reduced accumulators V1-V3
+	// (found by the qemu sweep).
+	VMOV  V0.S[0], R8
+	VMOV  V0.S[1], R9
+	VMOV  V0.S[2], R10
+	VMOV  V0.S[3], R11
+	FMOVS R8, F16
+	FMOVS R9, F17
+	FMOVS R10, F18
+	FMOVS R11, F19
 	FADDS F17, F16, F16
 	FADDS F19, F18, F18
 	FADDS F18, F16, F16
 	FADDS F24, F16, F16
 	FMOVS F16, (R0)
 
-	VST1  [V1.S4], (RSP)
-	FMOVS 0(RSP), F16
-	FMOVS 4(RSP), F17
-	FMOVS 8(RSP), F18
-	FMOVS 12(RSP), F19
+	VMOV  V1.S[0], R8
+	VMOV  V1.S[1], R9
+	VMOV  V1.S[2], R10
+	VMOV  V1.S[3], R11
+	FMOVS R8, F16
+	FMOVS R9, F17
+	FMOVS R10, F18
+	FMOVS R11, F19
 	FADDS F17, F16, F16
 	FADDS F19, F18, F18
 	FADDS F18, F16, F16
 	FADDS F25, F16, F16
 	FMOVS F16, 4(R0)
 
-	VST1  [V2.S4], (RSP)
-	FMOVS 0(RSP), F16
-	FMOVS 4(RSP), F17
-	FMOVS 8(RSP), F18
-	FMOVS 12(RSP), F19
+	VMOV  V2.S[0], R8
+	VMOV  V2.S[1], R9
+	VMOV  V2.S[2], R10
+	VMOV  V2.S[3], R11
+	FMOVS R8, F16
+	FMOVS R9, F17
+	FMOVS R10, F18
+	FMOVS R11, F19
 	FADDS F17, F16, F16
 	FADDS F19, F18, F18
 	FADDS F18, F16, F16
 	FADDS F26, F16, F16
 	FMOVS F16, 8(R0)
 
-	VST1  [V3.S4], (RSP)
-	FMOVS 0(RSP), F16
-	FMOVS 4(RSP), F17
-	FMOVS 8(RSP), F18
-	FMOVS 12(RSP), F19
+	VMOV  V3.S[0], R8
+	VMOV  V3.S[1], R9
+	VMOV  V3.S[2], R10
+	VMOV  V3.S[3], R11
+	FMOVS R8, F16
+	FMOVS R9, F17
+	FMOVS R10, F18
+	FMOVS R11, F19
 	FADDS F17, F16, F16
 	FADDS F19, F18, F18
 	FADDS F18, F16, F16

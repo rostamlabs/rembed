@@ -16,7 +16,7 @@ import (
 // Guard slots around dst catch out-of-bounds writes.
 func TestDot4(t *testing.T) {
 	if !hasSIMD {
-		t.Skip("no AVX2+FMA on this CPU")
+		t.Skip("no native dot kernel on this architecture")
 	}
 	rng := rand.New(rand.NewSource(7))
 	for k := 1; k <= 40; k++ {
