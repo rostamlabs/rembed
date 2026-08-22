@@ -3,6 +3,7 @@
 package tensor
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -30,33 +31,60 @@ func TestMatMulNaiveSmall(t *testing.T) {
 	almostEqual(t, dst, []float32{58, 64, 139, 154}, 0, "matmul")
 }
 
-// TestMatMulAgainstFloat64Reference cross-checks the active kernel against a
-// float64 reference on random matrices. Every future kernel body must pass
-// this same test — it is the per-kernel safety net of the optimization ladder.
+// kernels lists every matmul body; each must pass the float64 cross-check
+// below — it is the per-kernel safety net of the optimization ladder.
+var kernels = map[string]MatMulFunc{
+	"naive":   MatMulNaive,
+	"blocked": MatMulBlocked,
+}
+
+// TestMatMulAgainstFloat64Reference cross-checks every kernel body against a
+// float64 reference on random matrices, over shapes that exercise the
+// blocking edges: micro-kernel remainders (n%4 != 0), tile remainders
+// (m > blockM with a partial last tile), and degenerate sizes.
 func TestMatMulAgainstFloat64Reference(t *testing.T) {
+	shapes := [][3]int{
+		{17, 33, 29},        // nothing divides anything
+		{1, 1, 1},           // degenerate
+		{12, 384, 384},      // MiniLM projection shape
+		{12, 384, 1536},     // MiniLM FFN shape (n % 4 == 0)
+		{blockM + 5, 16, 7}, // partial last i-tile AND n remainder
+		{2 * blockM, 8, 4},  // exact tile boundaries
+		{3, 5, blockN - 1},  // n smaller than the micro-kernel
+	}
 	rng := rand.New(rand.NewSource(42))
-	const m, k, n = 17, 33, 29
-	a := make([]float32, m*k)
-	bT := make([]float32, n*k)
-	for i := range a {
-		a[i] = rng.Float32()*2 - 1
-	}
-	for i := range bT {
-		bT[i] = rng.Float32()*2 - 1
-	}
-	want := make([]float32, m*n)
-	for i := range m {
-		for j := range n {
-			var sum float64
-			for p := range k {
-				sum += float64(a[i*k+p]) * float64(bT[j*k+p])
+	for _, sh := range shapes {
+		m, k, n := sh[0], sh[1], sh[2]
+		a := make([]float32, m*k)
+		bT := make([]float32, n*k)
+		for i := range a {
+			a[i] = rng.Float32()*2 - 1
+		}
+		for i := range bT {
+			bT[i] = rng.Float32()*2 - 1
+		}
+		want := make([]float32, m*n)
+		for i := range m {
+			for j := range n {
+				var sum float64
+				for p := range k {
+					sum += float64(a[i*k+p]) * float64(bT[j*k+p])
+				}
+				want[i*n+j] = float32(sum)
 			}
-			want[i*n+j] = float32(sum)
+		}
+		for name, kern := range kernels {
+			got := make([]float32, m*n)
+			kern(got, a, bT, m, k, n)
+			// fp32 accumulation error grows with k and |value|, so the
+			// tolerance is relative: 1e-5 · (1 + |want|).
+			for i := range want {
+				if d := math.Abs(float64(got[i] - want[i])); d > 1e-5*(1+math.Abs(float64(want[i]))) {
+					t.Fatalf("%s %dx%dx%d: [%d]=%v want %v (diff %g)", name, m, k, n, i, got[i], want[i], d)
+				}
+			}
 		}
 	}
-	got := make([]float32, m*n)
-	MatMul(got, a, bT, m, k, n)
-	almostEqual(t, got, want, 1e-5, "matmul vs float64")
 }
 
 func TestSoftmax(t *testing.T) {
@@ -116,20 +144,29 @@ func TestAddBiasAndAdd(t *testing.T) {
 	almostEqual(t, x, []float32{12, 23, 14, 25}, 0, "add")
 }
 
-func BenchmarkMatMulNaive(b *testing.B) {
-	// Representative FFN shape for MiniLM at seq=128: [128×384]·[384×1536].
-	const m, k, n = 128, 384, 1536
-	a := make([]float32, m*k)
-	bT := make([]float32, n*k)
-	dst := make([]float32, m*n)
-	for i := range a {
-		a[i] = float32(i%7) * 0.1
-	}
-	for i := range bT {
-		bT[i] = float32(i%5) * 0.1
-	}
-	b.SetBytes(int64(m*k+n*k+m*n) * 4)
-	for b.Loop() {
-		MatMulNaive(dst, a, bT, m, k, n)
+// benchMatMul runs one kernel over the two shapes that dominate the forward
+// pass: the FFN panel at a large seq, and the skinny seq=12 projection that
+// the e2e bench text produces.
+func benchMatMul(b *testing.B, kern MatMulFunc) {
+	for _, sh := range [][3]int{{128, 384, 1536}, {12, 384, 384}} {
+		m, k, n := sh[0], sh[1], sh[2]
+		b.Run(fmt.Sprintf("%dx%dx%d", m, k, n), func(b *testing.B) {
+			a := make([]float32, m*k)
+			bT := make([]float32, n*k)
+			dst := make([]float32, m*n)
+			for i := range a {
+				a[i] = float32(i%7) * 0.1
+			}
+			for i := range bT {
+				bT[i] = float32(i%5) * 0.1
+			}
+			b.SetBytes(int64(m*k+n*k+m*n) * 4)
+			for b.Loop() {
+				kern(dst, a, bT, m, k, n)
+			}
+		})
 	}
 }
+
+func BenchmarkMatMulNaive(b *testing.B)   { benchMatMul(b, MatMulNaive) }
+func BenchmarkMatMulBlocked(b *testing.B) { benchMatMul(b, MatMulBlocked) }

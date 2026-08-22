@@ -97,6 +97,33 @@ func TestEmbedContextCancellation(t *testing.T) {
 	}
 }
 
+// TestEmbedSteadyStateAllocs pins the M1 alloc-free property: after warm-up,
+// a forward pass allocates only the returned vectors and tokenizer output,
+// not the ~15 large scratch buffers M0 allocated per call.
+func TestEmbedSteadyStateAllocs(t *testing.T) {
+	dir := modelDir(t)
+	emb, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	texts := []string{"The quick brown fox jumps over the lazy dog."}
+	if _, err := emb.Embed(ctx, texts); err != nil { // warm the scratch pool
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(20, func() {
+		if _, err := emb.Embed(ctx, texts); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// Small constant: out slice + pooled vector + tokenizer ids/mask/token
+	// strings. The bound has headroom; the point is it must not scale with
+	// the model's buffer count again.
+	if allocs > 40 {
+		t.Fatalf("steady-state Embed does %v allocs/op, want <= 40", allocs)
+	}
+}
+
 // BenchmarkEmbed is the end-to-end latency benchmark for the ladder deltas.
 func BenchmarkEmbed(b *testing.B) {
 	dir := modelDir(b)
