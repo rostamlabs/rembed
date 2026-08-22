@@ -73,6 +73,13 @@ the per-row absmax scheme loses ~3× more precision there — short texts
 degrade most. Full int8 is NOT recommended for RoBERTa-family models;
 prefer `WithInt8` (weight-only) for those.
 
+Cross-engine, measured on a Zen 4 cloud box with a both-orders/median
+protocol (bench/RESULTS.md has the full data and every noise flag):
+rembed fp32 sits at parity with ONNX Runtime fp32, and rembed full int8
+beat ORT fp32 in every round — the flag-free rounds measured 0.70× and
+0.75× (5.9 ms vs 7.9 ms on mpnet) — while trading blows at parity with
+ORT's own AVX-512-VNNI int8 graphs.
+
 Expected compatible (same architecture, no ONNX export on the Hub to
 validate against): the e5 family, larger BGE/GTE sizes, and other
 BERT-based sentence-transformers checkpoints. Caveat for retrieval

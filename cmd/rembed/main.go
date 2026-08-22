@@ -45,6 +45,13 @@ func main() {
 	}
 }
 
+func quantOpts(useInt8, useInt8Act bool) []rembed.Option {
+	if useInt8Act {
+		return []rembed.Option{rembed.WithInt8Activations()}
+	}
+	return int8Opts(useInt8)
+}
+
 func int8Opts(useInt8 bool) []rembed.Option {
 	if useInt8 {
 		return []rembed.Option{rembed.WithInt8()}
@@ -62,12 +69,13 @@ func cmdEmbed(args []string) error {
 	modelDir := fs.String("model", "models/all-MiniLM-L6-v2", "model directory")
 	full := fs.Bool("full", false, "print full vectors as JSON instead of a preview")
 	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
+	useInt8Act := fs.Bool("int8act", false, "full int8 (u8 activations, needs VNNI)")
 	_ = fs.Parse(args)
 	texts := fs.Args()
 	if len(texts) == 0 {
 		return fmt.Errorf("embed: no texts given")
 	}
-	emb, err := rembed.Load(*modelDir, int8Opts(*useInt8)...)
+	emb, err := rembed.Load(*modelDir, quantOpts(*useInt8, *useInt8Act)...)
 	if err != nil {
 		return err
 	}
@@ -170,6 +178,7 @@ func cmdBench(args []string) error {
 	runs := fs.Int("runs", 30, "measured runs")
 	warmup := fs.Int("warmup", 5, "discarded warm-up runs")
 	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
+	useInt8Act := fs.Bool("int8act", false, "full int8 (u8 activations, needs VNNI)")
 	text := fs.String("text", "The quick brown fox jumps over the lazy dog.", "input text")
 	asJSON := fs.Bool("json", false, "emit machine-readable per-run latencies (for bench/compare.py)")
 	_ = fs.Parse(args)
@@ -177,7 +186,7 @@ func cmdBench(args []string) error {
 		return fmt.Errorf("bench: -runs must be > 0 and -warmup >= 0 (got %d, %d)", *runs, *warmup)
 	}
 
-	emb, err := rembed.Load(*modelDir, int8Opts(*useInt8)...)
+	emb, err := rembed.Load(*modelDir, quantOpts(*useInt8, *useInt8Act)...)
 	if err != nil {
 		return err
 	}
@@ -201,8 +210,16 @@ func cmdBench(args []string) error {
 		for i, d := range durs {
 			runsSec[i] = d.Seconds()
 		}
-		// seq lets compare.py verify both engines tokenize to the same length.
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"runs_sec": runsSec, "seq": len(ids)})
+		// seq lets compare.py verify both engines tokenize to the same
+		// length; the quantization fields let it verify which mode
+		// ACTUALLY ran (the engine falls back silently by design, and a
+		// benchmark must not label fallback latencies as the full mode).
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"runs_sec":              runsSec,
+			"seq":                   len(ids),
+			"quantized":             emb.Quantized(),
+			"quantized_activations": emb.QuantizedActivations(),
+		})
 	}
 	slices.Sort(durs)
 	median := durs[len(durs)/2]

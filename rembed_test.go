@@ -128,8 +128,9 @@ func TestGoldenInt8Activations(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !emb.QuantizedActivations() {
-		t.Skip("AVX-VNNI unavailable on this CPU; nothing to assert")
+		t.Skip("no VNNI encoding available on this CPU; nothing to assert")
 	}
+	t.Logf("full-int8 path ACTIVE (VEX or EVEX per CPU) — accuracy bound enforced")
 	serial, err := Load(dir, WithInt8Activations(), WithWorkers(1))
 	if err != nil {
 		t.Fatal(err)
@@ -522,7 +523,10 @@ func TestGoldenMatrix(t *testing.T) {
 					t.Fatal(err)
 				}
 				if full.QuantizedActivations() {
+					t.Logf("int8-full bound %.4f enforced (VNNI active)", tc.int8ActMinCos)
 					checkQuant("int8-full", tc.int8ActMinCos, WithInt8Activations())
+				} else {
+					t.Logf("int8-full bound NOT enforced: no VNNI on this CPU")
 				}
 			}
 		})

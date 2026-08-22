@@ -12,14 +12,21 @@ import "golang.org/x/sys/cpu"
 var (
 	hasSIMD  = cpu.X86.HasAVX2 && cpu.X86.HasFMA
 	hasSIMD8 = hasSIMD
-	// hasVNNI gates the u8·s8 VPDPBUSD kernel. AVX-VNNI is the 256-bit
-	// VEX form: Alder Lake (2021) onward on client, Sapphire Rapids
-	// onward on server, Zen 5 onward on AMD. NOTE the trap the review
-	// caught: AVX-512-VNNI parts (Cascade/Ice Lake-SP, Zen 4) do NOT
-	// report AVX-VNNI, and our VEX encoding #UDs there — those CPUs
-	// would need the EVEX form Go emits natively, an untested path this
-	// codebase refuses to ship until hardware is available (R8's box).
+	// hasVNNI gates the VEX-encoded u8·s8 VPDPBUSD kernel. AVX-VNNI is
+	// the 256-bit VEX form: Alder Lake (2021) onward on client, Sapphire
+	// Rapids onward on server, Zen 5 onward on AMD. AVX-512-VNNI parts
+	// (Cascade/Ice Lake-SP, Zen 4) do NOT report it — our VEX encoding
+	// #UDs there — so they take the EVEX twin below, proven on R8's
+	// Zen 4 box.
 	hasVNNI = hasSIMD && cpu.X86.HasAVXVNNI
+	// hasVNNI512 covers the complementary set: AVX-512-VNNI parts
+	// (Cascade/Ice Lake-SP, Zen 4) where Go's native EVEX VPDPBUSD is
+	// legal (AVX512VL needed for the ymm form). Together the two gates
+	// give full int8 on every VNNI-capable CPU whose OS saves AVX-512
+	// state (x/sys forces that false on macOS, so Intel Macs stay on
+	// weight-only int8 — correct, just not "every"), each with the one
+	// encoding its hardware accepts.
+	hasVNNI512 = hasSIMD && cpu.X86.HasAVX512VNNI && cpu.X86.HasAVX512VL
 )
 
 // dot4 computes dst[0..3] = dot(a, b0..b3) over k floats with 8-lane FMA
@@ -47,3 +54,9 @@ func gemm4x16i8(dst *float32, n int, pa *float32, pb *int8, k int, scales *float
 //
 //go:noescape
 func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int)
+
+// gemm4x16vnni512 is gemm4x16vnni with the EVEX (AVX-512-VNNI) encoding
+// (implemented in vnni512_amd64.s; requires AVX512-VNNI + AVX512VL).
+//
+//go:noescape
+func gemm4x16vnni512(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int)

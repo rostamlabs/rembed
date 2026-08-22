@@ -111,11 +111,18 @@ outliers defeat the per-row absmax scheme (the review measured ~2.7×
 larger row absmax at the median). Full int8 is not recommended for
 RoBERTa-family checkpoints.
 
-## R8 — Publishable benchmark + beyond-CPU
-A pinned cloud box turns the consistent sign-test wins over ONNX Runtime
-into publishable magnitudes (DESIGN.md rule; laptop numbers stay
-relative-only). GPU execution remains explicitly out of scope until the
-CPU story is complete — revisit after R1–R7.
+## R8 — Cloud-box cross-engine benchmark ✅
+Done on a user-provisioned 12-vCPU Zen 4 (EPYC Genoa) KVM guest — a
+cloud VM, not bare metal, and the FLAG discipline stayed in charge.
+Verdicts (mpnet, three rounds, both-orders protocol): fp32 at PARITY
+with ONNX Runtime fp32; full int8 ahead of ORT fp32 in 3/3 rounds
+(0.59-0.78×); full int8 at parity with ORT's own qint8-avx512-vnni
+graphs (0.95-1.16×) despite rembed's kernel being 256-bit ymm. The box
+also proved R7's EVEX twin on real Zen 4 (bit-identical to the VEX
+path's outputs), so full int8 now covers every VNNI-capable CPU.
+Remaining headroom: a zmm-wide kernel for 512-bit-native parts; a
+dedicated bare-metal box would still tighten the noise bands. GPU
+remains out of scope.
 
 ## Standing rules
 Every rung: golden validation against an independent reference, its own
