@@ -165,6 +165,88 @@ func TestGoldenInt8(t *testing.T) {
 	}
 }
 
+// TestGoldenCLSPooling validates the CLS pooling path end to end against
+// BGE-small's own ONNX reference — the pooling mode the BGE/arctic model
+// families use. Skips when the model dir has not been exported.
+func TestGoldenCLSPooling(t *testing.T) {
+	dir := "models/bge-small-en-v1.5"
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("model dir %s not present (models/convert.py BAAI/bge-small-en-v1.5)", dir)
+	}
+	raw, err := os.ReadFile("testdata/golden-bge-small.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden goldenFile
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	if len(golden.Cases) == 0 {
+		t.Fatal("golden file has no cases")
+	}
+	emb, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := emb.Dim(); got != len(golden.Cases[0].Embedding) {
+		t.Fatalf("Dim()=%d, golden dim=%d", got, len(golden.Cases[0].Embedding))
+	}
+	for _, c := range golden.Cases {
+		if ids := emb.Tokenize(c.Text); !slices.Equal(ids, c.InputIDs) {
+			t.Errorf("%.40q: tokenizer mismatch", c.Text)
+			continue
+		}
+		v, err := emb.Embed(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var maxd float64
+		for i, want := range c.Embedding {
+			if d := math.Abs(float64(v[0][i] - want)); d > maxd {
+				maxd = d
+			}
+		}
+		if maxd > 1e-4 {
+			t.Errorf("%.40q: cls maxAbsDiff=%g > 1e-4", c.Text, maxd)
+		}
+	}
+}
+
+// TestLoadFromHub exercises the pure-Go Hugging Face download path into a
+// fresh cache. Network-dependent, so it runs only when opted in.
+func TestLoadFromHub(t *testing.T) {
+	if os.Getenv("REMBED_NETWORK_TESTS") == "" {
+		t.Skip("set REMBED_NETWORK_TESTS=1 to run hub download tests")
+	}
+	t.Setenv("REMBED_CACHE", t.TempDir())
+	emb, err := Load("sentence-transformers/all-MiniLM-L6-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emb.Dim() != 384 {
+		t.Fatalf("Dim()=%d", emb.Dim())
+	}
+	v, err := emb.Embed(context.Background(), []string{"hello world"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hub-derived config must produce the same vectors as the converted
+	// model dir when both are present.
+	if _, err := os.Stat("models/all-MiniLM-L6-v2/model.safetensors"); err == nil {
+		ref, err := Load("models/all-MiniLM-L6-v2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := ref.Embed(context.Background(), []string{"hello world"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(v[0], w[0]) {
+			t.Fatal("hub-loaded model diverged from converted model dir")
+		}
+	}
+}
+
 // TestWithWorkersSerialMatchesDefault pins WithWorkers(1): fully serial,
 // same embeddings as the default full-machine configuration.
 func TestWithWorkersSerialMatchesDefault(t *testing.T) {

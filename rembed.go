@@ -11,8 +11,11 @@ package rembed
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/rostamlabs/rembed/internal/hub"
 	"github.com/rostamlabs/rembed/internal/model"
 	"github.com/rostamlabs/rembed/tokenizer"
 )
@@ -61,14 +64,37 @@ func WithWorkers(n int) Option {
 	return func(o *loadOptions) { o.workers = n }
 }
 
-// Load opens a model directory produced by models/convert.py, containing
-// model.safetensors, vocab.txt, and manifest.json.
-func Load(modelDir string, opts ...Option) (*Embedder, error) {
+// Load opens a model. ref may be:
+//
+//   - a local directory: either a converted dir (manifest.json) or a plain
+//     Hugging Face repo checkout (config.json + 1_Pooling/... — the
+//     manifest is derived on the fly);
+//   - a Hugging Face model id like "sentence-transformers/all-MiniLM-L6-v2"
+//     (optionally prefixed "hf:"): the files are downloaded straight from
+//     the Hub in pure Go into $REMBED_CACHE (default: the user cache dir)
+//     and reused on later loads. Set HF_TOKEN for gated repos.
+func Load(ref string, opts ...Option) (*Embedder, error) {
 	var o loadOptions
 	for _, opt := range opts {
 		opt(&o)
 	}
-	cfg, err := model.LoadConfig(filepath.Join(modelDir, "manifest.json"))
+	name := strings.TrimPrefix(ref, "hf:")
+	modelDir := name
+	if fi, statErr := os.Stat(modelDir); statErr != nil || !fi.IsDir() {
+		if !hub.IsModelID(name) {
+			return nil, fmt.Errorf("rembed: %q is neither a model directory nor a Hugging Face model id", ref)
+		}
+		cache, err := hub.CacheDir()
+		if err != nil {
+			return nil, fmt.Errorf("rembed: %w", err)
+		}
+		dir, err := hub.Ensure(name, cache)
+		if err != nil {
+			return nil, fmt.Errorf("rembed: %w", err)
+		}
+		modelDir = dir
+	}
+	cfg, err := model.LoadConfigOrDerive(modelDir, name)
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}

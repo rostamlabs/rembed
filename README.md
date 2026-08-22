@@ -5,10 +5,18 @@ Text in, L2-normalized embedding vectors out — no cgo, no ONNX Runtime,
 one static binary.
 
 ```go
-emb, err := rembed.Load("models/all-MiniLM-L6-v2")
+// Loads straight from the Hugging Face Hub (pure Go, cached locally) —
+// no Python, no conversion step:
+emb, err := rembed.Load("sentence-transformers/all-MiniLM-L6-v2")
 vecs, err := emb.Embed(ctx, []string{"hello world"})
 // vecs[0] is a []float32 of emb.Dim() (384 for MiniLM-L6-v2)
 ```
+
+`Load` accepts a Hub model id (downloaded into `$REMBED_CACHE`, default
+the user cache dir; `HF_TOKEN` honored), a git-cloned HF repo directory,
+or a converted model dir. Options: `rembed.WithInt8()` (weight-only
+quantization, ~4× less weight traffic, cosine ≥ 0.999 vs fp32) and
+`rembed.WithWorkers(n)` (CPU cap for servers).
 
 Status: the optimization ladder is complete — naive baseline to
 **statistical parity with (and, with int8, consistently ahead of) ONNX
@@ -20,19 +28,35 @@ including the failed experiments. Weight-only int8 is opt-in via
 `rembed.WithInt8()`; `rembed.WithWorkers(n)` caps per-call CPU for
 throughput-saturated servers.
 
-## Getting a model
+## Supported models
 
-Model weights are not committed. Export one from HuggingFace:
+BERT-family encoders in sentence-transformers format: mean or CLS pooling,
+WordPiece, absolute positions, exact GELU; F32/F16/BF16 safetensors.
+Validated end-to-end against each model's own ONNX Runtime reference:
+
+| model | pooling | dtype | fp32 vs ONNX | int8 |
+|-------|---------|-------|--------------|------|
+| sentence-transformers/all-MiniLM-L6-v2 | mean | F32 | 1.5e-7 | cosine ≥ 0.9991 |
+| sentence-transformers/all-MiniLM-L12-v2 | mean | F32 | 1.9e-7 | in bounds |
+| sentence-transformers/paraphrase-MiniLM-L3-v2 | mean | F32 | < 1e-4 | — |
+| BAAI/bge-small-en-v1.5 | cls | F32 | < 1e-4 | in bounds |
+| thenlper/gte-small | mean | F16 | 2e-3 (= the f16 weights' own rounding vs the fp32 ONNX export) | — |
+
+Expected compatible (same architecture, no ONNX export on the Hub to
+validate against): the e5 family, larger BGE/GTE sizes, and other
+BERT-based sentence-transformers checkpoints. Not supported: MPNet,
+RoBERTa/XLM-R (different architectures/tokenizers).
+
+## Dev: golden reference generation
+
+The validation harness's golden files come from ONNX Runtime in Python
+(this is a dev-time tool; users never need it):
 
 ```sh
 cd models
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python convert.py sentence-transformers/all-MiniLM-L6-v2
 ```
-
-This writes `models/all-MiniLM-L6-v2/{model.safetensors, vocab.txt, manifest.json}`
-and regenerates `testdata/golden.json` (ONNX Runtime reference outputs used
-by the validation harness).
 
 ## Python
 
