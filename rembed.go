@@ -36,10 +36,13 @@ type loadOptions struct {
 	workers int
 }
 
-// WithInt8 selects weight-only int8 inference: weights are quantized at
-// load (per-output-channel symmetric scales; activations stay float32),
-// cutting weight memory and per-embed weight traffic 4×. Embeddings differ
-// slightly from fp32 — see the int8 golden test for the measured bound.
+// WithInt8 selects weight-only int8 inference: transformer dense weights
+// are quantized at load (per-output-channel symmetric scales; activations
+// stay float32), cutting per-embed weight traffic ~4× (~42 MB → ~10.5 MB
+// for MiniLM). Token embeddings stay fp32, so RESIDENT model memory drops
+// ~1.5×, not 4×. Embeddings differ slightly from fp32 — see the int8
+// golden test for the measured bound. On CPUs without AVX2+FMA the engine
+// silently falls back to fp32; check Quantized() when the mode matters.
 func WithInt8() Option {
 	return func(o *loadOptions) { o.int8 = true }
 }
@@ -50,6 +53,11 @@ func WithInt8() Option {
 // idle-core cycles for the duration of each call (~10× the useful CPU at
 // low concurrency). A server saturating many concurrent Embed calls should
 // set a small cap; WithWorkers(1) is fully serial with zero spinning.
+//
+// The cap governs the packed SIMD path (every matmul on amd64+AVX2) and
+// the attention/GELU fan-outs. The unpacked fallback matmul (non-amd64, or
+// weight shapes the packer rejects) currently parallelizes via an uncapped
+// ParallelFor and may exceed the cap there.
 func WithWorkers(n int) Option {
 	return func(o *loadOptions) { o.workers = n }
 }
@@ -114,6 +122,11 @@ func (e *Embedder) Tokenize(text string) []int64 {
 
 // Model returns the model name from the manifest.
 func (e *Embedder) Model() string { return e.cfg.Name }
+
+// Quantized reports whether the weight-only int8 path is actually active
+// (WithInt8 requested AND every dense weight packed as int8 — the engine
+// falls back to fp32 per-matrix when the CPU or a shape cannot take it).
+func (e *Embedder) Quantized() bool { return e.m.Quantized() }
 
 // Dim returns the embedding dimensionality.
 func (e *Embedder) Dim() int { return e.cfg.HiddenSize }

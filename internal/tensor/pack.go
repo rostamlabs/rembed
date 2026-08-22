@@ -23,8 +23,8 @@ func PackB(bT []float32, k, n int) (*PackedB, error) {
 	if !hasSIMD {
 		return nil, fmt.Errorf("tensor: PackB requires AVX2+FMA (packed layout feeds the SIMD kernel only)")
 	}
-	if n%16 != 0 {
-		return nil, fmt.Errorf("tensor: PackB needs n%%16==0, got n=%d", n)
+	if n < 16 || n%16 != 0 {
+		return nil, fmt.Errorf("tensor: PackB needs n%%16==0 and n>=16, got n=%d", n)
 	}
 	if k < 1 {
 		return nil, fmt.Errorf("tensor: PackB needs k>=1, got k=%d", k)

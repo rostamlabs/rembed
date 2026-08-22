@@ -123,11 +123,24 @@ func TestGoldenInt8(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !emb.Quantized() {
+		t.Skip("int8 path unavailable on this CPU; nothing to assert")
+	}
+	if emb.Dim() != len(golden.Cases[0].Embedding) {
+		t.Fatalf("Dim()=%d, golden dim=%d", emb.Dim(), len(golden.Cases[0].Embedding))
+	}
+	var worst float64
 	for _, c := range golden.Cases {
+		if ids := emb.Tokenize(c.Text); !slices.Equal(ids, c.InputIDs) {
+			t.Errorf("%.40q: tokenizer mismatch", c.Text)
+			continue
+		}
 		v, err := emb.Embed(context.Background(), []string{c.Text})
 		if err != nil {
 			t.Fatal(err)
 		}
+		// dot IS cosine here because both vectors are unit-norm (the
+		// manifest sets normalize: true, and the golden is normalized).
 		var dot, maxd float64
 		for i, want := range c.Embedding {
 			dot += float64(v[0][i]) * float64(want)
@@ -135,10 +148,47 @@ func TestGoldenInt8(t *testing.T) {
 				maxd = d
 			}
 		}
+		if maxd > worst {
+			worst = maxd
+		}
 		if maxd > 0.03 || dot < 0.998 {
 			t.Errorf("%.40q: int8 maxAbsDiff=%.4g cosine=%.6f (want <= 0.03, >= 0.998)", c.Text, maxd, dot)
 		} else {
 			t.Logf("%.40q: int8 maxAbsDiff=%.4g cosine=%.6f", c.Text, maxd, dot)
+		}
+	}
+	// Quantization error must be PRESENT: a run indistinguishable from fp32
+	// means the int8 path silently isn't executing, and this test would
+	// otherwise pass most easily with the feature under test disabled.
+	if worst < 1e-4 {
+		t.Fatalf("int8 error (%.3g) indistinguishable from fp32 — int8 path appears inactive", worst)
+	}
+}
+
+// TestWithWorkersSerialMatchesDefault pins WithWorkers(1): fully serial,
+// same embeddings as the default full-machine configuration.
+func TestWithWorkersSerialMatchesDefault(t *testing.T) {
+	dir := modelDir(t)
+	def, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ser, err := Load(dir, WithWorkers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, text := range []string{"hello world", "The quick brown fox jumps over the lazy dog."} {
+		a, err := def.Embed(ctx, []string{text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := ser.Embed(ctx, []string{text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(a[0], b[0]) {
+			t.Fatalf("%q: WithWorkers(1) diverged from default", text)
 		}
 	}
 }

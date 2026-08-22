@@ -266,6 +266,22 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 // Config returns the manifest the model was loaded with.
 func (m *Model) Config() Config { return m.cfg }
 
+// Quantized reports whether EVERY dense weight actually took the int8
+// path. Quantization can silently fall back per-matrix (no AVX2, or an
+// out-dim not divisible by 16) — callers who requested int8 can check the
+// mode took effect instead of discovering fp32 memory and speed later.
+func (m *Model) Quantized() bool {
+	for i := range m.layers {
+		l := &m.layers[i]
+		for _, w := range []*denseWeight{&l.qkv, &l.attnOut, &l.ffn1, &l.ffn2} {
+			if w.packed8 == nil {
+				return false
+			}
+		}
+	}
+	return len(m.layers) > 0
+}
+
 // Forward embeds one token-id sequence (no padding: the sequence is exactly
 // len(ids) long, so the attention mask is implicit all-ones) and returns the
 // pooled sentence vector of length HiddenSize.

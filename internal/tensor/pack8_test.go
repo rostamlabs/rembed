@@ -39,6 +39,10 @@ func TestMatMulPacked8AgainstDequantizedReference(t *testing.T) {
 		for i := range bT {
 			bT[i] = rng.Float32()*2 - 1
 		}
+		// Force one all-zero channel so the scale=1 branch executes.
+		for p := range k {
+			bT[(n/2)*k+p] = 0
+		}
 		pb, err := PackB8(bT, k, n)
 		if err != nil {
 			t.Fatal(err)
@@ -92,6 +96,21 @@ func TestMatMulPacked8AgainstDequantizedReference(t *testing.T) {
 // TestPackB8QuantizationError pins the quantization error bound itself:
 // per-channel symmetric int8 keeps every dequantized weight within
 // scale/2 = maxabs/254 of the original.
+func TestPackB8RejectsNonFinite(t *testing.T) {
+	if !hasSIMD {
+		t.Skip("no AVX2+FMA on this CPU")
+	}
+	bT := make([]float32, 16*4)
+	bT[7] = float32(math.NaN())
+	if _, err := PackB8(bT, 4, 16); err == nil {
+		t.Fatal("expected error for NaN weight (int8(NaN) silently truncates to 0)")
+	}
+	bT[7] = float32(math.Inf(1))
+	if _, err := PackB8(bT, 4, 16); err == nil {
+		t.Fatal("expected error for Inf weight")
+	}
+}
+
 func TestPackB8QuantizationError(t *testing.T) {
 	if !hasSIMD {
 		t.Skip("no AVX2+FMA on this CPU")

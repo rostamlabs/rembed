@@ -26,8 +26,8 @@ func PackB8(bT []float32, k, n int) (*PackedB8, error) {
 	if !hasSIMD {
 		return nil, fmt.Errorf("tensor: PackB8 requires AVX2+FMA")
 	}
-	if n%16 != 0 {
-		return nil, fmt.Errorf("tensor: PackB8 needs n%%16==0, got n=%d", n)
+	if n < 16 || n%16 != 0 {
+		return nil, fmt.Errorf("tensor: PackB8 needs n%%16==0 and n>=16, got n=%d", n)
 	}
 	if k < 1 {
 		return nil, fmt.Errorf("tensor: PackB8 needs k>=1, got k=%d", k)
@@ -40,6 +40,12 @@ func PackB8(bT []float32, k, n int) (*PackedB8, error) {
 		row := bT[j*k : j*k+k]
 		var maxAbs float32
 		for _, v := range row {
+			if v != v || v > math.MaxFloat32 || v < -math.MaxFloat32 {
+				// Reject NaN/Inf: int8(NaN) silently truncates to 0, so a
+				// corrupted checkpoint would produce plausible-looking
+				// embeddings here while fp32 correctly propagates NaN.
+				return nil, fmt.Errorf("tensor: PackB8 channel %d has a non-finite weight", j)
+			}
 			if a := float32(math.Abs(float64(v))); a > maxAbs {
 				maxAbs = a
 			}
@@ -51,9 +57,12 @@ func PackB8(bT []float32, k, n int) (*PackedB8, error) {
 		p.scales[j] = scale
 		panel := p.data[(j/16)*k*16:]
 		c := j % 16
-		inv := 1 / scale
+		// Divide in float64: a float32 reciprocal double-rounds (breaking
+		// the scale/2 error bound by up to ~4e-6 — a latent test flake the
+		// review caught) and overflows to +Inf for subnormal scales,
+		// silently collapsing a tiny-but-normal channel to ±127.
 		for pp, v := range row {
-			q := math.RoundToEven(float64(v * inv))
+			q := math.RoundToEven(float64(v) / float64(scale))
 			if q > 127 {
 				q = 127
 			}
