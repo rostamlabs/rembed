@@ -39,6 +39,7 @@ GOLDEN_TEXTS = [
     "café résumé naïve déjà vu at the sørensen-müller café",
     "€100 costs $5, or ±43 at 20° ± 3°",
     "你好世界 mixed with english text",
+    "سلام دنیا! جستجوی معنایی به زبان فارسی هم کار می‌کند.",
     "In 2024, the model processed 1,234,567 queries at 99.9% availability, "
     "averaging 3.14 ms per request across 42 regions. "
     "This sentence exists to push the sequence length up so the golden set "
@@ -150,9 +151,21 @@ def main() -> None:
     shutil.copyfile(st, out / "model.safetensors")
 
     config = json.loads(fetch("config.json").read_text())
-    # Byte-level BPE models (RoBERTa) ship vocab.json + merges.txt;
-    # WordPiece models (BERT, MPNet) ship vocab.txt.
-    if config.get("model_type") == "roberta":
+    # The sentencepiece.bpe.model FILE is the authority — tokenizer_class
+    # is unreliable in real repos (the multilingual MiniLM says
+    # PreTrainedTokenizerFast).
+    from huggingface_hub.errors import EntryNotFoundError
+    try:
+        fetch("sentencepiece.bpe.model")
+        sentencepiece_tok = True
+    except EntryNotFoundError:
+        sentencepiece_tok = False
+    # SentencePiece models (XLM-R tokenizer, any architecture) ship
+    # sentencepiece.bpe.model; byte-level BPE (RoBERTa) ships vocab.json +
+    # merges.txt; WordPiece (BERT, MPNet) ships vocab.txt.
+    if sentencepiece_tok:
+        shutil.copyfile(fetch("sentencepiece.bpe.model"), out / "sentencepiece.bpe.model")
+    elif config.get("model_type") == "roberta":
         shutil.copyfile(fetch("vocab.json"), out / "vocab.json")
         shutil.copyfile(fetch("merges.txt"), out / "merges.txt")
     else:
@@ -204,10 +217,10 @@ def main() -> None:
         "vocab_size": config["vocab_size"],
         "max_position_embeddings": config["max_position_embeddings"],
         "layer_norm_eps": config.get("layer_norm_eps", 1e-12),
-        "do_lower_case": bool(tok_config.get("do_lower_case", False)) if model_type == "roberta" else bool(tok_config.get("do_lower_case", True)),
+        "do_lower_case": bool(tok_config.get("do_lower_case", False)) if (model_type == "roberta" or sentencepiece_tok) else bool(tok_config.get("do_lower_case", True)),
         "cls_token": tok_config.get("cls_token", "[CLS]"),
         "sep_token": tok_config.get("sep_token", "[SEP]"),
-        "unk_token": tok_config.get("unk_token", "<unk>" if model_type == "roberta" else "[UNK]"),
+        "unk_token": tok_config.get("unk_token", "<unk>" if (model_type == "roberta" or sentencepiece_tok) else "[UNK]"),
         "pooling": pool_mode,
         "normalize": normalize,
     }
@@ -221,8 +234,11 @@ def main() -> None:
         # Same fairseq position offset as MPNet; plain BERT encoder inside.
         manifest["model_type"] = "roberta"
         manifest["pad_token_id"] = config["pad_token_id"]
+    if sentencepiece_tok:
+        manifest["tokenizer"] = "sentencepiece"
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    vocab_files = "vocab.json merges.txt" if model_type == "roberta" else "vocab.txt"
+    vocab_files = ("sentencepiece.bpe.model" if sentencepiece_tok
+                   else "vocab.json merges.txt" if model_type == "roberta" else "vocab.txt")
     print(f"wrote {out}/[model.safetensors {vocab_files} manifest.json]")
 
     # --- golden reference (ONNX Runtime, per-text, no padding) -------------

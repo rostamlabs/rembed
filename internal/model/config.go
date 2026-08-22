@@ -28,6 +28,12 @@ type Config struct {
 	UnkToken              string  `json:"unk_token"`
 	Pooling               string  `json:"pooling"`   // "mean" or "cls"
 	Normalize             bool    `json:"normalize"` // L2-normalize the pooled vector
+	// Tokenizer overrides the architecture's default tokenizer family.
+	// "" = by model_type (bert/mpnet → WordPiece, roberta → byte-level
+	// BPE); "sentencepiece" = SentencePiece Unigram (the XLM-R tokenizer,
+	// which BERT-architecture multilingual models like multilingual-e5 and
+	// paraphrase-multilingual MiniLM use).
+	Tokenizer string `json:"tokenizer,omitempty"`
 
 	// MPNet only. Positions are offset by PadTokenID+1 (fairseq
 	// convention: position ids start at padding_idx+1), and every layer's
@@ -78,6 +84,11 @@ func validate(c *Config, source string) error {
 	}
 	if c.Pooling != "mean" && c.Pooling != "cls" {
 		return fmt.Errorf("%s: pooling %q unsupported (mean or cls)", source, c.Pooling)
+	}
+	switch c.Tokenizer {
+	case "", "sentencepiece":
+	default:
+		return fmt.Errorf("%s: tokenizer %q unsupported (\"\" or sentencepiece)", source, c.Tokenizer)
 	}
 	switch c.ModelType {
 	case "", "bert":

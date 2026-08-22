@@ -36,10 +36,11 @@ throughput-saturated servers.
 ## Supported models
 
 BERT-family, MPNet, and RoBERTa encoders in sentence-transformers
-format: mean or CLS pooling, WordPiece or byte-level BPE tokenization,
-absolute positions (plus MPNet's bucketed relative-position attention
-bias), exact GELU; F32/F16/BF16 safetensors. Validated end-to-end
-against each model's own ONNX Runtime reference:
+format: mean or CLS pooling; WordPiece, byte-level BPE, or SentencePiece
+Unigram tokenization (the XLM-R tokenizer — multilingual models work,
+50+ languages); absolute positions (plus MPNet's bucketed
+relative-position attention bias); exact GELU; F32/F16/BF16 safetensors.
+Validated end-to-end against each model's own ONNX Runtime reference:
 
 | model | pooling | dtype | fp32 vs ONNX | int8 |
 |-------|---------|-------|--------------|------|
@@ -49,6 +50,7 @@ against each model's own ONNX Runtime reference:
 | BAAI/bge-small-en-v1.5 | cls | F32 | < 1e-4 | in bounds |
 | sentence-transformers/all-mpnet-base-v2 | mean | F32 | 3.3e-7 | cosine ≥ 0.9978 |
 | sentence-transformers/all-distilroberta-v1 | mean | F32 | 3.2e-7 | cosine ≥ 0.9985 |
+| sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | mean | F32 | 7e-7 | cosine ≥ 0.9995 |
 | thenlper/gte-small | mean | F16 | 2e-3 maxAbs + cosine ≥ 0.9999 + meanAbs ≤ 2e-4 (the repo's ONNX export is fp32 while its safetensors are f16, so maxAbs is dominated by the checkpoint's own rounding; the cosine/mean bounds are what actually constrain rembed) | — |
 
 Expected compatible (same architecture, no ONNX export on the Hub to
@@ -57,8 +59,15 @@ BERT-based sentence-transformers checkpoints. Caveat for retrieval
 models: e5 requires "query: "/"passage: " prefixes and some models
 (e.g. arctic) declare prompt handling in their pooling config — rembed
 embeds exactly the text you pass and does not add prefixes; add them
-yourself or retrieval quality silently degrades. Not supported yet:
-XLM-R and other SentencePiece models (on the roadmap).
+yourself or retrieval quality silently degrades (multilingual-e5 is the
+main SentencePiece model in this category).
+
+One deliberate tokenizer divergence: on NFD (decomposed) Hangul/kana —
+routine output from macOS — HF's fast tokenizer skips ≥6-byte grapheme
+clusters during normalization and shreds Korean into jamo; rembed
+matches the sentencepiece C++ reference instead, which composes NFD
+back so decomposed and composed text embed identically. 65k-input
+fuzzing against the reference: zero mismatches.
 
 ## Dev: golden reference generation
 
