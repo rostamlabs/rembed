@@ -51,9 +51,11 @@ type Model struct {
 //
 // Buffers only grow: one max-length (512-token) input inflates a scratch to
 // ~25 MB (the per-head scores panel dominates), and sync.Pool retains up to
-// one scratch per P until GC drains it. That is a deliberate trade (reuse
-// over footprint) — revisit if rembed's host process cares about worst-case
-// resident memory.
+// one scratch PER P until GC drains it — worst case ~25 MB × GOMAXPROCS
+// (~500 MB on a 20-core box) after a burst of concurrent max-length embeds.
+// That is a deliberate trade (reuse over footprint); if it ever bites,
+// scores is the buffer to shrink (a worker-slot ParallelFor variant would
+// cut it from heads·seq² to min(heads, workers)·seq²).
 type scratch struct {
 	x, q, k, v      []float32 // [seq×H]
 	ctxOut, attnOut []float32 // [seq×H]
@@ -241,14 +243,22 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 		m.matmul(v, x, l.vW, seq, H, H)
 		tensor.AddBias(v, l.vB, seq, H)
 
-		// Scaled dot-product attention, heads fanned out in parallel.
-		// Repack every head first: qh/kh are [heads][seq×dh], vhT is
-		// [heads][dh×seq] so probs·V fits the single MatMul (bT) signature.
-		for h := range heads {
+		// Scaled dot-product attention, heads fanned out in parallel. The
+		// whole per-head pipeline — repack, matmuls, softmax, gather — runs
+		// inside the worker: repack-then-consume keeps the head's panels
+		// cache-hot, and no phase is left serial to bound the speedup.
+		// Race-free by construction: worker h reads q/k/v (written before
+		// the fan-out) and writes only its own slices of qh/kh/vhT/ch/scores
+		// plus the disjoint ctxOut columns [h·dh, (h+1)·dh) of each row.
+		tensor.ParallelFor(heads, func(h int) {
 			off := h * dh
-			qhH := qh[h*seq*dh:]
-			khH := kh[h*seq*dh:]
-			vhTH := vhT[h*dh*seq:]
+			qhH := qh[h*seq*dh : (h+1)*seq*dh]
+			khH := kh[h*seq*dh : (h+1)*seq*dh]
+			vhTH := vhT[h*dh*seq : (h+1)*dh*seq]
+			chH := ch[h*seq*dh : (h+1)*seq*dh]
+			sc := scores[h*seq*seq : (h+1)*seq*seq]
+			// Repack: qh/kh as [seq×dh] panels, vhT as Vᵀ [dh×seq] so that
+			// probs·V fits the single MatMul (bT) signature.
 			for i := range seq {
 				copy(qhH[i*dh:i*dh+dh], q[i*H+off:i*H+off+dh])
 				copy(khH[i*dh:i*dh+dh], k[i*H+off:i*H+off+dh])
@@ -256,13 +266,6 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 					vhTH[d*seq+i] = v[i*H+off+d]
 				}
 			}
-		}
-		tensor.ParallelFor(heads, func(h int) {
-			qhH := qh[h*seq*dh : (h+1)*seq*dh]
-			khH := kh[h*seq*dh : (h+1)*seq*dh]
-			vhTH := vhT[h*dh*seq : (h+1)*dh*seq]
-			chH := ch[h*seq*dh : (h+1)*seq*dh]
-			sc := scores[h*seq*seq : (h+1)*seq*seq]
 			// The heads ARE the parallelism here, so the serial kernel is
 			// deliberate: nesting MatMulParallel would oversubscribe the
 			// scheduler and make allocation counts depend on seq.
@@ -272,16 +275,13 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 				sc[i] *= scale
 			}
 			tensor.Softmax(sc, seq, seq)
-			// ch = probs·Vh, with Vhᵀ as the bT operand.
+			// ch = probs·Vh, with Vhᵀ as the bT operand; then gather into
+			// this head's ctxOut columns.
 			tensor.MatMulBlocked(chH, sc, vhTH, seq, seq, dh)
-		})
-		for h := range heads {
-			off := h * dh
-			chH := ch[h*seq*dh:]
 			for i := range seq {
 				copy(ctxOut[i*H+off:i*H+off+dh], chH[i*dh:i*dh+dh])
 			}
-		}
+		})
 
 		// Attention output projection + residual + LayerNorm.
 		m.matmul(attnOut, ctxOut, l.attnOutW, seq, H, H)

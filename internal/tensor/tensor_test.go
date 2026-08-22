@@ -55,6 +55,13 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 		{2 * blockM, 8, 4},    // exact tile boundaries
 		{2*blockM + 7, 33, 7}, // multiple full i-tiles PLUS both remainders
 		{3, 5, blockN - 1},    // n smaller than the micro-kernel
+		// Shapes that clear MatMulParallel's per-unit gate with awkward
+		// column remainders, so the parallel path's partial final column
+		// block is pinned (the model's own dims are all 64-aligned and
+		// would never catch it):
+		{blockM, 384, 129},
+		{blockM + 6, 400, 191},
+		{2, 384, 384}, // tiny m through the parallel path (per-unit gate)
 	}
 	rng := rand.New(rand.NewSource(42))
 	for _, sh := range shapes {
@@ -170,7 +177,9 @@ func TestAddBiasAndAdd(t *testing.T) {
 // pass: the FFN panel at a large seq, and the skinny seq=12 projection that
 // the e2e bench text produces.
 func benchMatMul(b *testing.B, kern MatMulFunc) {
-	for _, sh := range [][3]int{{128, 384, 1536}, {12, 384, 384}} {
+	// FFN panel at large seq, the seq=12 projection, and the short-query
+	// projections that defend the per-unit parallelization gate.
+	for _, sh := range [][3]int{{128, 384, 1536}, {12, 384, 384}, {3, 384, 384}, {1, 384, 384}} {
 		m, k, n := sh[0], sh[1], sh[2]
 		b.Run(fmt.Sprintf("%dx%dx%d", m, k, n), func(b *testing.B) {
 			a := make([]float32, m*k)
@@ -195,13 +204,35 @@ func BenchmarkMatMulBlocked(b *testing.B)  { benchMatMul(b, MatMulBlocked) }
 func BenchmarkMatMulParallel(b *testing.B) { benchMatMul(b, MatMulParallel) }
 
 func TestParallelForCoversEveryUnitOnce(t *testing.T) {
-	for _, units := range []int{0, 1, 2, 7, 64, 1000} {
-		hits := make([]atomic.Int32, units)
-		ParallelFor(units, func(u int) { hits[u].Add(1) })
-		for u := range hits {
-			if got := hits[u].Load(); got != 1 {
-				t.Fatalf("units=%d: unit %d executed %d times", units, u, got)
+	// Sweep GOMAXPROCS so the atomic-counter path is exercised even when
+	// the test host has few cores, including units < workers.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
+	for _, procs := range []int{1, 2, 4, 16} {
+		runtime.GOMAXPROCS(procs)
+		for _, units := range []int{0, 1, 2, 3, 7, 64, 1000} {
+			hits := make([]atomic.Int32, units)
+			ParallelFor(units, func(u int) { hits[u].Add(1) })
+			for u := range hits {
+				if got := hits[u].Load(); got != 1 {
+					t.Fatalf("procs=%d units=%d: unit %d executed %d times", procs, units, u, got)
+				}
 			}
 		}
 	}
+}
+
+func TestParallelForPropagatesPanic(t *testing.T) {
+	// A worker panic must surface on the calling goroutine (where the
+	// host's recover can handle it), not kill the process.
+	defer func() {
+		if r := recover(); r != "boom" {
+			t.Fatalf("recovered %v, want \"boom\"", r)
+		}
+	}()
+	ParallelFor(64, func(u int) {
+		if u == 13 {
+			panic("boom")
+		}
+	})
+	t.Fatal("ParallelFor returned instead of panicking")
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -119,14 +120,21 @@ func TestEmbedConcurrentMatchesSerial(t *testing.T) {
 		"Rostam is a vector database written in Go, with BM25 and semantic caching built in.",
 		strings.Repeat("a longer text to hit a different scratch size class ", 20),
 	}
+	// The reference is computed with GOMAXPROCS=1, which drives every
+	// ParallelFor (matmul tiles, heads, GELU rows) down its inline serial
+	// path — so this really is parallel-vs-serial bit-equality, not just
+	// reproducibility of the parallel path against itself.
+	runtime.GOMAXPROCS(1)
 	want := make([][]float32, len(texts))
 	for i, text := range texts {
 		v, err := emb.Embed(ctx, []string{text})
 		if err != nil {
+			runtime.GOMAXPROCS(runtime.NumCPU())
 			t.Fatal(err)
 		}
 		want[i] = v[0]
 	}
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	var wg sync.WaitGroup
 	errs := make(chan error, 64)
 	for w := range 8 {
@@ -168,6 +176,10 @@ func TestEmbedSteadyStateAllocs(t *testing.T) {
 	}
 	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 
+	// Three size classes: a tiny query (seq≈3 — the class the original
+	// total-work parallelization gate left serial, which made alloc counts
+	// regime-dependent), a typical sentence, and a near-max input.
+	tiny := emb.Tokenize("hi")
 	short := emb.Tokenize("The quick brown fox jumps over the lazy dog.")
 	long := emb.Tokenize(strings.Repeat("embedding inference engines should be boring and fast ", 60))
 	if len(long) < 400 {
@@ -185,14 +197,16 @@ func TestEmbedSteadyStateAllocs(t *testing.T) {
 			}
 		})
 	}
-	// Warm the long size first so the short runs reuse grown buffers too.
+	// Warm the long size first so the smaller runs reuse grown buffers too.
 	// The absolute bound covers the M2 fan-out's fixed goroutine/closure
-	// allocations (measured 49); equality across seq is the invariant that
-	// catches a regression to per-call buffer allocation.
+	// allocations; equality across ALL size classes is the invariant that
+	// catches both a regression to per-call buffer allocation and a
+	// parallelization gate that silently changes regime with seq.
 	aLong := forwardAllocs(long)
 	aShort := forwardAllocs(short)
-	if aShort != aLong || aShort > 64 {
-		t.Fatalf("Forward allocs must be small and independent of seq: short=%v long=%v (want equal, <= 64)", aShort, aLong)
+	aTiny := forwardAllocs(tiny)
+	if aTiny != aShort || aShort != aLong || aShort > 64 {
+		t.Fatalf("Forward allocs must be small and independent of seq: tiny=%v short=%v long=%v (want all equal, <= 64)", aTiny, aShort, aLong)
 	}
 
 	// End-to-end sanity: tokenizer allocations scale with token count, so

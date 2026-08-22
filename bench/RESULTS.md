@@ -103,5 +103,33 @@ median is soft. The pinned-cloud-box rule from DESIGN.md starts mattering
 here, one rung before M3 was expected to need it.
 
 Steady-state allocations grew from 29 to a fixed ~49 per forward pass (the
-fan-out's goroutine/closure overhead) — still constant across sequence
-lengths, which the alloc test continues to enforce.
+fan-out's goroutine/closure overhead).
+
+### M2 review fixes (same day)
+
+The review caught the original `minParallelWork = 1<<20` total-work gate
+leaving every short-sequence projection serial — seq=3 e2e sped up only
+1.20× over single-core while the same shapes parallelize ~2.4–2.9×. It also
+disproved the "allocations are seq-independent" claim as then written: the
+gate made alloc counts regime-dependent (31 at seq=3 vs 77 at seq=12), and
+the test's two size classes sat on the same side of the threshold, so it
+couldn't see the violation. Both fixed:
+
+- Per-UNIT work gate (1<<14 MACs) + 2-D (row×column) output partitioning.
+  Measured after: 3×384·384×384 135 µs → 57 µs (2.4×), 1×384·384×384
+  43 µs → 30 µs, seq=3 e2e 8.7 ms → **4.4 ms**; seq=12 unchanged (~17 ms).
+  The 2-D grid also lifts the 6-unit cap on projection shapes and lets
+  n < 128 matmuls parallelize by rows.
+- Alloc equality now asserted across THREE size classes (seq 3/12/~480) and
+  genuinely holds — the gate no longer changes regime with seq.
+- Repack/gather moved inside the head workers (no serial Amdahl bracket;
+  pack-then-consume stays cache-hot); ParallelFor propagates worker panics
+  to the caller (a library must not kill its host process), spawns
+  min(GOMAXPROCS, units), and its unit-coverage test sweeps GOMAXPROCS.
+
+Caveat carried from the review, unfixed by design this rung: concurrent
+Embed callers each spawn their own fan-out — aggregate throughput saturates
+around 4 in-flight requests (~190 embeds/s on 20 cores) and higher
+concurrency mostly buys tail latency. The 9.6× figure is single-request
+latency. A worker-cap option on Load is the natural M3+ knob if a server
+workload needs it.

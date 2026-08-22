@@ -113,32 +113,34 @@ func matMulBlockedCols(dst, a, bT []float32, m, k, n, jLo, jHi int) {
 	}
 }
 
-// ParallelFor runs fn(u) for every u in [0, units), fanned out over exactly
-// GOMAXPROCS goroutines pulling unit indexes from an atomic counter. The
-// worker count is deliberately NOT scaled to units: a fixed fan-out keeps
-// the per-call allocation count constant (the alloc-regression test relies
-// on allocations being independent of sequence length) and the atomic
-// counter load-balances uneven units for free. units <= 1 runs inline.
+// ParallelFor runs fn(u) for every u in [0, units), fanned out over
+// min(GOMAXPROCS, units) goroutines pulling unit indexes from an atomic
+// counter. The fan-out is bounded by GOMAXPROCS so nested or concurrent
+// calls cannot explode the goroutine count, and the counter load-balances
+// uneven units for free. units <= 1 (or a single-core box) runs inline.
+// A panic in fn is captured and re-raised on the calling goroutine after
+// all workers finish — a library must not let a worker panic kill the host
+// process when the caller's recover() could have handled it.
 func ParallelFor(units int, fn func(u int)) {
-	if units <= 1 {
+	workers := min(runtime.GOMAXPROCS(0), units)
+	if workers <= 1 {
 		for u := range units {
 			fn(u)
 		}
 		return
 	}
-	workers := runtime.GOMAXPROCS(0)
-	if workers == 1 {
-		for u := range units {
-			fn(u)
-		}
-		return
-	}
+	var panicked atomic.Pointer[any]
 	var next atomic.Int64
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for range workers {
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicked.CompareAndSwap(nil, &r)
+				}
+			}()
 			for {
 				u := int(next.Add(1)) - 1
 				if u >= units {
@@ -149,35 +151,49 @@ func ParallelFor(units int, fn func(u int)) {
 		}()
 	}
 	wg.Wait()
+	if p := panicked.Load(); p != nil {
+		panic(*p)
+	}
 }
 
-// parallelCols is the column-block width MatMulParallel hands each unit:
-// blockN-aligned, and — with k ≥ 384 in every model matmul — comfortably
-// more work (~100 µs) than the per-unit overhead.
+// parallelCols is the column-block width of one parallel unit
+// (blockN-aligned); rows partition by blockM, giving a 2-D unit grid.
 const parallelCols = 64
 
-// minParallelWork is the matmul size (m·k·n multiply-adds) below which
-// spawning workers costs more than it saves; smaller calls run inline.
-const minParallelWork = 1 << 20
+// minUnitWork is the per-unit size (multiply-adds) below which a unit is
+// not worth a worker's while: 1<<14 ≈ 5 µs of scalar work, comfortably
+// above spawn/counter overhead. The gate is per-UNIT, not total work — a
+// 1×384·384×384 projection is only ~1.8 M MACs total but its 6 units are
+// each worth parallelizing (the original total-work gate of 1<<20 left
+// every short-sequence projection serial, costing seq<8 inputs most of the
+// rung's benefit).
+const minUnitWork = 1 << 14
 
-// MatMulParallel is the M2 body: MatMulBlocked with the output columns
-// partitioned into 64-wide blocks executed via ParallelFor. Workers own
-// disjoint column ranges (disjoint dst writes, no synchronization beyond
-// the final wait), and each element's k-accumulation is untouched, so the
-// result is bit-identical to MatMulBlocked.
+// MatMulParallel is the M2 body: MatMulBlocked with the output partitioned
+// into blockM×parallelCols tiles executed via ParallelFor. Workers own
+// disjoint output tiles (no synchronization beyond the final wait), and
+// each element's k-accumulation is untouched, so the result is
+// bit-identical to MatMulBlocked.
 func MatMulParallel(dst, a, bT []float32, m, k, n int) {
 	if m*n > 0 {
 		_ = dst[m*n-1] // same fail-fast as MatMulBlocked
 	}
-	if m*k*n < minParallelWork || n < 2*parallelCols {
+	rowTiles := (m + blockM - 1) / blockM
+	colBlocks := (n + parallelCols - 1) / parallelCols
+	units := rowTiles * colBlocks
+	perUnit := min(m, blockM) * k * min(n, parallelCols)
+	if units < 2 || perUnit < minUnitWork {
 		matMulBlockedCols(dst, a, bT, m, k, n, 0, n)
 		return
 	}
-	units := (n + parallelCols - 1) / parallelCols
 	ParallelFor(units, func(u int) {
-		jLo := u * parallelCols
+		i0 := (u / colBlocks) * blockM
+		i1 := min(i0+blockM, m)
+		jLo := (u % colBlocks) * parallelCols
 		jHi := min(jLo+parallelCols, n)
-		matMulBlockedCols(dst, a, bT, m, k, n, jLo, jHi)
+		// A row block is contiguous in dst and a, so the row range is just
+		// a sub-slice; the kernel's own i-tiling sees a single tile.
+		matMulBlockedCols(dst[i0*n:i1*n], a[i0*k:i1*k], bT, i1-i0, k, n, jLo, jHi)
 	})
 }
 
