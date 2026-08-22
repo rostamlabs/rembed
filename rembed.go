@@ -21,7 +21,16 @@ import (
 	"github.com/rostamlabs/rembed/internal/model"
 	"github.com/rostamlabs/rembed/internal/tensor"
 	"github.com/rostamlabs/rembed/tokenizer"
+	"github.com/rostamlabs/rembed/tokenizer/bpe"
 )
+
+// textTokenizer is what an Embedder needs from a tokenizer; the WordPiece
+// (BERT/MPNet) and byte-level BPE (RoBERTa) implementations both satisfy
+// it, and Load picks by the model's architecture.
+type textTokenizer interface {
+	Encode(text string, maxLen int) (ids, mask []int64)
+	VocabSize() int
+}
 
 // Embedder turns texts into fixed-size embedding vectors. It is safe for
 // concurrent use. Latency is the default optimization target: each Embed
@@ -30,7 +39,7 @@ import (
 // WithWorkers to cap that for throughput-saturated servers.
 type Embedder struct {
 	cfg model.Config
-	tok *tokenizer.Tokenizer
+	tok textTokenizer
 	m   *model.Model
 }
 
@@ -122,14 +131,20 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
-	tok, err := tokenizer.New(filepath.Join(modelDir, "vocab.txt"), cfg.DoLowerCase, cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
+	var tok textTokenizer
+	if cfg.ModelType == "roberta" {
+		tok, err = bpe.New(filepath.Join(modelDir, "vocab.json"), filepath.Join(modelDir, "merges.txt"),
+			cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
+	} else {
+		tok, err = tokenizer.New(filepath.Join(modelDir, "vocab.txt"), cfg.DoLowerCase, cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
 	if tok.VocabSize() != cfg.VocabSize {
-		// A vocab.txt and model.safetensors from different models would
+		// A vocab and model.safetensors from different models would
 		// otherwise produce silently wrong (or per-call failing) embeddings.
-		return nil, fmt.Errorf("rembed: vocab.txt has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
+		return nil, fmt.Errorf("rembed: vocab has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 	}
 	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, o.int8, o.workers)
 	if err != nil {

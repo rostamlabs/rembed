@@ -48,11 +48,17 @@ across layers) on top of absolute embeddings, RoBERTa-style position
 offsets, MPNet special tokens (the tokenizer already supports custom
 framing tokens). Golden via the repo's ONNX export.
 
-## R5 — RoBERTa family + byte-level BPE tokenizer
-Unlocks RoBERTa-based ST models. The architecture is near-BERT (learned
-absolute positions offset by padding_idx+1, single token type); the work
-is a pure-Go byte-level BPE tokenizer (GPT-2 style: byte encoder +
-merges ranking) validated token-for-token against HF.
+## R5 — RoBERTa family + byte-level BPE tokenizer ✅
+Done: pure-Go byte-level BPE (tokenizer/bpe — GPT-2 byte table, a
+hand-written scanner reproducing the pre-tokenization pattern's
+lookahead, ranked merges), validated token-for-token against HF's
+RobertaTokenizer over a 27-case fixture hitting every pre-tokenizer
+branch, plus the 12-case golden's input_ids. The encoder is BERT
+untouched — only the fairseq position offset (pad+1, shared with the
+MPNet plumbing) differs. all-distilroberta-v1 vs its ONNX export:
+fp32 maxAbs 3.2e-7 cosine 1.0; int8 cosine ≥ 0.9985 (measured worst
+0.998727, test-enforced). The hub loader now selects tokenizer files by
+model_type (vocab.json+merges.txt vs vocab.txt).
 
 ## R6 — XLM-R + SentencePiece unigram (multilingual-e5)
 The multilingual unlock. Needs a pure-Go SentencePiece unigram tokenizer

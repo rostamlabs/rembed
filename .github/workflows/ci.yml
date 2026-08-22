@@ -64,6 +64,9 @@ jobs:
         # per-commit net (they cover every arm64 assembly kernel).
         run: |
           mkdir -p /tmp/arm64
+          # tokenizer/bpe is absent on purpose: it has no assembly, and its
+          # fixture tests need vocab files this job does not fetch — the
+          # golden job runs them against the hub cache instead.
           for pkg in ./internal/tensor ./internal/model ./internal/safetensors ./tokenizer; do
             GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/arm64/$(basename $pkg).test $pkg
           done
@@ -86,16 +89,22 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/rembed
-          key: rembed-models-v2
+          key: rembed-models-v3
       - name: fetch models via the hub loader
         run: |
           go run ./cmd/rembed embed -model sentence-transformers/all-MiniLM-L6-v2 "warm" > /dev/null
           go run ./cmd/rembed embed -model BAAI/bge-small-en-v1.5 "warm" > /dev/null
           go run ./cmd/rembed embed -model sentence-transformers/all-mpnet-base-v2 "warm" > /dev/null
+          go run ./cmd/rembed embed -model sentence-transformers/all-distilroberta-v1 "warm" > /dev/null
       - name: golden suite (fp32, int8, cls, allocs, concurrency)
         run: |
           export REMBED_MODEL_DIR=~/.cache/rembed/sentence-transformers--all-MiniLM-L6-v2
           export REMBED_MODEL_BGE=~/.cache/rembed/BAAI--bge-small-en-v1.5
           export REMBED_MODEL_MPNET=~/.cache/rembed/sentence-transformers--all-mpnet-base-v2
+          export REMBED_MODEL_ROBERTA=~/.cache/rembed/sentence-transformers--all-distilroberta-v1
           go test -v -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" . 2>&1 | tail -30
           go test -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" .
+          # The BPE fixture needs real vocab/merges files; the hub cache
+          # fetched above has them, so the token-for-token HF fixture runs
+          # here rather than silently skipping suite-wide.
+          go test -v ./tokenizer/bpe

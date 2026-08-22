@@ -148,16 +148,22 @@ def main() -> None:
     st = fetch("model.safetensors")
     sanity_check_safetensors(st)
     shutil.copyfile(st, out / "model.safetensors")
-    shutil.copyfile(fetch("vocab.txt"), out / "vocab.txt")
 
     config = json.loads(fetch("config.json").read_text())
+    # Byte-level BPE models (RoBERTa) ship vocab.json + merges.txt;
+    # WordPiece models (BERT, MPNet) ship vocab.txt.
+    if config.get("model_type") == "roberta":
+        shutil.copyfile(fetch("vocab.json"), out / "vocab.json")
+        shutil.copyfile(fetch("merges.txt"), out / "merges.txt")
+    else:
+        shutil.copyfile(fetch("vocab.txt"), out / "vocab.txt")
     tok_config = json.loads(fetch("tokenizer_config.json").read_text())
     pooling = json.loads(fetch("1_Pooling/config.json").read_text())
     modules = json.loads(fetch("modules.json").read_text())
 
     model_type = config.get("model_type")
-    if model_type not in ("bert", "mpnet"):
-        raise SystemExit(f"model_type={model_type!r}: only bert and mpnet models are supported")
+    if model_type not in ("bert", "roberta", "mpnet"):
+        raise SystemExit(f"model_type={model_type!r}: only bert, roberta, and mpnet models are supported")
     if model_type == "mpnet":
         # HF's MPNet code hardcodes num_buckets=32 and padding_idx=1
         # regardless of config; the Go loader refuses anything else, so
@@ -198,10 +204,10 @@ def main() -> None:
         "vocab_size": config["vocab_size"],
         "max_position_embeddings": config["max_position_embeddings"],
         "layer_norm_eps": config.get("layer_norm_eps", 1e-12),
-        "do_lower_case": bool(tok_config.get("do_lower_case", True)),
+        "do_lower_case": bool(tok_config.get("do_lower_case", False)) if model_type == "roberta" else bool(tok_config.get("do_lower_case", True)),
         "cls_token": tok_config.get("cls_token", "[CLS]"),
         "sep_token": tok_config.get("sep_token", "[SEP]"),
-        "unk_token": tok_config.get("unk_token", "[UNK]"),
+        "unk_token": tok_config.get("unk_token", "<unk>" if model_type == "roberta" else "[UNK]"),
         "pooling": pool_mode,
         "normalize": normalize,
     }
@@ -211,8 +217,13 @@ def main() -> None:
         manifest["model_type"] = "mpnet"
         manifest["relative_attention_num_buckets"] = config["relative_attention_num_buckets"]
         manifest["pad_token_id"] = config.get("pad_token_id", 1)
+    elif model_type == "roberta":
+        # Same fairseq position offset as MPNet; plain BERT encoder inside.
+        manifest["model_type"] = "roberta"
+        manifest["pad_token_id"] = config["pad_token_id"]
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"wrote {out}/[model.safetensors vocab.txt manifest.json]")
+    vocab_files = "vocab.json merges.txt" if model_type == "roberta" else "vocab.txt"
+    print(f"wrote {out}/[model.safetensors {vocab_files} manifest.json]")
 
     # --- golden reference (ONNX Runtime, per-text, no padding) -------------
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
@@ -220,7 +231,7 @@ def main() -> None:
     input_names = {i.name for i in sess.get_inputs()}
 
     max_len = manifest["max_position_embeddings"]
-    if model_type == "mpnet":
+    if model_type in ("mpnet", "roberta"):
         max_len -= config.get("pad_token_id", 1) + 1
 
     golden = []
