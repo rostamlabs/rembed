@@ -346,6 +346,12 @@ func TestGoldenMatrix(t *testing.T) {
 		// margin — the review caught the docs claiming an optimistic
 		// 0.9989 measured on 2 texts.
 		{"testdata/golden-all-mpnet-base-v2.json", "models/all-mpnet-base-v2", "REMBED_MODEL_MPNET", 1e-4, 0, 1e-5, 0.9978},
+		// RoBERTa exercises the byte-level BPE tokenizer end to end (the
+		// tokenizer-mismatch check above bites hardest here) plus the
+		// fairseq position offset on the plain BERT encoder path. int8
+		// bound is the measured worst case (0.998727, the 326-token text)
+		// less margin.
+		{"testdata/golden-all-distilroberta-v1.json", "models/all-distilroberta-v1", "REMBED_MODEL_ROBERTA", 1e-4, 0, 1e-5, 0.9985},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {

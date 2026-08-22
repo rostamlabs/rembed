@@ -37,10 +37,11 @@ type Config struct {
 }
 
 // PositionOffset is the value added to a token's index to form its
-// position-embedding row: 0 for BERT, PadTokenID+1 for MPNet (rows 0 and 1
-// of its position table are the padding slots and are never used).
+// position-embedding row: 0 for BERT; PadTokenID+1 for MPNet and RoBERTa
+// (the fairseq convention both inherit — the first PadTokenID+1 rows of
+// their position tables are padding slots and are never used).
 func (c *Config) PositionOffset() int {
-	if c.ModelType == "mpnet" {
+	if c.ModelType == "mpnet" || c.ModelType == "roberta" {
 		return c.PadTokenID + 1
 	}
 	return 0
@@ -80,6 +81,13 @@ func validate(c *Config, source string) error {
 	}
 	switch c.ModelType {
 	case "", "bert":
+	case "roberta":
+		// Unlike MPNet, HF's RoBERTa reads padding_idx from config, so
+		// any non-negative pad is honored; the offset must leave usable
+		// positions.
+		if c.PadTokenID < 0 || c.MaxSeqLen() <= 0 {
+			return fmt.Errorf("%s: pad_token_id %d leaves no usable positions (max_position_embeddings %d)", source, c.PadTokenID, c.MaxPositionEmbeddings)
+		}
 	case "mpnet":
 		// HF's MPNet implementation HARDCODES both values in code:
 		// compute_position_bias buckets with its default num_buckets=32
@@ -94,7 +102,7 @@ func validate(c *Config, source string) error {
 			return fmt.Errorf("%s: pad_token_id=%d — HF's MPNet embeddings hardcode padding_idx=1 regardless of config, so rembed only accepts 1", source, c.PadTokenID)
 		}
 	default:
-		return fmt.Errorf("%s: model_type %q unsupported (bert or mpnet)", source, c.ModelType)
+		return fmt.Errorf("%s: model_type %q unsupported (bert, roberta, or mpnet)", source, c.ModelType)
 	}
 	if c.LayerNormEps == 0 {
 		c.LayerNormEps = 1e-12

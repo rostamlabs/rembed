@@ -197,11 +197,14 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 		return nil, err
 	}
 	prefix := ""
-	for _, p := range []string{"bert.", "mpnet."} {
+	for _, p := range []string{"bert.", "roberta.", "mpnet."} {
 		if _, ok := tensors[p+"embeddings.word_embeddings.weight"]; ok {
 			prefix = p
 		}
 	}
+	// RoBERTa loads through the BERT branch untouched: identical tensor
+	// names, a [1×H] token_type table (row 0, the only one, is used), and
+	// the position offset already comes from cfg.PositionOffset().
 	mpnet := cfg.ModelType == "mpnet"
 	get := func(name string, wantShape ...int) ([]float32, error) {
 		t, ok := tensors[prefix+name]

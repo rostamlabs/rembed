@@ -53,6 +53,12 @@ func DeriveConfig(dir, name string) (Config, error) {
 	// convert.py's export-time guards).
 	switch hf.ModelType {
 	case "bert":
+	case "roberta":
+		if hf.PadTokenID == nil {
+			// RoBERTa's position rows are offset by pad_token_id+1;
+			// guessing it wrong shifts every position embedding.
+			return c, fmt.Errorf("model dir %s: roberta config.json lacks pad_token_id", dir)
+		}
 	case "mpnet":
 		if hf.RelAttnNumBuckets <= 0 {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks relative_attention_num_buckets", dir)
@@ -64,7 +70,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
 		}
 	default:
-		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert and mpnet encoders", dir, hf.ModelType)
+		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, roberta, and mpnet encoders", dir, hf.ModelType)
 	}
 	if hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
 		return c, fmt.Errorf("model dir %s: hidden_act=%q — only exact GELU is supported", dir, hf.HiddenAct)
@@ -92,11 +98,21 @@ func DeriveConfig(dir, name string) (Config, error) {
 		return c, fmt.Errorf("model dir %s: %w", dir, err)
 	}
 
-	// The tokenizer couples lowercasing to accent stripping, so guessing
-	// this wrong yields plausible-but-wrong embeddings. Every surveyed
-	// BERT/ST repo sets the field explicitly; refuse rather than guess.
-	if tok.DoLowerCase == nil {
-		return c, fmt.Errorf("model dir %s: tokenizer_config.json does not set do_lower_case — set it there or provide a manifest.json", dir)
+	// The WordPiece tokenizer couples lowercasing to accent stripping, so
+	// guessing this wrong yields plausible-but-wrong embeddings. Every
+	// surveyed BERT/ST repo sets the field explicitly; refuse rather than
+	// guess. RoBERTa's byte-level BPE never lowercases and its configs do
+	// not carry the field at all.
+	doLower := false
+	if hf.ModelType == "roberta" {
+		if tok.DoLowerCase != nil && *tok.DoLowerCase {
+			return c, fmt.Errorf("model dir %s: do_lower_case=true on a roberta model — byte-level BPE is case-preserving", dir)
+		}
+	} else {
+		if tok.DoLowerCase == nil {
+			return c, fmt.Errorf("model dir %s: tokenizer_config.json does not set do_lower_case — set it there or provide a manifest.json", dir)
+		}
+		doLower = *tok.DoLowerCase
 	}
 
 	// modules.json is required: silently assuming "no Normalize module"
@@ -126,7 +142,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 		IntermediateSize:      hf.IntermediateSize,
 		VocabSize:             hf.VocabSize,
 		MaxPositionEmbeddings: hf.MaxPositionEmbeddings,
-		DoLowerCase:           *tok.DoLowerCase,
+		DoLowerCase:           doLower,
 		ClsToken:              tok.ClsToken,
 		SepToken:              tok.SepToken,
 		UnkToken:              tok.UnkToken,
@@ -136,8 +152,11 @@ func DeriveConfig(dir, name string) (Config, error) {
 	if hf.LayerNormEps != nil {
 		c.LayerNormEps = *hf.LayerNormEps
 	}
-	if hf.ModelType == "mpnet" {
+	switch hf.ModelType {
+	case "mpnet":
 		c.RelativeAttentionNumBuckets = hf.RelAttnNumBuckets
+		c.PadTokenID = *hf.PadTokenID
+	case "roberta":
 		c.PadTokenID = *hf.PadTokenID
 	}
 	return c, validate(&c, dir)

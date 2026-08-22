@@ -319,3 +319,26 @@ verified to pick identical buckets for every |distance| ≤ 1000
 No benchmark entry: the forward pass is the same kernel ladder; MPNet
 just runs 12 layers × 768 hidden instead of MiniLM's 6 × 384. R8 (pinned
 cloud box) remains where cross-model magnitude claims get made.
+
+## R5 — RoBERTa + byte-level BPE (2026-08-22)
+
+Coverage rung. The encoder needed nothing: RoBERTa is BERT with the
+fairseq position offset (pad_token_id+1) that R4 already plumbed, plus a
+[1×H] segment table the loader already accepted. The work was the
+tokenizer: a pure-Go byte-level BPE (GPT-2 family) — the byte-to-unicode
+table, a hand-written pre-tokenization scanner that reproduces the GPT-2
+pattern's \s+(?!\S) lookahead (Go's regexp has none; the whitespace-run
+backtracking and the only-a-literal-space-joins rule are the subtle
+parts), and the ranked-merge loop.
+
+Validation: token-for-token against HF's RobertaTokenizer over a
+27-case fixture that hits every pre-tokenizer branch (contractions and
+their case-sensitivity, space joining, whitespace backtracking, tabs and
+newlines, unicode letter/number classes including No/Nl, multi-byte
+UTF-8, emoji) — passed on the first run — plus the golden's own
+input_ids assertions. all-distilroberta-v1 against its repo's ONNX
+export over the 12-case golden (326-token long case included): fp32
+maxAbs 3.2e-7, cosine 1.0. int8: cosine ≥ 0.9985 (measured worst
+0.998727 on the long case), enforced in the golden matrix.
+
+No benchmark entry: same kernels, one fewer encoder layer than MPNet.

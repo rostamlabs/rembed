@@ -11,6 +11,7 @@ package hub
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,17 +22,28 @@ import (
 	"time"
 )
 
-// required are the files a sentence-transformers-format repo must provide.
-// modules.json is required deliberately: silently assuming "no Normalize
-// module" for a repo that actually has one would shift every downstream
-// cosine threshold, and every genuine ST repo ships the file.
+// required are the files every sentence-transformers-format repo must
+// provide, regardless of architecture. modules.json is required
+// deliberately: silently assuming "no Normalize module" for a repo that
+// actually has one would shift every downstream cosine threshold, and
+// every genuine ST repo ships the file. config.json comes first: the
+// tokenizer files to fetch depend on its model_type.
 var required = []string{
-	"model.safetensors",
-	"vocab.txt",
 	"config.json",
 	"tokenizer_config.json",
 	"1_Pooling/config.json",
 	"modules.json",
+	"model.safetensors",
+}
+
+// tokenizerFiles returns the tokenizer artifacts for a model_type:
+// byte-level BPE models (RoBERTa family) ship vocab.json + merges.txt;
+// WordPiece models (BERT, MPNet) ship vocab.txt.
+func tokenizerFiles(modelType string) []string {
+	if modelType == "roberta" || modelType == "xlm-roberta" {
+		return []string{"vocab.json", "merges.txt"}
+	}
+	return []string{"vocab.txt"}
 }
 
 var idRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$`)
@@ -67,12 +79,32 @@ func Ensure(modelID, cacheDir string) (string, error) {
 		return "", err
 	}
 	sweepStaleTemps(dir)
+	cleanup := func() {
+		// A failed first fetch should not litter the cache with empty
+		// org--name directories (os.Remove refuses non-empty ones).
+		_ = os.Remove(filepath.Join(dir, "1_Pooling"))
+		_ = os.Remove(dir)
+	}
 	for _, f := range required {
 		if err := fetch(modelID, f, dir); err != nil {
-			// A failed first fetch should not litter the cache with empty
-			// org--name directories (os.Remove refuses non-empty ones).
-			_ = os.Remove(filepath.Join(dir, "1_Pooling"))
-			_ = os.Remove(dir)
+			cleanup()
+			return "", err
+		}
+	}
+	var hf struct {
+		ModelType string `json:"model_type"`
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err == nil {
+		err = json.Unmarshal(raw, &hf)
+	}
+	if err != nil {
+		cleanup()
+		return "", fmt.Errorf("hub: %s: config.json: %w", modelID, err)
+	}
+	for _, f := range tokenizerFiles(hf.ModelType) {
+		if err := fetch(modelID, f, dir); err != nil {
+			cleanup()
 			return "", err
 		}
 	}
