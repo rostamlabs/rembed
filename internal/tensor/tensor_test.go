@@ -261,6 +261,32 @@ func TestParallelForCoversEveryUnitOnce(t *testing.T) {
 	}
 }
 
+// TestDefaultCappedMatchesDefault: capping the fan-out must change
+// scheduling only, never results — capped kernels share the serial bodies.
+func TestDefaultCappedMatchesDefault(t *testing.T) {
+	rng := rand.New(rand.NewSource(99))
+	const m, k, n = 37, 129, 192
+	a := make([]float32, m*k)
+	bT := make([]float32, n*k)
+	for i := range a {
+		a[i] = rng.Float32()*2 - 1
+	}
+	for i := range bT {
+		bT[i] = rng.Float32()*2 - 1
+	}
+	want := make([]float32, m*n)
+	Default()(want, a, bT, m, k, n)
+	for _, workers := range []int{1, 2, 5} {
+		got := make([]float32, m*n)
+		DefaultCapped(workers)(got, a, bT, m, k, n)
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("workers=%d: [%d]=%v differs from uncapped %v", workers, i, got[i], want[i])
+			}
+		}
+	}
+}
+
 func TestParallelForPropagatesPanic(t *testing.T) {
 	// A worker panic must surface on the calling goroutine (where the
 	// host's recover can handle it), not kill the process.

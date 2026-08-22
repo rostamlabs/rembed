@@ -10,9 +10,15 @@ vecs, err := emb.Embed(ctx, []string{"hello world"})
 // vecs[0] is a []float32 of emb.Dim() (384 for MiniLM-L6-v2)
 ```
 
-Status: pre-v1. See [DESIGN.md](DESIGN.md) for the architecture and the
-optimization ladder (M0 correctness → M1 cache-blocked → M2 parallel →
-M3 SIMD → M4 int8).
+Status: the optimization ladder is complete — naive baseline to
+**statistical parity with (and, with int8, consistently ahead of) ONNX
+Runtime** on the reference laptop: ~45× → 0.89× across six rungs, every
+step measured against a golden ONNX reference within 1e-4 (int8: cosine
+≥ 0.999). See [DESIGN.md](DESIGN.md) for the architecture and
+[bench/RESULTS.md](bench/RESULTS.md) for the full measured ladder,
+including the failed experiments. Weight-only int8 is opt-in via
+`rembed.WithInt8()`; `rembed.WithWorkers(n)` caps per-call CPU for
+throughput-saturated servers.
 
 ## Getting a model
 

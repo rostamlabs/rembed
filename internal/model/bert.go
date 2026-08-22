@@ -181,7 +181,7 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 	if cfg.NumAttentionHeads <= 0 || H%cfg.NumAttentionHeads != 0 {
 		return nil, fmt.Errorf("weights %s: hidden_size %d not divisible by num_attention_heads %d", weightsPath, H, cfg.NumAttentionHeads)
 	}
-	m := &Model{cfg: cfg, matmul: tensor.Default(), workers: workers}
+	m := &Model{cfg: cfg, matmul: tensor.DefaultCapped(workers), workers: workers}
 	m.scratchPool.New = func() any { return new(scratch) }
 
 	type load struct {

@@ -54,10 +54,9 @@ func WithInt8() Option {
 // low concurrency). A server saturating many concurrent Embed calls should
 // set a small cap; WithWorkers(1) is fully serial with zero spinning.
 //
-// The cap governs the packed SIMD path (every matmul on amd64+AVX2) and
-// the attention/GELU fan-outs. The unpacked fallback matmul (non-amd64, or
-// weight shapes the packer rejects) currently parallelizes via an uncapped
-// ParallelFor and may exceed the cap there.
+// The cap governs every fan-out: the packed SIMD path, the attention and
+// GELU phases, and the unpacked fallback matmul (non-amd64, or weight
+// shapes the packer rejects).
 func WithWorkers(n int) Option {
 	return func(o *loadOptions) { o.workers = n }
 }
