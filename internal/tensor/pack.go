@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package tensor
+
+import "fmt"
+
+// PackedB is a weight matrix pre-packed ONCE (at model load) into the
+// panel layout the gemm4x16 micro-kernel streams: 16-column panels, k-major
+// within each panel (data[jp*K*16 + p*16 + c] = bT[(jp*16+c)*K + p]).
+// Weights are static for the life of a model, so rembed pays the packing
+// cost once where a runtime pays it per session or per call — this is the
+// structural advantage the packed path exists to exploit.
+type PackedB struct {
+	K, N int
+	data []float32
+}
+
+// PackB packs a bT ([n×k] row-major) weight matrix. It requires the SIMD
+// kernel (the packed layout exists only for gemm4x16) and n a multiple of
+// 16 (true for every BERT-family dimension: hidden, 3·hidden,
+// intermediate); callers keep the unpacked path for anything else.
+func PackB(bT []float32, k, n int) (*PackedB, error) {
+	if !hasSIMD {
+		return nil, fmt.Errorf("tensor: PackB requires AVX2+FMA (packed layout feeds the SIMD kernel only)")
+	}
+	if n%16 != 0 {
+		return nil, fmt.Errorf("tensor: PackB needs n%%16==0, got n=%d", n)
+	}
+	if k < 1 {
+		return nil, fmt.Errorf("tensor: PackB needs k>=1, got k=%d", k)
+	}
+	if len(bT) != k*n {
+		return nil, fmt.Errorf("tensor: PackB bT has %d floats, want %d", len(bT), k*n)
+	}
+	p := &PackedB{K: k, N: n, data: make([]float32, k*n)}
+	for jp := range n / 16 {
+		panel := p.data[jp*k*16:]
+		for c := range 16 {
+			col := bT[(jp*16+c)*k:]
+			for pp := range k {
+				panel[pp*16+c] = col[pp]
+			}
+		}
+	}
+	return p, nil
+}
+
+// PackAPad returns the padded row count MatMulPacked uses for m rows.
+func PackAPad(m int) int { return (m + 3) &^ 3 }
+
+// packA4 packs a ([m×k] row-major) into 4-row k-major panels
+// (dst[ip*k*4 + p*4 + r]), zero-filling pad rows so the kernel's extra
+// output rows are deterministic zeros.
+func packA4(dst, a []float32, m, k int) {
+	mPad := PackAPad(m)
+	for ip := range mPad / 4 {
+		panel := dst[ip*k*4 : ip*k*4+k*4]
+		for r := range 4 {
+			i := ip*4 + r
+			if i >= m {
+				for p := range k {
+					panel[p*4+r] = 0
+				}
+				continue
+			}
+			row := a[i*k : i*k+k]
+			for p, v := range row {
+				panel[p*4+r] = v
+			}
+		}
+	}
+}
+
+// MatMulPacked computes dst[m×N] = a[m×K] · Bᵀ from a pre-packed weight
+// matrix. dst must have PackAPad(m)·N floats (the kernel writes whole 4-row
+// tiles; pad rows receive zeros and must simply be writable — model scratch
+// is sized for this) and aPack PackAPad(m)·K floats of caller scratch.
+// A non-nil pool runs the fan-out on its spinning workers (the latency
+// path); nil falls back to ParallelFor.
+// Accumulation is scalar-ordered per element within the kernel's broadcast
+// scheme; results match the float64 reference within fp32 rounding.
+func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *Pool) {
+	if m == 0 {
+		return
+	}
+	mPad := PackAPad(m)
+	k, n := pb.K, pb.N
+	_ = dst[mPad*n-1] // fail fast before the asm writes anything
+	_ = aPack[mPad*k-1]
+	packA4(aPack, a, m, k)
+
+	rowPanels := mPad / 4
+	colPanels := n / 16
+	// A parallel unit is a CHUNK of micro-tiles, not one 4×16 tile: one
+	// tile is ~2-5 µs of SIMD work, and a first cut that fanned out single
+	// tiles ran SLOWER than serial — 200+ units thrashed the atomic
+	// counter, and the counter's interleaving handed adjacent 64-byte
+	// output strips to different workers, maximizing false sharing. Chunks
+	// of 8×4 panels (32 rows × 64 cols) restore ~the granularity the
+	// unpacked path uses, and the B chunk is reused across the chunk's row
+	// panels while cache-hot.
+	const rowChunk, colChunk = 32, 4
+	rowUnits := (rowPanels + rowChunk - 1) / rowChunk
+	colUnits := (colPanels + colChunk - 1) / colChunk
+	units := rowUnits * colUnits
+	unitMACs := min(rowPanels, rowChunk) * 4 * k * min(colPanels, colChunk) * 16
+	if units < 2 || unitMACs < minUnitWork {
+		gemmChunk(dst, aPack, pb, 0, rowPanels, 0, colPanels, k, n)
+		return
+	}
+	body := func(u int) {
+		ip0 := (u / colUnits) * rowChunk
+		jp0 := (u % colUnits) * colChunk
+		gemmChunk(dst, aPack, pb, ip0, min(ip0+rowChunk, rowPanels), jp0, min(jp0+colChunk, colPanels), k, n)
+	}
+	if pool != nil {
+		pool.Run(units, body)
+	} else {
+		ParallelFor(units, body)
+	}
+}
+
+// gemmChunk runs the micro-kernel over row panels [ip0,ip1) × column panels
+// [jp0,jp1). The COLUMN loop is outermost: at short seq the whole pass is
+// bound by streaming the weights from DRAM, and a row-outer order
+// re-streams every B panel once per row panel (measured: 3× the weight
+// traffic at seq=12, 41 cycles per k-step against ~4 of compute). With jp
+// outer, each B panel (k×16 floats, L1/L2-resident) is loaded from memory
+// once and reused across every row panel of the chunk.
+func gemmChunk(dst, aPack []float32, pb *PackedB, ip0, ip1, jp0, jp1, k, n int) {
+	for jp := jp0; jp < jp1; jp++ {
+		pbPanel := &pb.data[jp*k*16]
+		for ip := ip0; ip < ip1; ip++ {
+			off := ip*4*n + jp*16
+			// Reslice so every float the asm writes (3 full rows of stride
+			// n plus the final 16-wide row) is bounds-checked up front.
+			d := dst[off : off+3*n+16]
+			gemm4x16(&d[0], n, &aPack[ip*k*4], pbPanel, k)
+		}
+	}
+}

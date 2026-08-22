@@ -129,7 +129,16 @@ func matMulBlockedCols(dst, a, bT []float32, m, k, n, jLo, jHi int) {
 // all workers finish — a library must not let a worker panic kill the host
 // process when the caller's recover() could have handled it.
 func ParallelFor(units int, fn func(u int)) {
-	workers := min(runtime.GOMAXPROCS(0), units)
+	ParallelForCap(runtime.GOMAXPROCS(0), units, fn)
+}
+
+// ParallelForCap is ParallelFor with the fan-out additionally capped at
+// cap workers. When the total work is small (a short-sequence forward
+// pass), goroutine wake latency dominates wide fan-outs — measured at
+// seq=12, 4 workers beat 20 by ~20% — so the model caps the fan-out from
+// what it knows about the sequence length.
+func ParallelForCap(cap, units int, fn func(u int)) {
+	workers := min(cap, runtime.GOMAXPROCS(0), units)
 	if workers <= 1 {
 		for u := range units {
 			fn(u)
@@ -139,8 +148,13 @@ func ParallelFor(units int, fn func(u int)) {
 	var panicked atomic.Pointer[any]
 	var next atomic.Int64
 	var wg sync.WaitGroup
-	wg.Add(workers)
-	for range workers {
+	// The caller is worker zero: it starts on units immediately instead of
+	// blocking in Wait while spawned workers wake. For small fan-outs the
+	// caller often drains the counter before the workers are running, and
+	// Wait returns without ever parking — cutting the wake latency that
+	// dominated short-sequence forward passes.
+	wg.Add(workers - 1)
+	for range workers - 1 {
 		go func() {
 			defer wg.Done()
 			defer func() {
@@ -157,6 +171,20 @@ func ParallelFor(units int, fn func(u int)) {
 			}
 		}()
 	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked.CompareAndSwap(nil, &r)
+			}
+		}()
+		for {
+			u := int(next.Add(1)) - 1
+			if u >= units {
+				return
+			}
+			fn(u)
+		}
+	}()
 	wg.Wait()
 	if p := panicked.Load(); p != nil {
 		panic(*p)
@@ -206,6 +234,21 @@ func MatMulParallel(dst, a, bT []float32, m, k, n int) {
 		// a sub-slice; the kernel's own i-tiling sees a single tile.
 		matMulBlockedCols(dst[i0*n:i1*n], a[i0*k:i1*k], bT, i1-i0, k, n, jLo, jHi)
 	})
+}
+
+// MatMulSerial is the best SERIAL matmul body: the SIMD kernel where the
+// CPU supports it, scalar blocked otherwise. It exists for callers that are
+// already inside a parallel region (the per-head attention workers) — using
+// MatMulSIMD there would nest fan-outs and oversubscribe the scheduler.
+func MatMulSerial(dst, a, bT []float32, m, k, n int) {
+	if m*n > 0 {
+		_ = dst[m*n-1] // fail fast on undersized dst
+	}
+	if !hasSIMD || k == 0 {
+		matMulBlockedCols(dst, a, bT, m, k, n, 0, n)
+		return
+	}
+	matMulSIMDCols(dst, a, bT, m, k, n, 0, n)
 }
 
 // matMulSIMDCols is matMulBlockedCols with the 1×4 micro-kernel replaced by
@@ -309,9 +352,26 @@ func Softmax(x []float32, m, n int) {
 				maxv = v
 			}
 		}
+		// The exp is written flat in the loop (expNonPos exceeds the inline
+		// budget — cost 99 vs 80 — and a call per element stops the OoO
+		// core from overlapping consecutive elements' chains).
 		var sum float32
 		for j, v := range row {
-			e := float32(math.Exp(float64(v - maxv)))
+			xe := v - maxv // <= 0 by construction
+			if xe < -87.33 {
+				xe = -87.33
+			}
+			nf := float32(int32(xe*expLog2e - 0.5))
+			xe -= nf * expC1
+			xe -= nf * expC2
+			z := xe * xe
+			y := float32(1.9875691500e-4)
+			y = y*xe + 1.3981999507e-3
+			y = y*xe + 8.3334519073e-3
+			y = y*xe + 4.1665795894e-2
+			y = y*xe + 1.6666665459e-1
+			y = y*xe + 5.0000001201e-1
+			e := (y*z + xe + 1) * math.Float32frombits(uint32(int32(nf)+127)<<23)
 			row[j] = e
 			sum += e
 		}
@@ -346,11 +406,43 @@ func LayerNorm(x, gamma, beta []float32, m, n int, eps float32) {
 	}
 }
 
-// GELU applies the exact (erf-based) Gaussian Error Linear Unit in place,
-// matching HuggingFace's "gelu" activation: 0.5x(1+erf(x/√2)).
+// GELU applies the erf-based Gaussian Error Linear Unit in place, matching
+// HuggingFace's "gelu" activation: 0.5x(1+erf(x/√2)), with the float32 erf
+// (~3e-7 absolute error — see fastmath.go; the golden tolerance is 1e-4).
+// The erf is written flat in the loop body (|x| fold via multiply, A&S
+// polynomial, inlinable exp) rather than calling erff32: a function call
+// per element blocks the out-of-order core from overlapping consecutive
+// elements' division/exp latency chains, and this loop runs on seq×I
+// elements per layer.
 func GELU(x []float32) {
+	const invSqrt2 = float32(0.7071067811865476)
 	for i, v := range x {
-		x[i] = float32(0.5 * float64(v) * (1 + math.Erf(float64(v)/math.Sqrt2)))
+		a := v * invSqrt2
+		sign := float32(1)
+		if a < 0 {
+			sign = -1
+			a = -a
+		}
+		t := 1 / (1 + 0.3275911*a)
+		poly := t * (0.254829592 + t*(-0.284496736+t*(1.421413741+t*(-1.453152027+t*1.061405429))))
+		// exp(-a²), flat (see Softmax for why this is not a call).
+		xe := -a * a
+		if xe < -87.33 {
+			xe = -87.33
+		}
+		nf := float32(int32(xe*expLog2e - 0.5))
+		xe -= nf * expC1
+		xe -= nf * expC2
+		z := xe * xe
+		y := float32(1.9875691500e-4)
+		y = y*xe + 1.3981999507e-3
+		y = y*xe + 8.3334519073e-3
+		y = y*xe + 4.1665795894e-2
+		y = y*xe + 1.6666665459e-1
+		y = y*xe + 5.0000001201e-1
+		e := (y*z + xe + 1) * math.Float32frombits(uint32(int32(nf)+127)<<23)
+		erf := sign * (1 - poly*e)
+		x[i] = 0.5 * v * (1 + erf)
 	}
 }
 

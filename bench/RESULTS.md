@@ -172,3 +172,53 @@ firing.** Ladder to date in that configuration: ~45× → ~25× → 9.6× →
 rung DESIGN.md says needs a pinned cloud box before any publishable claim;
 these laptop numbers remain relative-only, and the remaining gap is now of
 the same magnitude as this machine's own noise floor.
+
+## M4 — parity with ONNX Runtime (2026-08-22)
+
+Five changes, each driven by a profile and several corrected by a failed
+experiment the harness caught:
+
+1. **Fast float32 exp/erf** replacing the float64 libm calls in Softmax and
+   GELU (~28% of the pass), written FLAT in the loop bodies — the helper
+   exceeds Go's inline budget (cost 99 vs 80), and a call per element
+   stops the out-of-order core from overlapping consecutive elements'
+   chains. Accuracy ~3e-7, pinned by tests against the stdlib.
+2. **Attention head matmuls through the serial SIMD body**
+   (tensor.MatMulSerial) — they were 27% of the pass on the scalar kernel.
+3. **GEBP packed-weights kernel** (gemm4x16, plan9 asm): 4×16 tiles,
+   broadcast-FMA, 8 accumulator chains saturating both FMA ports; weights
+   packed ONCE at load (a structural edge over runtimes that pack per
+   session/call), Q‖K‖V fused into one [3H×H] matmul. Measured 101 GFLOPS
+   single-P-core (~69% of peak). Failed first cut, caught same-day: units
+   of one tile ran SLOWER than serial (counter thrash + the interleaving
+   handing adjacent 64-byte strips to different workers); a loop-order swap
+   aimed at DRAM streaming was a no-op (per-layer weights are L3-resident).
+4. **Spinning fork-join pool** (tensor.Pool), one per forward pass: the
+   ~36 fan-outs per embed each paid goroutine wake latency — about HALF
+   the short-sequence wall time. Workers spawn once, spin between tasks,
+   exit at the end; per-task state makes stale workers harmless.
+5. **Fan-out = GOMAXPROCS**: with coordination cheap, the earlier
+   seq-scaled worker cap (which was compensating for wake latency)
+   inverted — full width wins at every measured seq.
+
+Also learned: this box is an i9-13900H — 6 P-cores at 101 GFLOPS/core on
+the kernel, 8 E-cores 2.5× slower. E-core workers poison fan-out tails,
+which is most of the unpinned spread.
+
+Result (compare.py, 60 runs, both orders, after cool-down;
+`taskset` pins BOTH engines identically):
+
+| config | rembed | ONNX Runtime | ratio |
+|--------|--------|--------------|-------|
+| pinned 6 P-cores | 1.458 ms (p10 1.316) | 1.387 ms (p10 1.361) | **1.05× — FLAGged as parity** |
+| unpinned, all cores | 2.48 ms (spread 123%) | 1.68 ms | 1.47× — FLAGged within noise |
+
+**Statistical parity with ONNX Runtime on P-cores — the ladder reads
+~45× → ~25× → 9.6× → 3.3× → 1.05×.** The harness FLAGs both configs as
+inside measurement noise, so "faster than ONNX" is NOT claimable from this
+laptop; the pinned cloud box (DESIGN.md rule) is where that claim gets
+settled. The structural lever that goes decisively past parity is int8
+(4× less weight traffic on a pass that streams 42 MB of weights per
+embed). Trade recorded: the spinning pool burns idle worker cores for the
+duration of a forward pass — right for latency, wrong for saturated
+servers; a worker-cap Load option remains the follow-up.

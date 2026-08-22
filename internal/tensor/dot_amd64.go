@@ -17,3 +17,9 @@ var hasSIMD = cpu.X86.HasAVX2 && cpu.X86.HasFMA
 //
 //go:noescape
 func dot4AVX2(dst, a, b0, b1, b2, b3 *float32, k int)
+
+// gemm4x16 writes C[4×16] = packed-A-panel × packed-B-panel to dst with row
+// stride n floats (implemented in gemm_amd64.s). k must be >= 1.
+//
+//go:noescape
+func gemm4x16(dst *float32, n int, pa, pb *float32, k int)

@@ -2,7 +2,11 @@
 
 package model
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/rostamlabs/rembed/internal/tensor"
+)
 
 // TestScratchResizeTilesExactly pins the per-head slice arithmetic that
 // Forward relies on: for any (seq, H, I, dh) the golden tests' single MiniLM
@@ -27,15 +31,15 @@ func TestScratchResizeTilesExactly(t *testing.T) {
 		var s scratch
 		s.resize(seq, H, I, dh)
 
+		mPad := tensor.PackAPad(seq)
 		wantLens := map[string][2]int{
 			"x":         {len(s.x), seq * H},
-			"q":         {len(s.q), seq * H},
-			"k":         {len(s.k), seq * H},
-			"v":         {len(s.v), seq * H},
+			"qkv":       {len(s.qkv), mPad * 3 * H},
 			"ctxOut":    {len(s.ctxOut), seq * H},
-			"attnOut":   {len(s.attnOut), seq * H},
-			"ffnOut":    {len(s.ffnOut), seq * H},
-			"ffnHidden": {len(s.ffnHidden), seq * I},
+			"attnOut":   {len(s.attnOut), mPad * H},
+			"ffnOut":    {len(s.ffnOut), mPad * H},
+			"ffnHidden": {len(s.ffnHidden), mPad * I},
+			"aPack":     {len(s.aPack), mPad * max(H, I)},
 			"scores":    {len(s.scores), heads * seq * seq},
 			"qh":        {len(s.qh), seq * H},
 			"kh":        {len(s.kh), seq * H},

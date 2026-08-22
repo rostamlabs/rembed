@@ -175,11 +175,18 @@ func TestLayerNorm(t *testing.T) {
 }
 
 func TestGELU(t *testing.T) {
-	x := []float32{0, 1, -1, 2}
+	// Reference in float64 with exact erf; the fast float32 erf is within
+	// ~3e-7, so 1e-6 absolute over this range.
+	x := make([]float32, 0, 100)
+	for v := float32(-6); v <= 6; v += 0.25 {
+		x = append(x, v)
+	}
+	want := make([]float32, len(x))
+	for i, v := range x {
+		want[i] = float32(0.5 * float64(v) * (1 + math.Erf(float64(v)/math.Sqrt2)))
+	}
 	GELU(x)
-	ref := func(v float64) float32 { return float32(0.5 * v * (1 + math.Erf(v/math.Sqrt2))) }
-	want := []float32{0, ref(1), ref(-1), ref(2)}
-	almostEqual(t, x, want, 1e-7, "gelu")
+	almostEqual(t, x, want, 1e-6, "gelu")
 }
 
 func TestL2Normalize(t *testing.T) {
