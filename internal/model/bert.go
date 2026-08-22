@@ -46,7 +46,6 @@ type layer struct {
 // and per-call scratch comes from an internal pool.
 type Model struct {
 	cfg     Config
-	matmul  tensor.MatMulFunc
 	workers int // fan-out cap per Forward; 0 = GOMAXPROCS
 
 	wordEmb []float32 // [vocab×H]
@@ -68,6 +67,9 @@ type Model struct {
 // ~25 MB (the per-head scores panel dominates), and sync.Pool retains up to
 // one scratch PER P until GC drains it — worst case ~25 MB × GOMAXPROCS
 // (~500 MB on a 20-core box) after a burst of concurrent max-length embeds.
+// A single batched Embed call can inflate up to min(GOMAXPROCS, workers)
+// scratches at once (the across-texts fan-out), so the ×P worst case no
+// longer requires the CALLER to be concurrent.
 // That is a deliberate trade (reuse over footprint); if it ever bites,
 // scores is the buffer to shrink (a worker-slot ParallelFor variant would
 // cut it from heads·seq² to min(heads, workers)·seq²).
@@ -139,7 +141,10 @@ func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch
 	} else if w.packed != nil {
 		tensor.MatMulPacked(dst, x, w.packed, seq, s.aPack[:tensor.PackAPad(seq)*w.in], s.pool)
 	} else {
-		m.matmul(dst, x, w.raw, seq, w.in, w.out)
+		// The unpacked fallback must honor THIS call's cap too (the review
+		// caught the batch path nesting GOMAXPROCS-wide matmul fan-outs
+		// inside the across-texts fan-out on non-packed targets).
+		tensor.MatMulWorkers(dst, x, w.raw, seq, w.in, w.out, s.fanout)
 	}
 	tensor.AddBias(dst, w.bias, seq, w.out)
 }
@@ -181,7 +186,7 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 	if cfg.NumAttentionHeads <= 0 || H%cfg.NumAttentionHeads != 0 {
 		return nil, fmt.Errorf("weights %s: hidden_size %d not divisible by num_attention_heads %d", weightsPath, H, cfg.NumAttentionHeads)
 	}
-	m := &Model{cfg: cfg, matmul: tensor.DefaultCapped(workers), workers: workers}
+	m := &Model{cfg: cfg, workers: workers}
 	m.scratchPool.New = func() any { return new(scratch) }
 
 	type load struct {
@@ -334,7 +339,13 @@ func (m *Model) ForwardWorkers(ids []int64, workers int) ([]float32, error) {
 // pooling and no normalization are applied: this is the raw material for
 // rerankers, late-interaction retrieval, and custom pooling.
 func (m *Model) ForwardTokens(ids []int64) ([][]float32, error) {
-	s, err := m.encode(ids)
+	return m.ForwardTokensWorkers(ids, m.workers)
+}
+
+// ForwardTokensWorkers is ForwardTokens with an explicit per-call worker
+// cap (the batch path spreads texts across workers).
+func (m *Model) ForwardTokensWorkers(ids []int64, workers int) ([][]float32, error) {
+	s, err := m.encodeWorkers(ids, workers)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +355,9 @@ func (m *Model) ForwardTokens(ids []int64) ([][]float32, error) {
 	flat := make([]float32, seq*H)
 	copy(flat, s.x[:seq*H])
 	for i := range out {
-		out[i] = flat[i*H : (i+1)*H]
+		// Three-index slice: without the cap clamp, append on row i would
+		// silently overwrite row i+1 (rows share one backing array).
+		out[i] = flat[i*H : (i+1)*H : (i+1)*H]
 	}
 	return out, nil
 }
@@ -371,9 +384,17 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	eps := m.cfg.LayerNormEps
 
 	s := m.scratchPool.Get().(*scratch)
-	// NOTE: encode does NOT return s to the pool — the caller reads s.x
-	// after this returns and is responsible for scratchPool.Put. On error,
-	// encode puts it back itself.
+	// encode does NOT return s to the pool on success — the caller reads
+	// s.x after this returns and is responsible for scratchPool.Put. On
+	// error OR panic this deferred reclaim runs; it is registered BEFORE
+	// the pool's Stop defer, so LIFO order guarantees the spin pool is
+	// stopped before the scratch is published back to the pool.
+	committed := false
+	defer func() {
+		if !committed {
+			m.scratchPool.Put(s)
+		}
+	}()
 	s.resize(seq, H, I, dh)
 	// The fan-out workers live in a spinning pool for the duration of this
 	// call — spawned once, never parked between the ~36 fan-outs — because
@@ -392,7 +413,6 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	x := s.x
 	for i, id := range ids {
 		if id < 0 || int(id) >= m.cfg.VocabSize {
-			m.scratchPool.Put(s)
 			return nil, fmt.Errorf("token id %d out of vocab range %d", id, m.cfg.VocabSize)
 		}
 		row := x[i*H : i*H+H]
@@ -478,5 +498,6 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 		tensor.LayerNorm(x, l.outLNg, l.outLNb, seq, H, eps)
 	}
 
+	committed = true
 	return s, nil
 }

@@ -12,6 +12,11 @@ vecs, err := emb.Embed(ctx, []string{"hello world"})
 // vecs[0] is a []float32 of emb.Dim() (384 for MiniLM-L6-v2)
 ```
 
+`EmbedTokens` returns per-token hidden states (ONNX Runtime's
+`last_hidden_state`) for rerankers and late-interaction retrieval, and a
+multi-text `Embed` call fans out across texts for near-linear batch
+throughput (bit-identical to one-at-a-time results).
+
 `Load` accepts a Hub model id (downloaded into `$REMBED_CACHE`, default
 the user cache dir; `HF_TOKEN` honored), a git-cloned HF repo directory,
 or a converted model dir. Options: `rembed.WithInt8()` (weight-only

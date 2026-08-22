@@ -5,6 +5,7 @@ package rembed
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -267,8 +268,8 @@ func TestGoldenTokens(t *testing.T) {
 		}
 		// Raw hidden states have magnitudes up to ~10 (unnormalized), so
 		// the tolerance is the golden rule's 1e-4 relative to that scale.
-		if maxd > 1e-3 {
-			t.Errorf("%.40q: token maxAbsDiff=%g > 1e-3", c.Text, maxd)
+		if maxd > 1e-4 {
+			t.Errorf("%.40q: token maxAbsDiff=%g > 1e-4 (observed baseline 2.9e-6 — see PR #13 review)", c.Text, maxd)
 		} else {
 			t.Logf("%.40q: %d tokens, maxAbsDiff=%.2e", c.Text, len(te.Vectors), maxd)
 		}
@@ -570,17 +571,83 @@ func TestEmbedBatchMatchesSingle(t *testing.T) {
 		"a third, somewhat longer text to vary the sequence lengths in play",
 		"short", "and", "many", "more", "texts",
 	}
-	batch, err := emb.Embed(ctx, texts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, text := range texts {
-		one, err := emb.Embed(ctx, []string{text})
+	// Pin BOTH parallelism regimes regardless of the host's core count
+	// (the review caught within>1 never running on small CI runners):
+	// GOMAXPROCS=8 with 2 texts forces across=2/within=4; with 16 texts
+	// forces across=8/within=1.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
+	for _, tc := range []struct {
+		procs int
+		n     int
+	}{{8, 2}, {8, 16}, {runtime.NumCPU(), len(texts)}} {
+		runtime.GOMAXPROCS(tc.procs)
+		sub := texts
+		for len(sub) < tc.n {
+			sub = append(sub, texts...)
+		}
+		sub = sub[:tc.n]
+		batch, err := emb.Embed(ctx, sub)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !slices.Equal(batch[i], one[0]) {
-			t.Fatalf("text %d: batch result diverged from single embed", i)
+		runtime.GOMAXPROCS(runtime.NumCPU())
+		for i, text := range sub {
+			one, err := emb.Embed(ctx, []string{text})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(batch[i], one[0]) {
+				t.Fatalf("procs=%d n=%d text %d: batch diverged from single embed", tc.procs, tc.n, i)
+			}
+		}
+	}
+
+	// A cancelled batch reports the ctx error, like the single-text path.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := emb.Embed(cctx, texts[:4]); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled batch returned %v, want context.Canceled", err)
+	}
+}
+
+// TestEmbedTokensPoolsToEmbed pins internal consistency: mean-pooling and
+// L2-normalizing EmbedTokens' output must reproduce Embed. Catches any
+// future divergence between encode()'s output and Forward's pooling
+// without needing a golden refresh.
+func TestEmbedTokensPoolsToEmbed(t *testing.T) {
+	dir := modelDir(t)
+	emb, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	texts := []string{"hello world", "The quick brown fox jumps over the lazy dog.", "third text"}
+	toks, err := emb.EmbedTokens(ctx, texts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vecs, err := emb.Embed(ctx, texts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ti, te := range toks {
+		dim := emb.Dim()
+		pooled := make([]float64, dim)
+		for _, row := range te.Vectors {
+			for j, v := range row {
+				pooled[j] += float64(v)
+			}
+		}
+		var norm float64
+		for j := range pooled {
+			pooled[j] /= float64(len(te.Vectors))
+			norm += pooled[j] * pooled[j]
+		}
+		norm = math.Sqrt(norm)
+		for j := range pooled {
+			if d := math.Abs(pooled[j]/norm - float64(vecs[ti][j])); d > 1e-6 {
+				t.Fatalf("text %d dim %d: pooled tokens %g vs Embed %g", ti, j, pooled[j]/norm, vecs[ti][j])
+			}
 		}
 	}
 }
@@ -593,9 +660,17 @@ func BenchmarkEmbedBatch32(b *testing.B) {
 		b.Fatal(err)
 	}
 	ctx := context.Background()
+	// Mixed lengths: uniform batches are the fan-out's best case (no
+	// stragglers), so they overstate throughput for real workloads.
+	base := []string{
+		"short",
+		"The quick brown fox jumps over the lazy dog.",
+		strings.Repeat("a mid-length passage about nothing in particular ", 4),
+		strings.Repeat("a long document body that pushes the sequence length up considerably ", 12),
+	}
 	texts := make([]string, 32)
 	for i := range texts {
-		texts[i] = "The quick brown fox jumps over the lazy dog."
+		texts[i] = base[i%len(base)]
 	}
 	for b.Loop() {
 		if _, err := emb.Embed(ctx, texts); err != nil {

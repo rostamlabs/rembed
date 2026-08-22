@@ -32,6 +32,25 @@ func Default() MatMulFunc {
 	return MatMulParallel
 }
 
+// MatMulWorkers runs the best kernel for this platform with the fan-out
+// capped at workers (<= 0 = GOMAXPROCS) for THIS call — the per-call
+// counterpart of DefaultCapped, used by the model's batch path where the
+// cap varies call to call.
+func MatMulWorkers(dst, a, bT []float32, m, k, n, workers int) {
+	if hasSIMD {
+		matMulSIMDWorkers(dst, a, bT, m, k, n, normWorkers(workers))
+		return
+	}
+	matMulParallelWorkers(dst, a, bT, m, k, n, normWorkers(workers))
+}
+
+func normWorkers(w int) int {
+	if w <= 0 {
+		return runtime.GOMAXPROCS(0)
+	}
+	return w
+}
+
 // DefaultCapped is Default with the fan-out capped at workers goroutines
 // (<= 0 means uncapped). This is what makes rembed.WithWorkers hold on the
 // UNPACKED matmul path too — before it existed, the fallback kernel
