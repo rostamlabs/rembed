@@ -170,9 +170,12 @@ func TestGoldenInt8(t *testing.T) {
 // BGE-small's own ONNX reference — the pooling mode the BGE/arctic model
 // families use. Skips when the model dir has not been exported.
 func TestGoldenCLSPooling(t *testing.T) {
-	dir := "models/bge-small-en-v1.5"
+	dir := os.Getenv("REMBED_MODEL_BGE")
+	if dir == "" {
+		dir = "models/bge-small-en-v1.5"
+	}
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("model dir %s not present (models/convert.py BAAI/bge-small-en-v1.5)", dir)
+		t.Skipf("model dir %s not present (models/convert.py BAAI/bge-small-en-v1.5, or set REMBED_MODEL_BGE)", dir)
 	}
 	raw, err := os.ReadFile("testdata/golden-bge-small.json")
 	if err != nil {

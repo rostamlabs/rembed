@@ -41,3 +41,28 @@ jobs:
           go-version: "1.26.x"
       - name: build ${{ matrix.goos }}/${{ matrix.goarch }}
         run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
+
+  golden:
+    # The full golden validation against committed ONNX-reference outputs,
+    # with real weights fetched through rembed's own hub loader (dogfooding
+    # the pure-Go download path) and cached between runs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/rembed
+          key: rembed-models-v1
+      - name: fetch models via the hub loader
+        run: |
+          go run ./cmd/rembed embed -model sentence-transformers/all-MiniLM-L6-v2 "warm" > /dev/null
+          go run ./cmd/rembed embed -model BAAI/bge-small-en-v1.5 "warm" > /dev/null
+      - name: golden suite (fp32, int8, cls, allocs, concurrency)
+        run: |
+          export REMBED_MODEL_DIR=~/.cache/rembed/sentence-transformers--all-MiniLM-L6-v2
+          export REMBED_MODEL_BGE=~/.cache/rembed/BAAI--bge-small-en-v1.5
+          go test -v -run "Golden|SteadyState|Concurrent|WithWorkers" . 2>&1 | tail -30
+          go test -run "Golden|SteadyState|Concurrent|WithWorkers" .
