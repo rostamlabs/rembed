@@ -217,6 +217,49 @@ func TestGoldenCLSPooling(t *testing.T) {
 	}
 }
 
+// TestGoldenMPNetParallelMatchesSerial pins the CONCURRENT form of the
+// MPNet-only code: the per-head workers reading the shared biasDelta table
+// from inside Pool.Run goroutines. TestGoldenMatrix runs serially (it is a
+// numerics test), so without this the relative-position bias path would
+// have no coverage in its parallel form — and the input is long enough
+// (≥300 tokens) that the far buckets are exercised concurrently too.
+// Parallel must be BIT-identical to serial: partitioning never changes any
+// output element's accumulation order.
+func TestGoldenMPNetParallelMatchesSerial(t *testing.T) {
+	dir := os.Getenv("REMBED_MODEL_MPNET")
+	if dir == "" {
+		dir = "models/all-mpnet-base-v2"
+	}
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("model dir %s not present", dir)
+	}
+	serial, err := Load(dir, WithWorkers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parallel, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Repeat("the antikythera mechanism modeled the motions of the sun and moon with startling precision, ", 25)
+	if n := len(serial.Tokenize(text)); n < 300 {
+		t.Fatalf("test input tokenizes to %d tokens; need >=300 to reach the far relative-position buckets", n)
+	}
+	a, err := serial.Embed(context.Background(), []string{text})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := parallel.Embed(context.Background(), []string{text})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range a[0] {
+		if a[0][i] != b[0][i] {
+			t.Fatalf("parallel diverges from serial at [%d]: %v vs %v", i, b[0][i], a[0][i])
+		}
+	}
+}
+
 // TestGoldenTokens validates EmbedTokens — per-token hidden states —
 // against ONNX Runtime's last_hidden_state for the committed token-level
 // golden. This is the raw, unpooled output, so nothing downstream
@@ -287,13 +330,22 @@ func TestGoldenMatrix(t *testing.T) {
 	cases := []struct {
 		golden, dir, env        string
 		maxAbs, minCos, maxMean float64
+		// int8MinCos > 0 also validates WithInt8 against the same golden
+		// (cosine only — int8 trades absolute error for speed by design),
+		// so every documented int8 figure is test-enforced.
+		int8MinCos float64
 	}{
-		{"testdata/golden-all-MiniLM-L12-v2.json", "models/all-MiniLM-L12-v2", "REMBED_MODEL_L12", 1e-4, 0, 1e-5},
-		{"testdata/golden-paraphrase-MiniLM-L3-v2.json", "models/paraphrase-MiniLM-L3-v2", "REMBED_MODEL_L3", 1e-4, 0, 1e-5},
-		{"testdata/golden-gte-small.json", "models/gte-small", "REMBED_MODEL_GTE", 2e-3, 0.9999, 2e-4},
+		{"testdata/golden-all-MiniLM-L12-v2.json", "models/all-MiniLM-L12-v2", "REMBED_MODEL_L12", 1e-4, 0, 1e-5, 0},
+		{"testdata/golden-paraphrase-MiniLM-L3-v2.json", "models/paraphrase-MiniLM-L3-v2", "REMBED_MODEL_L3", 1e-4, 0, 1e-5, 0},
+		{"testdata/golden-gte-small.json", "models/gte-small", "REMBED_MODEL_GTE", 2e-3, 0.9999, 2e-4, 0},
 		// MPNet exercises the second architecture end to end: offset
-		// positions, no segment table, shared relative-position bias.
-		{"testdata/golden-all-mpnet-base-v2.json", "models/all-mpnet-base-v2", "REMBED_MODEL_MPNET", 1e-4, 0, 1e-5},
+		// positions, no segment table, shared relative-position bias. The
+		// 12-case golden's 324-token case reaches |j−i| ≥ 128, pinning the
+		// log-spaced far buckets and the max-distance clamp. int8 bound is
+		// the measured worst case (0.997874, the punctuation text) less
+		// margin — the review caught the docs claiming an optimistic
+		// 0.9989 measured on 2 texts.
+		{"testdata/golden-all-mpnet-base-v2.json", "models/all-mpnet-base-v2", "REMBED_MODEL_MPNET", 1e-4, 0, 1e-5, 0.9978},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {
@@ -350,6 +402,31 @@ func TestGoldenMatrix(t *testing.T) {
 				if maxd > tc.maxAbs || cos < tc.minCos || mean > tc.maxMean {
 					t.Errorf("%.40q: maxAbs=%.3g (<=%.3g) cos=%.6f (>=%.4f) meanAbs=%.3g (<=%.3g)",
 						c.Text, maxd, tc.maxAbs, cos, tc.minCos, mean, tc.maxMean)
+				}
+			}
+			if tc.int8MinCos > 0 {
+				q, err := Load(dir, WithInt8(), WithWorkers(1))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !q.Quantized() {
+					t.Skip("int8 path not active on this CPU")
+				}
+				for _, c := range golden.Cases {
+					v, err := q.Embed(context.Background(), []string{c.Text})
+					if err != nil {
+						t.Fatal(err)
+					}
+					var dot, na, nb float64
+					for i, want := range c.Embedding {
+						g, w := float64(v[0][i]), float64(want)
+						dot += g * w
+						na += g * g
+						nb += w * w
+					}
+					if cos := dot / math.Sqrt(na*nb); cos < tc.int8MinCos {
+						t.Errorf("int8 %.40q: cos=%.6f (>=%.4f)", c.Text, cos, tc.int8MinCos)
+					}
 				}
 			}
 		})

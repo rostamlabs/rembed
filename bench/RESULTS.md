@@ -296,13 +296,21 @@ Because positions are contiguous, the bias collapses to a
 [heads×(2·seq−1)] delta table computed once per forward — HF
 materializes [heads×seq×seq].
 
-Validation against the repo's own ONNX export over the 11-case golden:
-maxAbsDiff 3.3e-7, worst per-text meanAbs 7.3e-8, cosine 1.000000000 —
-the same fidelity class as the BERT matrix (1.5e-7–1.9e-7). Tokenization
-(WordPiece with <s>/</s> framing over the 4-shifted vocab) matches HF's
-MPNetTokenizer token-for-token on every golden case, including the
-accent/CJK/symbol torture cases. Weight-only int8 engages unchanged
-(768-dim projections pack cleanly): cosine ≥ 0.9989 vs fp32.
+Validation against the repo's own ONNX export over the 12-case golden
+(the longest case is 324 tokens, so token pairs reach |j−i| ≥ 128 and
+the log-spaced far buckets plus the max-distance clamp are pinned end to
+end, not just in the unit test): maxAbsDiff 3.3e-7, worst per-text
+meanAbs 7.3e-8, cosine 1.000000000 — the same fidelity class as the
+BERT matrix (1.5e-7–1.9e-7). The adversarial review additionally
+validated against a LIVE HuggingFace MPNetModel forward pass at 4, 52,
+402, and 512 tokens: maxAbs ≤ 2.05e-6, cosine 1.0 throughout.
+Tokenization (WordPiece with <s>/</s> framing over the 4-shifted vocab)
+matches HF's MPNetTokenizer token-for-token on every golden case,
+including the accent/CJK/symbol torture cases. Weight-only int8 engages
+unchanged (768-dim projections pack cleanly): cosine ≥ 0.9978 vs the
+golden — the measured worst case is 0.997874 on the punctuation text,
+now test-enforced in the golden matrix. (An earlier draft claimed
+0.9989, measured on only 2 texts; the review caught it.)
 
 The bucket function ports HF's float32 log computation to float64 —
 verified to pick identical buckets for every |distance| ≤ 1000

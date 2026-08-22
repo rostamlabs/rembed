@@ -81,11 +81,17 @@ func validate(c *Config, source string) error {
 	switch c.ModelType {
 	case "", "bert":
 	case "mpnet":
-		if c.RelativeAttentionNumBuckets <= 0 {
-			return fmt.Errorf("%s: model_type mpnet requires relative_attention_num_buckets", source)
+		// HF's MPNet implementation HARDCODES both values in code:
+		// compute_position_bias buckets with its default num_buckets=32
+		// (config only sizes the embedding table), and MPNetEmbeddings
+		// sets padding_idx=1 unconditionally. A checkpoint declaring
+		// anything else would make rembed and HF silently diverge —
+		// refuse loudly instead of computing a valid-looking wrong answer.
+		if c.RelativeAttentionNumBuckets != 32 {
+			return fmt.Errorf("%s: relative_attention_num_buckets=%d — HF's MPNet hardcodes 32 regardless of config, so rembed only accepts 32", source, c.RelativeAttentionNumBuckets)
 		}
-		if c.PadTokenID < 0 || c.MaxSeqLen() <= 0 {
-			return fmt.Errorf("%s: pad_token_id %d leaves no usable positions (max_position_embeddings %d)", source, c.PadTokenID, c.MaxPositionEmbeddings)
+		if c.PadTokenID != 1 {
+			return fmt.Errorf("%s: pad_token_id=%d — HF's MPNet embeddings hardcode padding_idx=1 regardless of config, so rembed only accepts 1", source, c.PadTokenID)
 		}
 	default:
 		return fmt.Errorf("%s: model_type %q unsupported (bert or mpnet)", source, c.ModelType)

@@ -39,7 +39,9 @@ no segment table, and the shared bucketed relative-position bias added
 to every layer's attention scores (computed once per forward as a
 [heads×(2·seq−1)] delta table since positions are contiguous).
 Validated against the repo's ONNX export: maxAbsDiff 3.3e-7, cosine
-1.0 over the 11-case golden; int8 cosine ≥ 0.9989 vs fp32. The
+1.0 over the 12-case golden (longest case 324 tokens, so the far
+relative-position buckets and the max-distance clamp are pinned end to
+end); int8 cosine ≥ 0.9978 (measured worst 0.997874, test-enforced). The
 original scope, for the record — needed:
 relative position bias added to attention scores (bucketed, shared
 across layers) on top of absolute embeddings, RoBERTa-style position

@@ -84,6 +84,24 @@ func TestDeriveConfigMPNet(t *testing.T) {
 	if _, err := DeriveConfig(dir, "test-mpnet"); err == nil {
 		t.Fatal("expected error for missing relative_attention_num_buckets")
 	}
+
+	// HF's code hardcodes num_buckets=32 and padding_idx=1 no matter what
+	// config declares; a checkpoint declaring otherwise would silently
+	// diverge from HF, so both must refuse.
+	write("config.json", `{"model_type":"mpnet","hidden_act":"gelu","hidden_size":768,
+		"num_hidden_layers":12,"num_attention_heads":12,"intermediate_size":3072,
+		"vocab_size":30527,"max_position_embeddings":514,"layer_norm_eps":1e-5,
+		"relative_attention_num_buckets":64,"pad_token_id":1}`)
+	if _, err := DeriveConfig(dir, "test-mpnet"); err == nil {
+		t.Fatal("expected refusal for relative_attention_num_buckets != 32")
+	}
+	write("config.json", `{"model_type":"mpnet","hidden_act":"gelu","hidden_size":768,
+		"num_hidden_layers":12,"num_attention_heads":12,"intermediate_size":3072,
+		"vocab_size":30527,"max_position_embeddings":514,"layer_norm_eps":1e-5,
+		"relative_attention_num_buckets":32,"pad_token_id":0}`)
+	if _, err := DeriveConfig(dir, "test-mpnet"); err == nil {
+		t.Fatal("expected refusal for pad_token_id != 1")
+	}
 }
 
 // TestManifestRoundTripMPNet ensures the mpnet fields survive

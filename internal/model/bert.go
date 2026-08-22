@@ -568,13 +568,16 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 			tensor.MatMulSerial(sc, qhH, khH, seq, dh, seq)
 			if m.relBias != nil {
 				// MPNet: scores/√dh + bias(j−i), matching HF's order
-				// (scale first, then add) so accumulation rounds the same.
+				// (scale first, then add). The explicit float32 conversion
+				// forces the product to round before the add — without it
+				// the compiler fuses an FMA on arm64, and results stop
+				// being bit-identical across architectures.
 				bd := s.biasDelta[h*(2*seq-1):]
 				for i := range seq {
 					row := sc[i*seq : i*seq+seq]
 					bdi := bd[seq-1-i:] // index j-i+seq-1 = (seq-1-i)+j
 					for j := range row {
-						row[j] = row[j]*scale + bdi[j]
+						row[j] = float32(row[j]*scale) + bdi[j]
 					}
 				}
 			} else {

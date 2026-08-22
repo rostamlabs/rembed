@@ -58,8 +58,9 @@ func DeriveConfig(dir, name string) (Config, error) {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks relative_attention_num_buckets", dir)
 		}
 		if hf.PadTokenID == nil {
-			// Every MPNet checkpoint sets it (HF's default is 1), and
-			// guessing wrong shifts every position embedding.
+			// Every MPNet checkpoint sets it, and validate() then insists
+			// on 1 — the value HF's code hardcodes as padding_idx no
+			// matter what config says.
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
 		}
 	default:
