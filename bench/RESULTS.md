@@ -342,3 +342,32 @@ maxAbs 3.2e-7, cosine 1.0. int8: cosine ≥ 0.9985 (measured worst
 0.998727 on the long case), enforced in the golden matrix.
 
 No benchmark entry: same kernels, one fewer encoder layer than MPNet.
+
+## R6 — SentencePiece unigram, multilingual models (2026-08-22)
+
+Coverage rung, the deepest tokenizer of the three: SentencePiece Unigram
+in pure Go. Three independently-validated layers — a minimal protobuf
+wire reader for the .model file; the NMT-NFKC normalizer, driven by the
+model's precompiled charsmap (a darts-clone double-array trie whose
+traversal was ported unit-for-unit from the darts.h sentencepiece
+bundles, replacement strings NUL-delimited in the trailing blob); and
+Viterbi segmentation over 250k pieces with the unknown-character rules
+ported from unigram_model.cc (unk node only when no single-char piece
+covers a position; CONSECUTIVE unknowns merge into one piece — the one
+divergence the first fixture run caught, visible as three <unk> where
+sentencepiece emits one).
+
+Validation, per layer, against the reference implementation over a
+31-case battery spanning nine scripts (Persian, Arabic, CJK, Cyrillic,
+Greek, Hebrew, Korean, Devanagari) plus fullwidth/ligature NFKC cases,
+unicode spaces, emoji, and a >512-token Persian truncation case:
+normalization BYTE-FOR-BYTE vs sentencepiece's own Normalize; pieces
+exactly vs EncodeAsPieces; ids token-for-token vs HF XLMRobertaTokenizer
+(fairseq remapping + truncation included).
+
+paraphrase-multilingual-MiniLM-L12-v2 (a plain BERT encoder with a
+250037-row padded embedding table) against its repo's ONNX export over
+the 13-case golden (now including a Persian sentence): fp32 maxAbs
+6.96e-7, cosine 1.0. int8: cosine ≥ 0.9995 (measured worst 0.999642),
+enforced in the golden matrix. Ten validated models, three
+architectures, three tokenizer families.

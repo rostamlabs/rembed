@@ -80,10 +80,11 @@ func DeriveConfig(dir, name string) (Config, error) {
 	}
 
 	var tok struct {
-		DoLowerCase *bool  `json:"do_lower_case"`
-		ClsToken    string `json:"cls_token"`
-		SepToken    string `json:"sep_token"`
-		UnkToken    string `json:"unk_token"`
+		DoLowerCase    *bool  `json:"do_lower_case"`
+		ClsToken       string `json:"cls_token"`
+		SepToken       string `json:"sep_token"`
+		UnkToken       string `json:"unk_token"`
+		TokenizerClass string `json:"tokenizer_class"`
 	}
 	if err := readJSON("tokenizer_config.json", &tok); err != nil {
 		return c, err
@@ -98,17 +99,32 @@ func DeriveConfig(dir, name string) (Config, error) {
 		return c, fmt.Errorf("model dir %s: %w", dir, err)
 	}
 
+	// XLM-R-family repos ship a SentencePiece model even on a plain BERT
+	// architecture (multilingual-e5, paraphrase-multilingual MiniLM). The
+	// FILE is the authoritative signal: older exports lack the
+	// tokenizer_class field entirely (the multilingual MiniLM does).
+	sentencePiece := strings.HasPrefix(tok.TokenizerClass, "XLMRobertaTokenizer")
+	if !sentencePiece {
+		if _, err := os.Stat(filepath.Join(dir, "sentencepiece.bpe.model")); err == nil {
+			sentencePiece = true
+		}
+	}
+
 	// The WordPiece tokenizer couples lowercasing to accent stripping, so
 	// guessing this wrong yields plausible-but-wrong embeddings. Every
 	// surveyed BERT/ST repo sets the field explicitly; refuse rather than
-	// guess. RoBERTa's byte-level BPE never lowercases and its configs do
-	// not carry the field at all.
+	// guess. RoBERTa's byte-level BPE never carries the field. SentencePiece
+	// repos sometimes DO carry a stale do_lower_case=true that HF's
+	// XLMRobertaTokenizer never reads (the multilingual MiniLM does) — so
+	// it is IGNORED there, matching HF, rather than refused.
 	doLower := false
-	if hf.ModelType == "roberta" {
+	switch {
+	case sentencePiece:
+	case hf.ModelType == "roberta":
 		if tok.DoLowerCase != nil && *tok.DoLowerCase {
 			return c, fmt.Errorf("model dir %s: do_lower_case=true on a roberta model — byte-level BPE is case-preserving", dir)
 		}
-	} else {
+	default:
 		if tok.DoLowerCase == nil {
 			return c, fmt.Errorf("model dir %s: tokenizer_config.json does not set do_lower_case — set it there or provide a manifest.json", dir)
 		}
@@ -151,6 +167,9 @@ func DeriveConfig(dir, name string) (Config, error) {
 	}
 	if hf.LayerNormEps != nil {
 		c.LayerNormEps = *hf.LayerNormEps
+	}
+	if sentencePiece {
+		c.Tokenizer = "sentencepiece"
 	}
 	switch hf.ModelType {
 	case "mpnet":

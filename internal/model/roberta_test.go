@@ -86,3 +86,54 @@ func TestManifestMissingPadRefused(t *testing.T) {
 		t.Fatal("roberta manifest without pad_token_id was accepted; it must refuse")
 	}
 }
+
+// TestDeriveConfigSentencePiece: a BERT-architecture repo with the XLM-R
+// tokenizer (multilingual MiniLM / multilingual-e5 shape) derives
+// tokenizer=sentencepiece, is exempt from do_lower_case, and refuses a
+// config claiming lowercasing.
+func TestDeriveConfigSentencePiece(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("config.json", `{"model_type":"bert","hidden_act":"gelu","hidden_size":384,
+		"num_hidden_layers":12,"num_attention_heads":12,"intermediate_size":1536,
+		"vocab_size":250037,"max_position_embeddings":512,"layer_norm_eps":1e-12}`)
+	write("tokenizer_config.json", `{"tokenizer_class":"XLMRobertaTokenizer","cls_token":"<s>","sep_token":"</s>","unk_token":"<unk>"}`)
+	write("1_Pooling/config.json", `{"pooling_mode_mean_tokens":true,"pooling_mode_cls_token":false}`)
+	write("modules.json", `[{"type":"sentence_transformers.models.Transformer"},
+		{"type":"sentence_transformers.models.Pooling"}]`)
+
+	cfg, err := DeriveConfig(dir, "test-xlmr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Tokenizer != "sentencepiece" || cfg.DoLowerCase || cfg.ModelType != "bert" {
+		t.Fatalf("sentencepiece derivation wrong: %+v", cfg)
+	}
+	if cfg.PositionOffset() != 0 || cfg.MaxSeqLen() != 512 {
+		t.Fatalf("bert-architecture offsets wrong: %+v", cfg)
+	}
+
+	// The real multilingual MiniLM repo carries a stale do_lower_case=true
+	// that HF's XLM-R tokenizer never reads — it must be IGNORED, and the
+	// derivation must also work with no tokenizer_class field when the
+	// sentencepiece.bpe.model file is present (older exports lack the
+	// field).
+	write("tokenizer_config.json", `{"do_lower_case":true,"cls_token":"<s>","sep_token":"</s>","unk_token":"<unk>"}`)
+	write("sentencepiece.bpe.model", "not parsed by derive")
+	cfg, err = DeriveConfig(dir, "test-xlmr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Tokenizer != "sentencepiece" || cfg.DoLowerCase {
+		t.Fatalf("file-presence detection or stale do_lower_case handling wrong: %+v", cfg)
+	}
+}

@@ -60,11 +60,23 @@ fp32 maxAbs 3.2e-7 cosine 1.0; int8 cosine ≥ 0.9985 (measured worst
 0.998727, test-enforced). The hub loader now selects tokenizer files by
 model_type (vocab.json+merges.txt vs vocab.txt).
 
-## R6 — XLM-R + SentencePiece unigram (multilingual-e5)
-The multilingual unlock. Needs a pure-Go SentencePiece unigram tokenizer
-(minimal protobuf reader for the .model file + Viterbi segmentation),
-then XLM-R is architecturally RoBERTa. Validated token-for-token against
-HF across scripts (CJK, Cyrillic, Arabic, emoji).
+## R6 — SentencePiece unigram — multilingual models ✅
+Done: pure-Go SentencePiece Unigram (tokenizer/sentencepiece) — a
+minimal protobuf wire reader for the .model file, the NMT-NFKC
+normalizer driven by the model's precompiled charsmap (darts-clone
+double-array trie, traversal ported unit-for-unit), Viterbi
+segmentation with sentencepiece's consecutive-unknown merging, and HF's
+fairseq id remapping. Validated in three layers against the reference —
+normalization byte-for-byte, pieces exactly, ids token-for-token vs
+XLMRobertaTokenizer — over a 31-case battery spanning nine scripts
+(Persian included) plus a >512-token truncation case.
+paraphrase-multilingual-MiniLM-L12-v2 vs its ONNX export: fp32 maxAbs
+7e-7, int8 cosine ≥ 0.9995 (measured worst 0.999642, test-enforced).
+The multilingual-e5 family is architecture-identical (add the
+query:/passage: prefixes yourself). Tokenizer selection keys on the
+sentencepiece.bpe.model FILE, not tokenizer_class — older exports omit
+the field, and their stale do_lower_case=true is ignored exactly as HF
+ignores it.
 
 ## R7 — int8 depth: AVX-512-VNNI and activation quantization
 VNNI (VPDPBUSD) computes int8×int8→int32 4-wide-per-lane — on capable

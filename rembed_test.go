@@ -352,6 +352,11 @@ func TestGoldenMatrix(t *testing.T) {
 		// bound is the measured worst case (0.998727, the 326-token text)
 		// less margin.
 		{"testdata/golden-all-distilroberta-v1.json", "models/all-distilroberta-v1", "REMBED_MODEL_ROBERTA", 1e-4, 0, 1e-5, 0.9985},
+		// The multilingual model exercises the SentencePiece tokenizer end
+		// to end (normalizer + Viterbi + fairseq ids) on a BERT encoder
+		// with a padded embedding table (250037 rows for 250002 ids).
+		// int8 bound: measured worst 0.999642 (the 402-token text) less margin.
+		{"testdata/golden-paraphrase-multilingual-MiniLM-L12-v2.json", "models/paraphrase-multilingual-MiniLM-L12-v2", "REMBED_MODEL_XLMR", 1e-4, 0, 1e-5, 0.9995},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {

@@ -22,6 +22,7 @@ import (
 	"github.com/rostamlabs/rembed/internal/tensor"
 	"github.com/rostamlabs/rembed/tokenizer"
 	"github.com/rostamlabs/rembed/tokenizer/bpe"
+	"github.com/rostamlabs/rembed/tokenizer/sentencepiece"
 )
 
 // textTokenizer is what an Embedder needs from a tokenizer; the WordPiece
@@ -132,18 +133,29 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
 	var tok textTokenizer
-	if cfg.ModelType == "roberta" {
+	switch {
+	case cfg.Tokenizer == "sentencepiece":
+		tok, err = sentencepiece.New(filepath.Join(modelDir, "sentencepiece.bpe.model"))
+	case cfg.ModelType == "roberta":
 		tok, err = bpe.New(filepath.Join(modelDir, "vocab.json"), filepath.Join(modelDir, "merges.txt"),
 			cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
-	} else {
+	default:
 		tok, err = tokenizer.New(filepath.Join(modelDir, "vocab.txt"), cfg.DoLowerCase, cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
-	if tok.VocabSize() != cfg.VocabSize {
-		// A vocab and model.safetensors from different models would
-		// otherwise produce silently wrong (or per-call failing) embeddings.
+	// A vocab and model.safetensors from different models would otherwise
+	// produce silently wrong (or per-call failing) embeddings.
+	// SentencePiece models legitimately pad the embedding table PAST the
+	// tokenizer's id space (multilingual MiniLM: 250037 rows for 250002
+	// ids), so their check is one-sided.
+	switch {
+	case cfg.Tokenizer == "sentencepiece":
+		if tok.VocabSize() > cfg.VocabSize {
+			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model only %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
+		}
+	case tok.VocabSize() != cfg.VocabSize:
 		return nil, fmt.Errorf("rembed: vocab has %d tokens but manifest says %d — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 	}
 	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, o.int8, o.workers)
