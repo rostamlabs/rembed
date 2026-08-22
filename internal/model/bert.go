@@ -404,18 +404,23 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 		tensor.LayerNorm(x, l.outLNg, l.outLNb, seq, H, eps)
 	}
 
-	// Mean pooling over all positions (no padding ⇒ every position counts),
-	// then optional L2 normalization.
+	// Pooling (no padding ⇒ every position counts), then optional L2
+	// normalization. cls takes the first token's hidden state (BGE-style
+	// models); mean averages all positions (sentence-transformers style).
 	pooled := make([]float32, H)
-	for i := range seq {
-		row := x[i*H : i*H+H]
-		for j := range pooled {
-			pooled[j] += row[j]
+	if m.cfg.Pooling == "cls" {
+		copy(pooled, x[:H])
+	} else {
+		for i := range seq {
+			row := x[i*H : i*H+H]
+			for j := range pooled {
+				pooled[j] += row[j]
+			}
 		}
-	}
-	inv := 1 / float32(seq)
-	for j := range pooled {
-		pooled[j] *= inv
+		inv := 1 / float32(seq)
+		for j := range pooled {
+			pooled[j] *= inv
+		}
 	}
 	if m.cfg.Normalize {
 		tensor.L2Normalize(pooled)

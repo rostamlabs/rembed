@@ -49,7 +49,7 @@ GOLDEN_TEXTS = [
 
 
 def sanity_check_safetensors(path: Path) -> None:
-    """Verify every tensor is F32 (the Go loader supports nothing else)."""
+    """Verify every tensor dtype is one the Go loader handles."""
     with open(path, "rb") as f:
         (hlen,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(hlen))
@@ -57,23 +57,26 @@ def sanity_check_safetensors(path: Path) -> None:
         name: entry["dtype"]
         for name, entry in header.items()
         if name != "__metadata__"
-        and entry["dtype"] != "F32"
+        and entry["dtype"] not in ("F32", "F16", "BF16")
         # position_ids is a saved buffer (0..maxPos), not a weight; the Go
-        # loader skips non-F32 tensors so it is harmless.
+        # loader skips it.
         and not name.endswith("position_ids")
     }
     if bad:
-        raise SystemExit(f"{path}: non-F32 tensors (unsupported by the Go loader): {bad}")
+        raise SystemExit(f"{path}: unsupported tensor dtypes: {bad}")
 
 
-def mean_pool(last_hidden: np.ndarray, mask: np.ndarray, normalize: bool) -> np.ndarray:
+def pool(last_hidden: np.ndarray, mask: np.ndarray, mode: str, normalize: bool) -> np.ndarray:
     """[seq, H] token embeddings + [seq] attention mask -> pooled [H].
 
-    `normalize` must be the manifest's flag: the Go engine honors it, so the
-    golden must too, or the reference itself becomes wrong.
+    `mode`/`normalize` must be the manifest's values: the Go engine honors
+    them, so the golden must too, or the reference itself becomes wrong.
     """
-    m = mask.astype(np.float32)[:, None]
-    pooled = (last_hidden * m).sum(axis=0) / np.maximum(m.sum(), 1e-9)
+    if mode == "cls":
+        pooled = last_hidden[0].astype(np.float32)
+    else:
+        m = mask.astype(np.float32)[:, None]
+        pooled = (last_hidden * m).sum(axis=0) / np.maximum(m.sum(), 1e-9)
     if normalize:
         n = np.linalg.norm(pooled)
         if n == 0:
@@ -86,8 +89,17 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("model_id", nargs="?", default="sentence-transformers/all-MiniLM-L6-v2")
     ap.add_argument("--out", type=Path, default=None, help="model dir to write")
-    ap.add_argument("--golden", type=Path, default=REPO_ROOT / "testdata" / "golden.json")
+    ap.add_argument("--golden", type=Path, default=None,
+                    help="golden output path (default: testdata/golden.json for the default model, "
+                         "testdata/golden-<model>.json otherwise — never silently overwriting "
+                         "another model's golden)")
     args = ap.parse_args()
+    if args.golden is None:
+        short = args.model_id.split("/")[-1]
+        if args.model_id == "sentence-transformers/all-MiniLM-L6-v2":
+            args.golden = REPO_ROOT / "testdata" / "golden.json"
+        else:
+            args.golden = REPO_ROOT / "testdata" / f"golden-{short}.json"
 
     from huggingface_hub import hf_hub_download
     import onnxruntime as ort
@@ -119,10 +131,14 @@ def main() -> None:
         raise SystemExit(f"hidden_act={config.get('hidden_act')!r}: only exact GELU is supported")
     if config.get("position_embedding_type", "absolute") != "absolute":
         raise SystemExit(f"position_embedding_type={config.get('position_embedding_type')!r}: only absolute is supported")
-    if not pooling.get("pooling_mode_mean_tokens") or any(
-        pooling.get(k) for k in ("pooling_mode_cls_token", "pooling_mode_max_tokens", "pooling_mode_lasttoken")
-    ):
-        raise SystemExit(f"unsupported pooling config (v1 supports mean only): {pooling}")
+    mean = bool(pooling.get("pooling_mode_mean_tokens"))
+    cls = bool(pooling.get("pooling_mode_cls_token"))
+    other = any(pooling.get(k) for k in (
+        "pooling_mode_max_tokens", "pooling_mode_lasttoken",
+        "pooling_mode_mean_sqrt_len_tokens", "pooling_mode_weightedmean_tokens"))
+    if other or mean == cls:
+        raise SystemExit(f"unsupported pooling config (rembed supports mean or cls): {pooling}")
+    pool_mode = "mean" if mean else "cls"
     # Any ST module beyond Transformer/Pooling/Normalize (e.g. a Dense head)
     # would make the real model differ from what rembed computes.
     known = ("models.Transformer", "models.Pooling", "models.Normalize")
@@ -144,7 +160,7 @@ def main() -> None:
         "cls_token": tok_config.get("cls_token", "[CLS]"),
         "sep_token": tok_config.get("sep_token", "[SEP]"),
         "unk_token": tok_config.get("unk_token", "[UNK]"),
-        "pooling": "mean",
+        "pooling": pool_mode,
         "normalize": normalize,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -164,7 +180,7 @@ def main() -> None:
         if "token_type_ids" in input_names:
             feeds["token_type_ids"] = np.zeros_like(ids)
         (last_hidden,) = sess.run(["last_hidden_state"], feeds)
-        emb = mean_pool(last_hidden[0], mask[0], normalize)
+        emb = pool(last_hidden[0], mask[0], pool_mode, normalize)
         golden.append(
             {
                 "text": text,

@@ -25,7 +25,7 @@ type Config struct {
 	ClsToken              string  `json:"cls_token"`
 	SepToken              string  `json:"sep_token"`
 	UnkToken              string  `json:"unk_token"`
-	Pooling               string  `json:"pooling"`   // "mean" is the only v1 strategy
+	Pooling               string  `json:"pooling"`   // "mean" or "cls"
 	Normalize             bool    `json:"normalize"` // L2-normalize the pooled vector
 }
 
@@ -39,18 +39,24 @@ func LoadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return c, fmt.Errorf("manifest %s: %w", path, err)
 	}
+	return c, validate(&c, path)
+}
+
+// validate sanity-checks a Config from either source (manifest or HF
+// derivation) and defaults LayerNormEps, so both paths share the rules.
+func validate(c *Config, source string) error {
 	if c.HiddenSize <= 0 || c.NumHiddenLayers <= 0 || c.NumAttentionHeads <= 0 ||
 		c.IntermediateSize <= 0 || c.VocabSize <= 0 || c.MaxPositionEmbeddings <= 0 {
-		return c, fmt.Errorf("manifest %s: missing or non-positive architecture fields: %+v", path, c)
+		return fmt.Errorf("%s: missing or non-positive architecture fields: %+v", source, c)
 	}
 	if c.HiddenSize%c.NumAttentionHeads != 0 {
-		return c, fmt.Errorf("manifest %s: hidden_size %d not divisible by num_attention_heads %d", path, c.HiddenSize, c.NumAttentionHeads)
+		return fmt.Errorf("%s: hidden_size %d not divisible by num_attention_heads %d", source, c.HiddenSize, c.NumAttentionHeads)
 	}
-	if c.Pooling != "mean" {
-		return c, fmt.Errorf("manifest %s: pooling %q unsupported (v1 supports \"mean\")", path, c.Pooling)
+	if c.Pooling != "mean" && c.Pooling != "cls" {
+		return fmt.Errorf("%s: pooling %q unsupported (mean or cls)", source, c.Pooling)
 	}
 	if c.LayerNormEps == 0 {
 		c.LayerNormEps = 1e-12
 	}
-	return c, nil
+	return nil
 }

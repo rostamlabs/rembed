@@ -76,11 +76,44 @@ func TestLoadSkipsPositionIDsBufferOnly(t *testing.T) {
 		t.Fatalf("w=%v", tensors["w"])
 	}
 
-	// Any OTHER non-F32 tensor (e.g. an fp16 weight) must fail loudly with
-	// the dtype as the reason, not surface later as "missing tensor".
-	badHeader := `{"embeddings.word_embeddings.weight":{"dtype":"F16","shape":[1],"data_offsets":[0,2]}}`
+	// Any OTHER unsupported dtype must fail loudly with the dtype as the
+	// reason, not surface later as "missing tensor".
+	badHeader := `{"embeddings.word_embeddings.weight":{"dtype":"I8","shape":[2],"data_offsets":[0,2]}}`
 	if _, err := Load(writeFile(t, badHeader, []byte{0, 0})); err == nil {
-		t.Fatal("expected dtype error for non-F32 weight")
+		t.Fatal("expected dtype error for unsupported dtype")
+	}
+}
+
+// TestLoadF16AndBF16 pins the half-precision widening against hand-checked
+// bit patterns: normals, a subnormal, zero, and the sign bit.
+func TestLoadF16AndBF16(t *testing.T) {
+	// F16: 0x3C00=1.0, 0xC000=-2.0, 0x3555≈0.333252, 0x0001=subnormal
+	// 2^-24, 0x0000=0.
+	f16 := []byte{0x00, 0x3C, 0x00, 0xC0, 0x55, 0x35, 0x01, 0x00, 0x00, 0x00}
+	header := `{"w":{"dtype":"F16","shape":[5],"data_offsets":[0,10]}}`
+	tensors, err := Load(writeFile(t, header, f16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []float64{1, -2, 0.333251953125, 5.960464477539063e-08, 0}
+	for i, w := range want {
+		if got := float64(tensors["w"].Data[i]); math.Abs(got-w) > 1e-12 {
+			t.Fatalf("f16[%d]=%v want %v", i, got, w)
+		}
+	}
+
+	// BF16: float32's top 16 bits. 0x3F80=1.0, 0xC040=-3.0, 0x3EAB≈0.334.
+	bf16 := []byte{0x80, 0x3F, 0x40, 0xC0, 0xAB, 0x3E}
+	header = `{"w":{"dtype":"BF16","shape":[3],"data_offsets":[0,6]}}`
+	tensors, err = Load(writeFile(t, header, bf16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantB := []float64{1, -3, 0.333984375}
+	for i, w := range wantB {
+		if got := float64(tensors["w"].Data[i]); math.Abs(got-w) > 1e-12 {
+			t.Fatalf("bf16[%d]=%v want %v", i, got, w)
+		}
 	}
 }
 
