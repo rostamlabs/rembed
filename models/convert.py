@@ -222,7 +222,8 @@ def main() -> None:
         manifest["model_type"] = "roberta"
         manifest["pad_token_id"] = config["pad_token_id"]
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"wrote {out}/[model.safetensors vocab.txt manifest.json]")
+    vocab_files = "vocab.json merges.txt" if model_type == "roberta" else "vocab.txt"
+    print(f"wrote {out}/[model.safetensors {vocab_files} manifest.json]")
 
     # --- golden reference (ONNX Runtime, per-text, no padding) -------------
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)

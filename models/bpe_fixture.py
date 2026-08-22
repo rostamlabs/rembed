@@ -45,6 +45,13 @@ TEXTS = [
     "quotes \"double\" and 'single' and `backtick`",
     "In 2024, the model processed 1,234,567 queries at 99.9% availability, "
     "averaging 3.14 ms per request across 42 regions.",
+    " 'S uppercase after space-apostrophe hits no-contraction + case rules",
+    "nbsp\u00a0thin\u2009ideographic\u3000spaces and\u200bzwsp",
+    "a!\x1cb file separator pins the regex-module-vs-re \\s claim",
+    # >512 tokens so HF's truncation=True is exercised IN the fixture,
+    # not just self-asserted by the Go truncation test.
+    ("the quick brown fox jumps over the lazy dog and keeps on running "
+     * 40),
 ]
 
 

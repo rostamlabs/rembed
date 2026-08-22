@@ -11,6 +11,7 @@ package bpe
 
 import (
 	"bufio"
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -115,15 +116,18 @@ func New(vocabPath, mergesPath, clsTok, sepTok, unkTok string) (*Tokenizer, erro
 // VocabSize returns the number of entries in vocab.json.
 func (t *Tokenizer) VocabSize() int { return len(t.vocab) }
 
-// isNum reports \p{N} membership (all Number categories — Nd, Nl, No),
-// matching the pattern's \p{N}; unicode.IsNumber is exactly that.
+// isNum reports \p{N} membership (all Number categories — Nd, Nl, No)
+// via unicode.IsNumber. The only divergence from the reference pattern is
+// Unicode-database VERSION skew: Python's regex module bundles a newer
+// UCD than Go's unicode tables, so a handful of recently-encoded scripts
+// classify differently — and HF's actual tokenizer (Rust, its own UCD)
+// sides with Go on the fuzzed cases, so token ids agree even there.
 func isNum(r rune) bool { return unicode.IsNumber(r) }
 
-// isSpace reports Python-re \s membership for the pattern. Go's
-// unicode.IsSpace covers the same set for every character that appears in
-// real text; the sole divergence is the C0 file-separator block
-// \x1c-\x1f, which Python counts and Go does not — documented, untested
-// by HF's own fixtures, and never emitted by any known text source.
+// isSpace reports \s membership for the pattern. Verified by exhaustive
+// code-point enumeration: the regex module's \s (what GPT-2/HF actually
+// use — NOT Python's stdlib re, which adds \x1c-\x1f) and Go's
+// unicode.IsSpace are IDENTICAL, zero differences.
 func isSpace(r rune) bool { return unicode.IsSpace(r) }
 
 // preTokenize splits text with GPT-2's pattern:
@@ -224,38 +228,107 @@ func (t *Tokenizer) preTokenize(text string) []string {
 	return out
 }
 
-// bpe merges one byte-encoded pre-token into vocabulary symbols using the
-// GPT-2 algorithm: repeatedly merge every adjacent occurrence of the
-// lowest-ranked pair until no ranked pair remains.
+// bpe merges one byte-encoded pre-token into vocabulary symbols with a
+// doubly-linked symbol list and a min-heap of merge candidates ordered by
+// (rank, position) — the algorithm HF's fast (Rust) tokenizer uses.
+// O(n log n), so a megabyte-long unbroken pre-token costs milliseconds
+// where the textbook round-based rescan is quadratic (measured 3.28 s for
+// a 50k-char word — a real hazard for a server fed base64 or minified
+// JSON). Output is IDENTICAL to GPT-2's round-based algorithm for any
+// well-formed merge table: a merge's result can only appear in
+// higher-ranked (later-learned) merges, so the heap never reorders
+// rounds. bpeReference in the tests is the round-based version, and a
+// differential test pins the equivalence on this vocab.
 func (t *Tokenizer) bpe(token string) []string {
-	word := make([]string, 0, len(token))
-	for _, r := range token {
-		word = append(word, string(r))
+	runes := []rune(token)
+	if len(runes) < 2 {
+		if len(runes) == 0 {
+			return nil
+		}
+		return []string{string(runes[0])}
 	}
-	for len(word) > 1 {
-		bestRank := -1
-		var best [2]string
-		for i := 0; i+1 < len(word); i++ {
-			if r, ok := t.ranks[[2]string{word[i], word[i+1]}]; ok && (bestRank < 0 || r < bestRank) {
-				bestRank = r
-				best = [2]string{word[i], word[i+1]}
-			}
-		}
-		if bestRank < 0 {
-			break
-		}
-		merged := make([]string, 0, len(word))
-		for i := 0; i < len(word); i++ {
-			if i+1 < len(word) && word[i] == best[0] && word[i+1] == best[1] {
-				merged = append(merged, best[0]+best[1])
-				i++
-			} else {
-				merged = append(merged, word[i])
-			}
-		}
-		word = merged
+	syms := make([]string, len(runes))
+	next := make([]int, len(runes))
+	prev := make([]int, len(runes))
+	alive := make([]bool, len(runes))
+	for i, r := range runes {
+		syms[i] = string(r)
+		next[i] = i + 1
+		prev[i] = i - 1
+		alive[i] = true
 	}
-	return word
+	next[len(runes)-1] = -1
+
+	h := &candHeap{}
+	push := func(left int) {
+		right := next[left]
+		if right == -1 {
+			return
+		}
+		if rank, ok := t.ranks[[2]string{syms[left], syms[right]}]; ok {
+			// Snapshot the pair: a popped candidate is stale (skipped)
+			// unless both symbols still read exactly as they did here.
+			heap.Push(h, cand{rank: rank, pos: left, left: syms[left], right: syms[right]})
+		}
+	}
+	for i := 0; i+1 < len(runes); i++ {
+		push(i)
+	}
+	for h.Len() > 0 {
+		c := heap.Pop(h).(cand)
+		i := c.pos
+		j := next[i]
+		if !alive[i] || j == -1 || syms[i] != c.left || syms[j] != c.right {
+			continue // stale: one side was already merged away
+		}
+		syms[i] = c.left + c.right
+		alive[j] = false
+		next[i] = next[j]
+		if next[j] != -1 {
+			prev[next[j]] = i
+		}
+		if prev[i] != -1 {
+			push(prev[i])
+		}
+		push(i)
+	}
+
+	out := make([]string, 0, 8)
+	for i := 0; i != -1; i = next[i] {
+		if alive[i] {
+			out = append(out, syms[i])
+		}
+	}
+	return out
+}
+
+// cand is one prospective merge: the pair (left,right) starting at node
+// pos, valid only while both symbols still read as snapshotted.
+type cand struct {
+	rank, pos   int
+	left, right string
+}
+
+// candHeap orders candidates by rank then position, making merge order
+// deterministic and left-to-right among equal ranks (ranks are unique in
+// a merges.txt, so the position tie-break is belt-and-suspenders).
+type candHeap []cand
+
+func (h candHeap) Len() int { return len(h) }
+func (h candHeap) Less(a, b int) bool {
+	if h[a].rank != h[b].rank {
+		return h[a].rank < h[b].rank
+	}
+	return h[a].pos < h[b].pos
+}
+func (h candHeap) Swap(a, b int) { h[a], h[b] = h[b], h[a] }
+func (h *candHeap) Push(x any)   { *h = append(*h, x.(cand)) }
+func (h *candHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
 }
 
 // Encode tokenizes text as RoBERTa frames it — cls + tokens + sep —
@@ -264,7 +337,9 @@ func (t *Tokenizer) bpe(token string) []string {
 // input, but the lookup keeps it as a guard.
 func (t *Tokenizer) Encode(text string, maxLen int) (ids, mask []int64) {
 	ids = append(ids, t.cls)
-	budget := maxLen - 2
+	// Framing always survives: like the WordPiece path, maxLen < 2 clamps
+	// the content budget to zero and still returns [cls, sep].
+	budget := max(maxLen-2, 0)
 	var sb strings.Builder
 outer:
 	for _, pre := range t.preTokenize(text) {

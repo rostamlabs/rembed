@@ -67,3 +67,22 @@ func TestDeriveConfigRoberta(t *testing.T) {
 		t.Fatal("expected refusal for missing pad_token_id")
 	}
 }
+
+// TestManifestMissingPadRefused is the review's HIGH: PadTokenID is a
+// plain int, so a roberta manifest WITHOUT the field decodes as 0 — and
+// before the guard that loaded silently with every position embedding
+// shifted one row (cosine 0.66 vs correct). The manifest path must
+// refuse it exactly like the config.json path does.
+func TestManifestMissingPadRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manifest.json")
+	manifest := `{"name":"m","model_type":"roberta","hidden_size":768,
+		"num_hidden_layers":6,"num_attention_heads":12,"intermediate_size":3072,
+		"vocab_size":50265,"max_position_embeddings":514,"layer_norm_eps":1e-5,
+		"pooling":"mean","normalize":true}`
+	if err := os.WriteFile(path, []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("roberta manifest without pad_token_id was accepted; it must refuse")
+	}
+}

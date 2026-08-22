@@ -64,7 +64,10 @@ jobs:
         # per-commit net (they cover every arm64 assembly kernel).
         run: |
           mkdir -p /tmp/arm64
-          for pkg in ./internal/tensor ./internal/model ./internal/safetensors ./tokenizer ./tokenizer/bpe; do
+          # tokenizer/bpe is absent on purpose: it has no assembly, and its
+          # fixture tests need vocab files this job does not fetch — the
+          # golden job runs them against the hub cache instead.
+          for pkg in ./internal/tensor ./internal/model ./internal/safetensors ./tokenizer; do
             GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/arm64/$(basename $pkg).test $pkg
           done
       - name: run under qemu

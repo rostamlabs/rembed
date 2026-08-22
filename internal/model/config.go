@@ -82,10 +82,16 @@ func validate(c *Config, source string) error {
 	switch c.ModelType {
 	case "", "bert":
 	case "roberta":
-		// Unlike MPNet, HF's RoBERTa reads padding_idx from config, so
-		// any non-negative pad is honored; the offset must leave usable
-		// positions.
-		if c.PadTokenID < 0 || c.MaxSeqLen() <= 0 {
+		// Unlike MPNet, HF's RoBERTa reads padding_idx from config — but
+		// zero is refused deliberately: PadTokenID is a plain int, so a
+		// manifest MISSING the field decodes as 0 and would silently
+		// shift every position embedding by one row (measured: cosine
+		// 0.66 against correct output — plausible-looking garbage). No
+		// real RoBERTa uses pad 0; id 0 is <s>.
+		if c.PadTokenID < 1 {
+			return fmt.Errorf("%s: roberta requires pad_token_id >= 1 (found %d — a manifest without the field reads as 0)", source, c.PadTokenID)
+		}
+		if c.MaxSeqLen() <= 0 {
 			return fmt.Errorf("%s: pad_token_id %d leaves no usable positions (max_position_embeddings %d)", source, c.PadTokenID, c.MaxPositionEmbeddings)
 		}
 	case "mpnet":

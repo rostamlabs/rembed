@@ -23,27 +23,39 @@ import (
 )
 
 // required are the files every sentence-transformers-format repo must
-// provide, regardless of architecture. modules.json is required
-// deliberately: silently assuming "no Normalize module" for a repo that
-// actually has one would shift every downstream cosine threshold, and
-// every genuine ST repo ships the file. config.json comes first: the
-// tokenizer files to fetch depend on its model_type.
+// provide, regardless of architecture — fetched AFTER config.json's
+// model_type has been checked, so an unsupported architecture is refused
+// having downloaded one small JSON file, not the weights. modules.json is
+// required deliberately: silently assuming "no Normalize module" for a
+// repo that actually has one would shift every downstream cosine
+// threshold, and every genuine ST repo ships the file.
 var required = []string{
-	"config.json",
 	"tokenizer_config.json",
 	"1_Pooling/config.json",
 	"modules.json",
 	"model.safetensors",
 }
 
-// tokenizerFiles returns the tokenizer artifacts for a model_type:
-// byte-level BPE models (RoBERTa family) ship vocab.json + merges.txt;
-// WordPiece models (BERT, MPNet) ship vocab.txt.
+// tokenizerFiles returns the tokenizer artifacts for a supported
+// model_type: byte-level BPE (RoBERTa) ships vocab.json + merges.txt;
+// WordPiece (BERT, MPNet) ships vocab.txt. XLM-R is deliberately absent —
+// it ships a SentencePiece model file, which R6 will add.
 func tokenizerFiles(modelType string) []string {
-	if modelType == "roberta" || modelType == "xlm-roberta" {
+	if modelType == "roberta" {
 		return []string{"vocab.json", "merges.txt"}
 	}
 	return []string{"vocab.txt"}
+}
+
+// supported mirrors internal/model's architecture allowlist. Duplicated
+// here on purpose: hub must refuse BEFORE downloading gigabytes, and
+// cannot import internal/model (which would invert the dependency).
+func supported(modelType string) bool {
+	switch modelType {
+	case "bert", "roberta", "mpnet":
+		return true
+	}
+	return false
 }
 
 var idRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$`)
@@ -79,17 +91,21 @@ func Ensure(modelID, cacheDir string) (string, error) {
 		return "", err
 	}
 	sweepStaleTemps(dir)
-	cleanup := func() {
-		// A failed first fetch should not litter the cache with empty
-		// org--name directories (os.Remove refuses non-empty ones).
+	cleanup := func(files ...string) {
+		// A failed fetch should not litter the cache: remove whatever was
+		// fetched this far, then the (now empty) directories — os.Remove
+		// refuses non-empty ones, so a dir with unrelated content stays.
+		for _, f := range files {
+			_ = os.Remove(filepath.Join(dir, filepath.FromSlash(f)))
+		}
 		_ = os.Remove(filepath.Join(dir, "1_Pooling"))
 		_ = os.Remove(dir)
 	}
-	for _, f := range required {
-		if err := fetch(modelID, f, dir); err != nil {
-			cleanup()
-			return "", err
-		}
+	// config.json first, alone: its model_type decides both whether to
+	// continue at all and which tokenizer files exist to fetch.
+	if err := fetch(modelID, "config.json", dir); err != nil {
+		cleanup()
+		return "", err
 	}
 	var hf struct {
 		ModelType string `json:"model_type"`
@@ -99,14 +115,20 @@ func Ensure(modelID, cacheDir string) (string, error) {
 		err = json.Unmarshal(raw, &hf)
 	}
 	if err != nil {
-		cleanup()
+		cleanup("config.json")
 		return "", fmt.Errorf("hub: %s: config.json: %w", modelID, err)
 	}
-	for _, f := range tokenizerFiles(hf.ModelType) {
+	if !supported(hf.ModelType) {
+		cleanup("config.json")
+		return "", fmt.Errorf("hub: %s: model_type %q is not supported (rembed runs bert, roberta, and mpnet encoders)", modelID, hf.ModelType)
+	}
+	fetched := []string{"config.json"}
+	for _, f := range append(append([]string{}, required...), tokenizerFiles(hf.ModelType)...) {
 		if err := fetch(modelID, f, dir); err != nil {
-			cleanup()
+			cleanup(fetched...)
 			return "", err
 		}
+		fetched = append(fetched, f)
 	}
 	return dir, nil
 }
