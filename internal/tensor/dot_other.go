@@ -9,6 +9,7 @@ package tensor
 const (
 	hasSIMD  = false
 	hasSIMD8 = false
+	hasVNNI  = false
 )
 
 // The native kernels are never called when hasSIMD/hasSIMD8 are false;
@@ -23,4 +24,8 @@ func gemm4x16(dst *float32, n int, pa, pb *float32, k int) {
 
 func gemm4x16i8(dst *float32, n int, pa *float32, pb *int8, k int, scales *float32) {
 	panic("tensor: gemm4x16i8 called without a native kernel for this architecture")
+}
+
+func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int) {
+	panic("tensor: gemm4x16vnni called without a native kernel for this architecture")
 }

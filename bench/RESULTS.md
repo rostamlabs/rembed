@@ -371,3 +371,55 @@ the 13-case golden (now including a Persian sentence): fp32 maxAbs
 6.96e-7, cosine 1.0. int8: cosine ≥ 0.9995 (measured worst 0.999642),
 enforced in the golden matrix. Ten validated models, three
 architectures, three tokenizer families.
+
+## R7 — AVX-VNNI full int8 (2026-08-23)
+
+The last performance rung reachable on this machine. AVX-512-VNNI does
+not exist on consumer Raptor Lake, but AVX-VNNI (the 256-bit VEX form of
+VPDPBUSD) does — and Go's assembler only knows the EVEX encoding, which
+faults without AVX-512. So: eight hand-encoded VEX byte sequences,
+generated field-by-field (VEX.256.66.0F38.W0 50 /r) and verified
+byte-for-byte against GNU as's {vex}-prefixed output before first run —
+the amd64 mirror of R3's WORD-encoded NEON story.
+
+The scheme: weights per-output-channel symmetric s8 (as M5, float64
+scale division and all); activations per-ROW asymmetric u8 via the +128
+offset trick — q = round(a/s)+128, so VPDPBUSD's u8·s8 accumulation
+equals the true dot plus 128·colSum, and the column sums are precomputed
+at pack time and subtracted in the epilogue. One VPDPBUSD does four
+multiply-accumulates per int32 lane: 4× the MACs per instruction of the
+fp32 FMA path, and activations stream at a quarter the bytes.
+
+Correctness: the kernel is BIT-EXACT against a pure-Go integer
+reference over every shape class (there is no floating-point rounding to
+hide behind — the accumulation is integers until the epilogue), and
+serial vs parallel outputs are bit-identical (per-row quantization,
+disjoint tiles). The review additionally proved the no-intermediate-
+saturation semantics adversarially (all four products maximal in every
+lane, k up to 1536: bit-exact), decoded all eight VEX byte sequences
+independently, and showed int32 accumulator wraparound CANCELS exactly
+in the zero-point correction — the true overflow limit is k > 131072,
+~85× past any transformer.
+
+Golden accuracy, measured per model and enforced in the golden matrix:
+worst cosine 0.9917 (MiniLM-L6), 0.9932 (L12), 0.9979 (L3), 0.9912
+(mpnet), 0.9982 (multilingual), 0.9991 (gte) — and 0.9747 for
+distilroberta, where RoBERTa's activation outliers (~2.7× larger row
+absmax, measured) defeat the per-row absmax scheme and short texts
+degrade most. That spread is why the mode is a separate opt-in
+(WithInt8Activations), never a WithInt8 upgrade, and why the README
+carries a per-model table with a RoBERTa warning instead of one blanket
+bound.
+
+Pinned same-machine A/B (taskset 0-11, medians of 200 after warmup):
+
+| model | fp32 | int8 weights | int8 FULL | full vs weights |
+|---|---|---|---|---|
+| MiniLM-L6 | 3.69 ms | 3.57 ms | 2.62 ms | 1.36× |
+| mpnet-base | 18.2 ms | 16.2 ms | 12.7 ms | 1.28× |
+
+FLAG: single-machine numbers, same protocol caveats as M4/M5 — but the
+margins here are 28-36%, far outside the noise band that made the M5
+verdict a sign-test. Weight-only int8 already sat at 0.89× of ONNX
+Runtime fp32; full int8 on VNNI hardware is decisively ahead. R8's
+pinned cloud box remains where the cross-engine magnitude gets settled.

@@ -42,6 +42,11 @@ jobs:
       - name: build ${{ matrix.goos }}/${{ matrix.goarch }}
         run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
 
+  # NOTE: GitHub-hosted x64 runners (Ice Lake-SP / Zen 3) lack AVX-VNNI,
+  # so the R7 full-int8 tests skip in CI. Closing this needs an Intel SDE
+  # job (sde64 -adl -- go test ./internal/tensor) once Actions billing is
+  # restored — tracked as follow-up; the path is exercised on every local
+  # run of the suite on VNNI hardware.
   arm64-qemu:
     # The NEON kernels (fp32 gemm, WORD-encoded int8 gemm, dot4) are proven
     # here, not just cross-compiled: the arm64 test binaries run under

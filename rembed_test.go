@@ -104,6 +104,74 @@ func TestEmbedContextCancellation(t *testing.T) {
 	}
 }
 
+// TestGoldenInt8Activations pins the FULL int8 mode (VNNI: u8 activations
+// × s8 weights): accuracy against the ONNX golden at the measured bound
+// (worst case 0.991652 on this model; the bound leaves margin), an error
+// large enough that a silently-disabled feature cannot pass (the R4-era
+// inverted-test lesson), and bit-identity between serial and parallel —
+// per-row quantization and disjoint tiles make worker count invisible.
+func TestGoldenInt8Activations(t *testing.T) {
+	dir := modelDir(t)
+	raw, err := os.ReadFile("testdata/golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden goldenFile
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	if len(golden.Cases) == 0 {
+		t.Fatal("golden file has no cases")
+	}
+	emb, err := Load(dir, WithInt8Activations())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !emb.QuantizedActivations() {
+		t.Skip("AVX-VNNI unavailable on this CPU; nothing to assert")
+	}
+	serial, err := Load(dir, WithInt8Activations(), WithWorkers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var worstCos = 1.0
+	var maxErr float64
+	for _, c := range golden.Cases {
+		v, err := emb.Embed(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sv, err := serial.Embed(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range v[0] {
+			if v[0][i] != sv[0][i] {
+				t.Fatalf("%.40q: parallel[%d]=%v differs from serial %v", c.Text, i, v[0][i], sv[0][i])
+			}
+		}
+		var dot float64
+		for i, want := range c.Embedding {
+			dot += float64(v[0][i]) * float64(want)
+			if d := math.Abs(float64(v[0][i] - want)); d > maxErr {
+				maxErr = d
+			}
+		}
+		if dot < worstCos {
+			worstCos = dot
+		}
+		if dot < 0.991 {
+			t.Errorf("%.40q: cosine %.6f below the full-int8 bound 0.991", c.Text, dot)
+		}
+	}
+	// A full-int8 run that matches fp32 too well means the mode is not
+	// actually engaged.
+	if maxErr < 1e-4 {
+		t.Fatalf("full-int8 output within %.2g of the fp32 golden — is the VNNI path actually active?", maxErr)
+	}
+	t.Logf("full-int8 worst cosine %.6f, maxAbs %.4g", worstCos, maxErr)
+}
+
 // TestGoldenInt8 pins the int8 accuracy contract against the same fp32
 // ONNX reference: weight-only per-channel quantization measured worst
 // maxAbsDiff 0.0126 and worst cosine 0.99906 across the golden set; the
@@ -332,12 +400,17 @@ func TestGoldenMatrix(t *testing.T) {
 		maxAbs, minCos, maxMean float64
 		// int8MinCos > 0 also validates WithInt8 against the same golden
 		// (cosine only — int8 trades absolute error for speed by design),
-		// so every documented int8 figure is test-enforced.
-		int8MinCos float64
+		// so every documented int8 figure is test-enforced. int8ActMinCos
+		// does the same for the FULL int8 mode (WithInt8Activations) —
+		// bounds are per-model measured worst cases less margin, and they
+		// vary widely: RoBERTa-family activation outliers make full int8
+		// markedly worse there (see the README table).
+		int8MinCos    float64
+		int8ActMinCos float64
 	}{
-		{"testdata/golden-all-MiniLM-L12-v2.json", "models/all-MiniLM-L12-v2", "REMBED_MODEL_L12", 1e-4, 0, 1e-5, 0},
-		{"testdata/golden-paraphrase-MiniLM-L3-v2.json", "models/paraphrase-MiniLM-L3-v2", "REMBED_MODEL_L3", 1e-4, 0, 1e-5, 0},
-		{"testdata/golden-gte-small.json", "models/gte-small", "REMBED_MODEL_GTE", 2e-3, 0.9999, 2e-4, 0},
+		{"testdata/golden-all-MiniLM-L12-v2.json", "models/all-MiniLM-L12-v2", "REMBED_MODEL_L12", 1e-4, 0, 1e-5, 0, 0.992},
+		{"testdata/golden-paraphrase-MiniLM-L3-v2.json", "models/paraphrase-MiniLM-L3-v2", "REMBED_MODEL_L3", 1e-4, 0, 1e-5, 0, 0.997},
+		{"testdata/golden-gte-small.json", "models/gte-small", "REMBED_MODEL_GTE", 2e-3, 0.9999, 2e-4, 0, 0.9985},
 		// MPNet exercises the second architecture end to end: offset
 		// positions, no segment table, shared relative-position bias. The
 		// 12-case golden's 324-token case reaches |j−i| ≥ 128, pinning the
@@ -345,18 +418,18 @@ func TestGoldenMatrix(t *testing.T) {
 		// the measured worst case (0.997874, the punctuation text) less
 		// margin — the review caught the docs claiming an optimistic
 		// 0.9989 measured on 2 texts.
-		{"testdata/golden-all-mpnet-base-v2.json", "models/all-mpnet-base-v2", "REMBED_MODEL_MPNET", 1e-4, 0, 1e-5, 0.9978},
+		{"testdata/golden-all-mpnet-base-v2.json", "models/all-mpnet-base-v2", "REMBED_MODEL_MPNET", 1e-4, 0, 1e-5, 0.9978, 0.9905},
 		// RoBERTa exercises the byte-level BPE tokenizer end to end (the
 		// tokenizer-mismatch check above bites hardest here) plus the
 		// fairseq position offset on the plain BERT encoder path. int8
 		// bound is the measured worst case (0.998727, the 326-token text)
 		// less margin.
-		{"testdata/golden-all-distilroberta-v1.json", "models/all-distilroberta-v1", "REMBED_MODEL_ROBERTA", 1e-4, 0, 1e-5, 0.9985},
+		{"testdata/golden-all-distilroberta-v1.json", "models/all-distilroberta-v1", "REMBED_MODEL_ROBERTA", 1e-4, 0, 1e-5, 0.9985, 0.972},
 		// The multilingual model exercises the SentencePiece tokenizer end
 		// to end (normalizer + Viterbi + fairseq ids) on a BERT encoder
 		// with a padded embedding table (250037 rows for 250002 ids).
 		// int8 bound: measured worst 0.999642 (the 402-token text) less margin.
-		{"testdata/golden-paraphrase-multilingual-MiniLM-L12-v2.json", "models/paraphrase-multilingual-MiniLM-L12-v2", "REMBED_MODEL_XLMR", 1e-4, 0, 1e-5, 0.9995},
+		{"testdata/golden-paraphrase-multilingual-MiniLM-L12-v2.json", "models/paraphrase-multilingual-MiniLM-L12-v2", "REMBED_MODEL_XLMR", 1e-4, 0, 1e-5, 0.9995, 0.9975},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {
@@ -415,13 +488,13 @@ func TestGoldenMatrix(t *testing.T) {
 						c.Text, maxd, tc.maxAbs, cos, tc.minCos, mean, tc.maxMean)
 				}
 			}
-			if tc.int8MinCos > 0 {
-				q, err := Load(dir, WithInt8(), WithWorkers(1))
+			checkQuant := func(name string, minCos float64, opts ...Option) {
+				q, err := Load(dir, append(opts, WithWorkers(1))...)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if !q.Quantized() {
-					t.Skip("int8 path not active on this CPU")
+					t.Skipf("%s path not active on this CPU", name)
 				}
 				for _, c := range golden.Cases {
 					v, err := q.Embed(context.Background(), []string{c.Text})
@@ -435,9 +508,21 @@ func TestGoldenMatrix(t *testing.T) {
 						na += g * g
 						nb += w * w
 					}
-					if cos := dot / math.Sqrt(na*nb); cos < tc.int8MinCos {
-						t.Errorf("int8 %.40q: cos=%.6f (>=%.4f)", c.Text, cos, tc.int8MinCos)
+					if cos := dot / math.Sqrt(na*nb); cos < minCos {
+						t.Errorf("%s %.40q: cos=%.6f (>=%.4f)", name, c.Text, cos, minCos)
 					}
+				}
+			}
+			if tc.int8MinCos > 0 {
+				checkQuant("int8", tc.int8MinCos, WithInt8())
+			}
+			if tc.int8ActMinCos > 0 {
+				full, err := Load(dir, WithInt8Activations(), WithWorkers(1))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if full.QuantizedActivations() {
+					checkQuant("int8-full", tc.int8ActMinCos, WithInt8Activations())
 				}
 			}
 		})

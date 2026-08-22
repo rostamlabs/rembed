@@ -53,6 +53,26 @@ Validated end-to-end against each model's own ONNX Runtime reference:
 | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | mean | F32 | 7e-7 | cosine ≥ 0.9995 |
 | thenlper/gte-small | mean | F16 | 2e-3 maxAbs + cosine ≥ 0.9999 + meanAbs ≤ 2e-4 (the repo's ONNX export is fp32 while its safetensors are f16, so maxAbs is dominated by the checkpoint's own rounding; the cosine/mean bounds are what actually constrain rembed) | — |
 
+On CPUs with AVX-VNNI — Intel Alder Lake (2021) onward and Sapphire
+Rapids+ servers, AMD Zen 5+; note that AVX-512-VNNI-only parts like Ice
+Lake-SP and Zen 4 do NOT have it — `WithInt8Activations` selects full
+int8 inference (u8 activations × s8 weights via VPDPBUSD) for a further
+~1.3× over weight-only int8. The accuracy trade is real, PER-MODEL, and
+test-enforced (worst golden cosine, full int8 vs weight-only):
+
+| model | full int8 | weight-only int8 |
+|-------|-----------|------------------|
+| MiniLM-L6 / L12 / L3 | 0.9917 / 0.9932 / 0.9979 | ≥ 0.9990 |
+| mpnet-base | 0.9912 | 0.9979 |
+| multilingual MiniLM | 0.9982 | 0.9996 |
+| gte-small | 0.9991 | 0.9998 |
+| **distilroberta** | **0.9747** | 0.9987 |
+
+RoBERTa-family checkpoints have markedly larger activation outliers, and
+the per-row absmax scheme loses ~3× more precision there — short texts
+degrade most. Full int8 is NOT recommended for RoBERTa-family models;
+prefer `WithInt8` (weight-only) for those.
+
 Expected compatible (same architecture, no ONNX export on the Hub to
 validate against): the e5 family, larger BGE/GTE sizes, and other
 BERT-based sentence-transformers checkpoints. Caveat for retrieval
