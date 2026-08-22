@@ -32,6 +32,24 @@ func Default() MatMulFunc {
 	return MatMulParallel
 }
 
+// DefaultCapped is Default with the fan-out capped at workers goroutines
+// (<= 0 means uncapped). This is what makes rembed.WithWorkers hold on the
+// UNPACKED matmul path too — before it existed, the fallback kernel
+// ignored the cap and WithWorkers(1) still fanned out on non-amd64.
+func DefaultCapped(workers int) MatMulFunc {
+	if workers <= 0 {
+		return Default()
+	}
+	if hasSIMD {
+		return func(dst, a, bT []float32, m, k, n int) {
+			matMulSIMDWorkers(dst, a, bT, m, k, n, workers)
+		}
+	}
+	return func(dst, a, bT []float32, m, k, n int) {
+		matMulParallelWorkers(dst, a, bT, m, k, n, workers)
+	}
+}
+
 // MatMulNaive is the M0 reference body: three plain loops, dot products of
 // contiguous rows.
 func MatMulNaive(dst, a, bT []float32, m, k, n int) {
@@ -214,6 +232,10 @@ const minUnitWork = 1 << 14
 // each element's k-accumulation is untouched, so the result is
 // bit-identical to MatMulBlocked.
 func MatMulParallel(dst, a, bT []float32, m, k, n int) {
+	matMulParallelWorkers(dst, a, bT, m, k, n, runtime.GOMAXPROCS(0))
+}
+
+func matMulParallelWorkers(dst, a, bT []float32, m, k, n, workers int) {
 	if m*n > 0 {
 		_ = dst[m*n-1] // same fail-fast as MatMulBlocked
 	}
@@ -225,7 +247,7 @@ func MatMulParallel(dst, a, bT []float32, m, k, n int) {
 		matMulBlockedCols(dst, a, bT, m, k, n, 0, n)
 		return
 	}
-	ParallelFor(units, func(u int) {
+	ParallelForCap(workers, units, func(u int) {
 		i0 := (u / colBlocks) * blockM
 		i1 := min(i0+blockM, m)
 		jLo := (u % colBlocks) * parallelCols
@@ -294,8 +316,12 @@ func matMulSIMDCols(dst, a, bT []float32, m, k, n, jLo, jHi int) {
 // the Go call site cannot express (&ar[0] on an empty slice panics; the
 // asm itself handles k=0 fine).
 func MatMulSIMD(dst, a, bT []float32, m, k, n int) {
+	matMulSIMDWorkers(dst, a, bT, m, k, n, runtime.GOMAXPROCS(0))
+}
+
+func matMulSIMDWorkers(dst, a, bT []float32, m, k, n, workers int) {
 	if !hasSIMD || k == 0 {
-		MatMulParallel(dst, a, bT, m, k, n)
+		matMulParallelWorkers(dst, a, bT, m, k, n, workers)
 		return
 	}
 	if m*n > 0 {
@@ -315,7 +341,7 @@ func MatMulSIMD(dst, a, bT []float32, m, k, n int) {
 		matMulSIMDCols(dst, a, bT, m, k, n, 0, n)
 		return
 	}
-	ParallelFor(units, func(u int) {
+	ParallelForCap(workers, units, func(u int) {
 		i0 := (u / colBlocks) * blockM
 		i1 := min(i0+blockM, m)
 		jLo := (u % colBlocks) * parallelCols
