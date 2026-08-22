@@ -23,8 +23,8 @@ type PackedB8 struct {
 // PackB8 quantizes and packs a bT ([n×k] row-major) weight matrix.
 // Same preconditions as PackB (SIMD kernel, n%16 == 0).
 func PackB8(bT []float32, k, n int) (*PackedB8, error) {
-	if !hasSIMD {
-		return nil, fmt.Errorf("tensor: PackB8 requires AVX2+FMA")
+	if !hasSIMD8 {
+		return nil, fmt.Errorf("tensor: PackB8 requires a native int8 gemm kernel on this CPU")
 	}
 	if n < 16 || n%16 != 0 {
 		return nil, fmt.Errorf("tensor: PackB8 needs n%%16==0 and n>=16, got n=%d", n)

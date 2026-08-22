@@ -21,7 +21,7 @@ type PackedB struct {
 // intermediate); callers keep the unpacked path for anything else.
 func PackB(bT []float32, k, n int) (*PackedB, error) {
 	if !hasSIMD {
-		return nil, fmt.Errorf("tensor: PackB requires AVX2+FMA (packed layout feeds the SIMD kernel only)")
+		return nil, fmt.Errorf("tensor: PackB requires a native SIMD kernel on this architecture (packed layout feeds it only)")
 	}
 	if n < 16 || n%16 != 0 {
 		return nil, fmt.Errorf("tensor: PackB needs n%%16==0 and n>=16, got n=%d", n)

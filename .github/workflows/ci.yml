@@ -42,6 +42,37 @@ jobs:
       - name: build ${{ matrix.goos }}/${{ matrix.goarch }}
         run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
 
+  arm64-qemu:
+    # The NEON kernels (fp32 gemm, WORD-encoded int8 gemm, dot4) are proven
+    # here, not just cross-compiled: the arm64 test binaries run under
+    # qemu-user emulation, including the kernel sweeps against float64
+    # references. Perf means nothing under qemu; correctness means
+    # everything.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: install qemu-user
+        run: sudo apt-get update -q && sudo apt-get install -y -q qemu-user-static
+      - name: build arm64 test binaries
+        # The root package is deliberately omitted: its golden battery
+        # fetches real model weights over the network, which is painfully
+        # slow under qemu. The full root suite WAS run manually on arm64
+        # under qemu for the R3 PR; these four packages are the standing
+        # per-commit net (they cover every arm64 assembly kernel).
+        run: |
+          mkdir -p /tmp/arm64
+          for pkg in ./internal/tensor ./internal/model ./internal/safetensors ./tokenizer; do
+            GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o /tmp/arm64/$(basename $pkg).test $pkg
+          done
+      - name: run under qemu
+        run: |
+          for t in /tmp/arm64/*.test; do
+            echo "== $t"; qemu-aarch64-static $t
+          done
+
   golden:
     # The full golden validation against committed ONNX-reference outputs,
     # with real weights fetched through rembed's own hub loader (dogfooding
