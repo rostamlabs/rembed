@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""One-time HuggingFace -> rembed model-dir export, plus golden reference.
+
+Downloads a sentence-transformers BERT-family model, assembles the rembed
+model dir {model.safetensors, vocab.txt, manifest.json}, and regenerates
+testdata/golden.json: ONNX Runtime reference embeddings for a fixed input set,
+used by the Go validation harness (every kernel/model change must keep
+matching these within tolerance).
+
+Usage:
+    python convert.py [model_id] [--out DIR] [--golden FILE]
+
+Defaults: model_id=sentence-transformers/all-MiniLM-L6-v2,
+out=models/<basename>, golden=testdata/golden.json (repo-relative).
+"""
+
+import argparse
+import json
+import shutil
+import struct
+from pathlib import Path
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Fixed golden inputs. ASCII-only on purpose: the Go tokenizer does not strip
+# accents (HF's BasicTokenizer does when lowercasing), so accented inputs
+# would fail on tokenization, not numerics. That gap is documented in
+# DESIGN.md; revisit if non-English models are ever in scope.
+GOLDEN_TEXTS = [
+    "hello world",
+    "The quick brown fox jumps over the lazy dog.",
+    "a",
+    "Rostam is a vector database written in Go, with BM25 and semantic caching built in.",
+    "embedding inference engines should be boring, predictable, and fast",
+    "punctuation, splitting: does it (really) work?! yes -- it does...",
+    "supercalifragilisticexpialidocious antidisestablishmentarianism pseudopseudohypoparathyroidism",
+    "In 2024, the model processed 1,234,567 queries at 99.9% availability, "
+    "averaging 3.14 ms per request across 42 regions. "
+    "This sentence exists to push the sequence length up so the golden set "
+    "covers more position embeddings than the short inputs do, including a "
+    "second clause with commas, numbers like 8675309, and ordinary prose "
+    "about nothing in particular that keeps going for a while longer.",
+]
+
+
+def sanity_check_safetensors(path: Path) -> None:
+    """Verify every tensor is F32 (the Go loader supports nothing else)."""
+    with open(path, "rb") as f:
+        (hlen,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(hlen))
+    bad = {
+        name: entry["dtype"]
+        for name, entry in header.items()
+        if name != "__metadata__"
+        and entry["dtype"] != "F32"
+        # position_ids is a saved buffer (0..maxPos), not a weight; the Go
+        # loader skips non-F32 tensors so it is harmless.
+        and not name.endswith("position_ids")
+    }
+    if bad:
+        raise SystemExit(f"{path}: non-F32 tensors (unsupported by the Go loader): {bad}")
+
+
+def mean_pool_normalize(last_hidden: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """[seq, H] token embeddings + [seq] attention mask -> normalized [H]."""
+    m = mask.astype(np.float32)[:, None]
+    pooled = (last_hidden * m).sum(axis=0) / np.maximum(m.sum(), 1e-9)
+    return pooled / np.linalg.norm(pooled)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("model_id", nargs="?", default="sentence-transformers/all-MiniLM-L6-v2")
+    ap.add_argument("--out", type=Path, default=None, help="model dir to write")
+    ap.add_argument("--golden", type=Path, default=REPO_ROOT / "testdata" / "golden.json")
+    args = ap.parse_args()
+
+    from huggingface_hub import hf_hub_download
+    import onnxruntime as ort
+    from transformers import AutoTokenizer
+
+    out = args.out or Path(__file__).resolve().parent / args.model_id.split("/")[-1]
+    out.mkdir(parents=True, exist_ok=True)
+
+    def fetch(filename: str) -> Path:
+        return Path(hf_hub_download(args.model_id, filename))
+
+    # --- model dir ---------------------------------------------------------
+    st = fetch("model.safetensors")
+    sanity_check_safetensors(st)
+    shutil.copyfile(st, out / "model.safetensors")
+    shutil.copyfile(fetch("vocab.txt"), out / "vocab.txt")
+
+    config = json.loads(fetch("config.json").read_text())
+    tok_config = json.loads(fetch("tokenizer_config.json").read_text())
+    pooling = json.loads(fetch("1_Pooling/config.json").read_text())
+    modules = json.loads(fetch("modules.json").read_text())
+
+    if config.get("model_type") != "bert":
+        raise SystemExit(f"model_type={config.get('model_type')!r}: only BERT-family models are supported")
+    if not pooling.get("pooling_mode_mean_tokens"):
+        raise SystemExit(f"unsupported pooling config (v1 supports mean): {pooling}")
+    normalize = any("Normalize" in m.get("type", "") for m in modules)
+
+    manifest = {
+        "name": args.model_id,
+        "hidden_size": config["hidden_size"],
+        "num_hidden_layers": config["num_hidden_layers"],
+        "num_attention_heads": config["num_attention_heads"],
+        "intermediate_size": config["intermediate_size"],
+        "vocab_size": config["vocab_size"],
+        "max_position_embeddings": config["max_position_embeddings"],
+        "layer_norm_eps": config.get("layer_norm_eps", 1e-12),
+        "do_lower_case": bool(tok_config.get("do_lower_case", True)),
+        "cls_token": tok_config.get("cls_token", "[CLS]"),
+        "sep_token": tok_config.get("sep_token", "[SEP]"),
+        "unk_token": tok_config.get("unk_token", "[UNK]"),
+        "pooling": "mean",
+        "normalize": normalize,
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"wrote {out}/[model.safetensors vocab.txt manifest.json]")
+
+    # --- golden reference (ONNX Runtime, per-text, no padding) -------------
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    sess = ort.InferenceSession(fetch("onnx/model.onnx"), providers=["CPUExecutionProvider"])
+    input_names = {i.name for i in sess.get_inputs()}
+
+    golden = []
+    for text in GOLDEN_TEXTS:
+        enc = tokenizer(text, truncation=True, max_length=manifest["max_position_embeddings"])
+        ids = np.array([enc["input_ids"]], dtype=np.int64)
+        mask = np.array([enc["attention_mask"]], dtype=np.int64)
+        feeds = {"input_ids": ids, "attention_mask": mask}
+        if "token_type_ids" in input_names:
+            feeds["token_type_ids"] = np.zeros_like(ids)
+        (last_hidden,) = sess.run(["last_hidden_state"], feeds)
+        emb = mean_pool_normalize(last_hidden[0], mask[0])
+        golden.append(
+            {
+                "text": text,
+                "input_ids": enc["input_ids"],
+                "embedding": [float(f"{v:.8g}") for v in emb],
+            }
+        )
+
+    args.golden.parent.mkdir(parents=True, exist_ok=True)
+    args.golden.write_text(
+        json.dumps({"model": args.model_id, "cases": golden}, indent=1) + "\n"
+    )
+    print(f"wrote {args.golden} ({len(golden)} cases, dim {len(golden[0]['embedding'])})")
+
+
+if __name__ == "__main__":
+    main()
