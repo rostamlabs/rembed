@@ -312,7 +312,7 @@ func matMulSIMDCols(dst, a, bT []float32, m, k, n, jLo, jHi int) {
 				// would bounds-check only the first — on a pooled buffer
 				// (cap > len) the other three could corrupt silently.
 				d := dst[i*n+j : i*n+j+4]
-				dot4AVX2(&d[0], &ar[0], &b0[0], &b1[0], &b2[0], &b3[0], k)
+				dot4(&d[0], &ar[0], &b0[0], &b1[0], &b2[0], &b3[0], k)
 			}
 		}
 		for ; j < jHi; j++ { // remainder columns of this range (scalar)

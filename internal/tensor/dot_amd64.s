@@ -3,14 +3,14 @@
 
 #include "textflag.h"
 
-// func dot4AVX2(dst, a, b0, b1, b2, b3 *float32, k int)
+// func dot4(dst, a, b0, b1, b2, b3 *float32, k int)
 //
 // dst[0..3] = dot(a, b0..b3) over k floats, using 8-lane FMA accumulators.
 // The four dots share every load of a, so the inner loop is 1 load + 4
 // memory-operand FMAs per 8 floats. Lane sums are reduced horizontally at
 // the end, so the accumulation order differs from the scalar kernels: the
 // result is within fp32 rounding of them, not bit-identical.
-TEXT ·dot4AVX2(SB), NOSPLIT, $0-56
+TEXT ·dot4(SB), NOSPLIT, $0-56
 	MOVQ dst+0(FP), DI
 	MOVQ a+8(FP), SI
 	MOVQ b0+16(FP), R8

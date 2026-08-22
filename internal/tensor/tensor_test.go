@@ -85,6 +85,11 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	for _, sh := range shapes {
 		m, k, n := sh[0], sh[1], sh[2]
+		// fp32 accumulation error grows with k and |value| — and on arm64
+		// the compiler fuses mul+add even in the "naive" kernel, shifting
+		// accumulation slightly — so tolerances scale with √k like the
+		// packed sweep's.
+		tolF := max(1e-5, 1e-6*math.Sqrt(float64(k)))
 		a := make([]float32, m*k)
 		bT := make([]float32, n*k)
 		for i := range a {
@@ -108,10 +113,8 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 			got := make([]float32, m*n)
 			kern.fn(got, a, bT, m, k, n)
 			results[name] = got
-			// fp32 accumulation error grows with k and |value|, so the
-			// tolerance is relative: 1e-5 · (1 + |want|).
 			for i := range want {
-				if d := math.Abs(float64(got[i] - want[i])); d > 1e-5*(1+math.Abs(float64(want[i]))) {
+				if d := math.Abs(float64(got[i] - want[i])); d > tolF*(1+math.Abs(float64(want[i]))) {
 					t.Fatalf("%s %dx%dx%d: [%d]=%v want %v (diff %g)", name, m, k, n, i, got[i], want[i], d)
 				}
 			}
@@ -125,10 +128,12 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 		for name, got := range results {
 			ref := results["naive"]
 			// Reordered-accumulation kernels (SIMD lanes) legitimately
-			// differ from naive by more than exact ones can.
+			// differ from naive by more than exact ones can — and the gap
+			// grows with √k (on arm64 the naive reference itself is
+			// FMA-fused, widening it further).
 			tol := 1e-6
 			if !kernels[name].exact {
-				tol = 1e-5
+				tol = tolF
 			}
 			for i := range ref {
 				if bitwise && kernels[name].exact && got[i] != ref[i] {

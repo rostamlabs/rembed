@@ -259,3 +259,28 @@ magnitude gets settled; on this machine, rembed int8's best sessions
 all day (best 1.31 ms).
 
 Ladder complete: ~45× → ~25× → 9.6× → 3.3× → 1.05× → **0.89×**.
+
+## R3 — ARM64 NEON kernels (2026-08-22)
+
+All three kernels ported: gemm4x16 (pure supported mnemonics — one
+64-byte B load + 4 lane dups + 16 FMLAs per k step), gemm4x16i8 (the Go
+assembler has no SXTL/SCVTF vector mnemonics, so the int8 widening
+pipeline is WORD-encoded, documented instruction by instruction), and
+dot4 (vector accumulate + frame-spill reduction). arm64 is now a
+first-class kernel target: PackB/PackB8 engage, int8 works, the batch
+path's worker budget holds.
+
+Verified the only honest way available without ARM hardware: the ENTIRE
+test suite — kernel sweeps against float64 references, the quantizer, and
+the full golden suite (fp32 1e-4 vs ONNX, int8 bounds, CLS, the 5-model
+matrix, batch bit-identity, token-level outputs) — passes on arm64 under
+qemu-aarch64, locally and in a new CI job. Two war stories the sweeps
+caught in minutes: scalar Fn ALIASES Vn.S[0] on arm64, so dot4's
+reduction temporaries were silently clobbering un-reduced accumulator
+lanes (temps moved to dead registers, hazard documented in the file); and
+the WORD-encoded int8 widening passed its dequantized-weights reference
+sweep on the first run — the encodings are right.
+
+NO performance claims: qemu measures nothing. Real-ARM benchmarks (Apple
+Silicon / Graviton) are the follow-up; the structural expectation is
+ORT-competitive by the same weights-packed-at-load argument as amd64.

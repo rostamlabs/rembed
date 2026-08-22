@@ -8,13 +8,13 @@ import (
 	"testing"
 )
 
-// TestDot4AVX2 is the load-bearing test for the hand-written assembly: an
+// TestDot4 is the load-bearing test for the hand-written assembly (AVX2 and NEON): an
 // asserted sweep over every k in [1, 40] — covering zero, one, and many
 // vector iterations combined with every scalar-tail length 0..7 — using
 // index- and lane-dependent random values, so a wrong-lane reduction, a
 // dropped tail element, or a wrong intra-row offset cannot cancel out.
 // Guard slots around dst catch out-of-bounds writes.
-func TestDot4AVX2(t *testing.T) {
+func TestDot4(t *testing.T) {
 	if !hasSIMD {
 		t.Skip("no AVX2+FMA on this CPU")
 	}
@@ -41,7 +41,7 @@ func TestDot4AVX2(t *testing.T) {
 		// lands on a sentinel.
 		buf := []float32{-999, -999, 0, 0, 0, 0, -999, -999}
 		dst := buf[2:6]
-		dot4AVX2(&dst[0], &a[0], &bs[0][0], &bs[1][0], &bs[2][0], &bs[3][0], k)
+		dot4(&dst[0], &a[0], &bs[0][0], &bs[1][0], &bs[2][0], &bs[3][0], k)
 		for c := range want {
 			if d := math.Abs(float64(dst[c]) - want[c]); d > 1e-5*(1+math.Abs(want[c])) {
 				t.Fatalf("k=%d lane %d: got %v want %v (diff %g)", k, c, dst[c], want[c], d)
