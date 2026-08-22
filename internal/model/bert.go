@@ -46,7 +46,6 @@ type layer struct {
 // and per-call scratch comes from an internal pool.
 type Model struct {
 	cfg     Config
-	matmul  tensor.MatMulFunc
 	workers int // fan-out cap per Forward; 0 = GOMAXPROCS
 
 	wordEmb []float32 // [vocab×H]
@@ -68,6 +67,9 @@ type Model struct {
 // ~25 MB (the per-head scores panel dominates), and sync.Pool retains up to
 // one scratch PER P until GC drains it — worst case ~25 MB × GOMAXPROCS
 // (~500 MB on a 20-core box) after a burst of concurrent max-length embeds.
+// A single batched Embed call can inflate up to min(GOMAXPROCS, workers)
+// scratches at once (the across-texts fan-out), so the ×P worst case no
+// longer requires the CALLER to be concurrent.
 // That is a deliberate trade (reuse over footprint); if it ever bites,
 // scores is the buffer to shrink (a worker-slot ParallelFor variant would
 // cut it from heads·seq² to min(heads, workers)·seq²).
@@ -139,7 +141,10 @@ func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch
 	} else if w.packed != nil {
 		tensor.MatMulPacked(dst, x, w.packed, seq, s.aPack[:tensor.PackAPad(seq)*w.in], s.pool)
 	} else {
-		m.matmul(dst, x, w.raw, seq, w.in, w.out)
+		// The unpacked fallback must honor THIS call's cap too (the review
+		// caught the batch path nesting GOMAXPROCS-wide matmul fan-outs
+		// inside the across-texts fan-out on non-packed targets).
+		tensor.MatMulWorkers(dst, x, w.raw, seq, w.in, w.out, s.fanout)
 	}
 	tensor.AddBias(dst, w.bias, seq, w.out)
 }
@@ -181,7 +186,7 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 	if cfg.NumAttentionHeads <= 0 || H%cfg.NumAttentionHeads != 0 {
 		return nil, fmt.Errorf("weights %s: hidden_size %d not divisible by num_attention_heads %d", weightsPath, H, cfg.NumAttentionHeads)
 	}
-	m := &Model{cfg: cfg, matmul: tensor.DefaultCapped(workers), workers: workers}
+	m := &Model{cfg: cfg, workers: workers}
 	m.scratchPool.New = func() any { return new(scratch) }
 
 	type load struct {
@@ -266,6 +271,9 @@ func Load(weightsPath string, cfg Config, quantize bool, workers int) (*Model, e
 // Config returns the manifest the model was loaded with.
 func (m *Model) Config() Config { return m.cfg }
 
+// Workers returns the configured fan-out cap (0 = GOMAXPROCS).
+func (m *Model) Workers() int { return m.workers }
+
 // Quantized reports whether EVERY dense weight actually took the int8
 // path. Quantization can silently fall back per-matrix (no AVX2, or an
 // out-dim not divisible by 16) — callers who requested int8 can check the
@@ -286,6 +294,82 @@ func (m *Model) Quantized() bool {
 // len(ids) long, so the attention mask is implicit all-ones) and returns the
 // pooled sentence vector of length HiddenSize.
 func (m *Model) Forward(ids []int64) ([]float32, error) {
+	return m.ForwardWorkers(ids, m.workers)
+}
+
+// ForwardWorkers is Forward with an explicit per-call worker cap,
+// overriding the model default. workers=1 is fully serial — the batched
+// Embed path runs one serial forward per text so the parallelism lives
+// ACROSS texts with zero fan-out coordination inside each.
+func (m *Model) ForwardWorkers(ids []int64, workers int) ([]float32, error) {
+	s, err := m.encodeWorkers(ids, workers)
+	if err != nil {
+		return nil, err
+	}
+	defer m.scratchPool.Put(s)
+	seq, H := len(ids), m.cfg.HiddenSize
+	x := s.x
+
+	// Pooling (no padding ⇒ every position counts), then optional L2
+	// normalization. cls takes the first token's hidden state (BGE-style
+	// models); mean averages all positions (sentence-transformers style).
+	pooled := make([]float32, H)
+	if m.cfg.Pooling == "cls" {
+		copy(pooled, x[:H])
+	} else {
+		for i := range seq {
+			row := x[i*H : i*H+H]
+			for j := range pooled {
+				pooled[j] += row[j]
+			}
+		}
+		inv := 1 / float32(seq)
+		for j := range pooled {
+			pooled[j] *= inv
+		}
+	}
+	if m.cfg.Normalize {
+		tensor.L2Normalize(pooled)
+	}
+	return pooled, nil
+}
+
+// ForwardTokens returns the final-layer hidden state for every token —
+// ONNX Runtime's last_hidden_state — as a fresh [seq][H] matrix. No
+// pooling and no normalization are applied: this is the raw material for
+// rerankers, late-interaction retrieval, and custom pooling.
+func (m *Model) ForwardTokens(ids []int64) ([][]float32, error) {
+	return m.ForwardTokensWorkers(ids, m.workers)
+}
+
+// ForwardTokensWorkers is ForwardTokens with an explicit per-call worker
+// cap (the batch path spreads texts across workers).
+func (m *Model) ForwardTokensWorkers(ids []int64, workers int) ([][]float32, error) {
+	s, err := m.encodeWorkers(ids, workers)
+	if err != nil {
+		return nil, err
+	}
+	defer m.scratchPool.Put(s)
+	seq, H := len(ids), m.cfg.HiddenSize
+	out := make([][]float32, seq)
+	flat := make([]float32, seq*H)
+	copy(flat, s.x[:seq*H])
+	for i := range out {
+		// Three-index slice: without the cap clamp, append on row i would
+		// silently overwrite row i+1 (rows share one backing array).
+		out[i] = flat[i*H : (i+1)*H : (i+1)*H]
+	}
+	return out, nil
+}
+
+// encode runs the transformer stack, leaving the final hidden states in
+// the returned scratch's x[:seq*H]. The CALLER returns the scratch to the
+// pool once done reading.
+func (m *Model) encode(ids []int64) (*scratch, error) {
+	return m.encodeWorkers(ids, m.workers)
+}
+
+func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	seq := len(ids)
 	if seq == 0 {
 		return nil, fmt.Errorf("empty token sequence")
@@ -300,7 +384,17 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 	eps := m.cfg.LayerNormEps
 
 	s := m.scratchPool.Get().(*scratch)
-	defer m.scratchPool.Put(s)
+	// encode does NOT return s to the pool on success — the caller reads
+	// s.x after this returns and is responsible for scratchPool.Put. On
+	// error OR panic this deferred reclaim runs; it is registered BEFORE
+	// the pool's Stop defer, so LIFO order guarantees the spin pool is
+	// stopped before the scratch is published back to the pool.
+	committed := false
+	defer func() {
+		if !committed {
+			m.scratchPool.Put(s)
+		}
+	}()
 	s.resize(seq, H, I, dh)
 	// The fan-out workers live in a spinning pool for the duration of this
 	// call — spawned once, never parked between the ~36 fan-outs — because
@@ -309,8 +403,8 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 	// every seq (the earlier seq-scaled cap was compensating for wake
 	// latency, not for parallelism itself).
 	s.fanout = runtime.GOMAXPROCS(0)
-	if m.workers > 0 {
-		s.fanout = min(s.fanout, m.workers)
+	if workers > 0 {
+		s.fanout = min(s.fanout, workers)
 	}
 	s.pool = tensor.NewPool(s.fanout - 1)
 	defer s.pool.Stop()
@@ -404,26 +498,6 @@ func (m *Model) Forward(ids []int64) ([]float32, error) {
 		tensor.LayerNorm(x, l.outLNg, l.outLNb, seq, H, eps)
 	}
 
-	// Pooling (no padding ⇒ every position counts), then optional L2
-	// normalization. cls takes the first token's hidden state (BGE-style
-	// models); mean averages all positions (sentence-transformers style).
-	pooled := make([]float32, H)
-	if m.cfg.Pooling == "cls" {
-		copy(pooled, x[:H])
-	} else {
-		for i := range seq {
-			row := x[i*H : i*H+H]
-			for j := range pooled {
-				pooled[j] += row[j]
-			}
-		}
-		inv := 1 / float32(seq)
-		for j := range pooled {
-			pooled[j] *= inv
-		}
-	}
-	if m.cfg.Normalize {
-		tensor.L2Normalize(pooled)
-	}
-	return pooled, nil
+	committed = true
+	return s, nil
 }

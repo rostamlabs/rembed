@@ -64,5 +64,5 @@ jobs:
         run: |
           export REMBED_MODEL_DIR=~/.cache/rembed/sentence-transformers--all-MiniLM-L6-v2
           export REMBED_MODEL_BGE=~/.cache/rembed/BAAI--bge-small-en-v1.5
-          go test -v -run "Golden|SteadyState|Concurrent|WithWorkers" . 2>&1 | tail -30
-          go test -run "Golden|SteadyState|Concurrent|WithWorkers" .
+          go test -v -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" . 2>&1 | tail -30
+          go test -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" .
