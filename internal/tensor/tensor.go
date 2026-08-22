@@ -163,8 +163,12 @@ func ParallelFor(units int, fn func(u int)) {
 	}
 }
 
-// parallelCols is the column-block width of one parallel unit
-// (blockN-aligned); rows partition by blockM, giving a 2-D unit grid.
+// parallelCols is the column-block width of one parallel unit; rows
+// partition by blockM, giving a 2-D unit grid. It MUST stay a multiple of
+// blockN: that is what guarantees a 4-wide micro-kernel store can never
+// straddle a unit's column boundary, which is the disjointness argument for
+// the parallel path's safety (-race does not instrument assembly stores, so
+// this invariant — not the race detector — is the evidence).
 const parallelCols = 64
 
 // minUnitWork is the per-unit size (multiply-adds) below which a unit is
@@ -219,7 +223,12 @@ func matMulSIMDCols(dst, a, bT []float32, m, k, n, jLo, jHi int) {
 			b3 := bT[(j+3)*k : (j+3)*k+k]
 			for i := i0; i < i1; i++ {
 				ar := a[i*k : i*k+k]
-				dot4AVX2(&dst[i*n+j], &ar[0], &b0[0], &b1[0], &b2[0], &b3[0], k)
+				// The 4-wide reslice restores MatMulBlocked's fail-fast
+				// contract: the asm writes 4 floats, and &dst[i*n+j] alone
+				// would bounds-check only the first — on a pooled buffer
+				// (cap > len) the other three could corrupt silently.
+				d := dst[i*n+j : i*n+j+4]
+				dot4AVX2(&d[0], &ar[0], &b0[0], &b1[0], &b2[0], &b3[0], k)
 			}
 		}
 		for ; j < jHi; j++ { // remainder columns of this range (scalar)
@@ -238,8 +247,9 @@ func matMulSIMDCols(dst, a, bT []float32, m, k, n, jLo, jHi int) {
 
 // MatMulSIMD is the M3 body: the AVX2+FMA dot kernel under the same 2-D
 // output partition and per-unit gate as MatMulParallel. Falls back to the
-// scalar parallel body when the CPU lacks AVX2/FMA (or k is 0, which the
-// asm loop structure has no reason to special-case).
+// scalar parallel body when the CPU lacks AVX2/FMA — or when k is 0, which
+// the Go call site cannot express (&ar[0] on an empty slice panics; the
+// asm itself handles k=0 fine).
 func MatMulSIMD(dst, a, bT []float32, m, k, n int) {
 	if !hasSIMD || k == 0 {
 		MatMulParallel(dst, a, bT, m, k, n)

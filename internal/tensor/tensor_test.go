@@ -80,6 +80,7 @@ func TestMatMulAgainstFloat64Reference(t *testing.T) {
 		{blockM, 384, 129},
 		{blockM + 6, 400, 191},
 		{2, 384, 384}, // tiny m through the parallel path (per-unit gate)
+		{5, 20, 9},    // SIMD path with k%8=4: vector loop + a multi-element scalar tail
 	}
 	rng := rand.New(rand.NewSource(42))
 	for _, sh := range shapes {
