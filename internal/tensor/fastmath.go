@@ -54,6 +54,11 @@ func expf32(x float32) float32 {
 	return y * math.Float32frombits(uint32(n+127)<<23)
 }
 
+// ExpNeg is expNonPos exported for callers outside this package (the
+// flash-attention online softmax): e^x for x <= 0, with exp(<-87.33)
+// clamped to exp(-87.33). Same accuracy note as expNonPos.
+func ExpNeg(x float32) float32 { return expNonPos(x) }
+
 func sign05(x float32) float32 {
 	if x < 0 {
 		return -0.5

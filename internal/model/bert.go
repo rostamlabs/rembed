@@ -179,15 +179,21 @@ type scratch struct {
 	cosL, sinL []float32 // [seq×dh/2] local-theta RoPE table
 
 	// Qwen3-only buffers. q/k/v are the separate (non-fused) projections;
-	// kHead/vHeadT are the per-kv-head normed+RoPE'd K and Vᵀ (computed once
-	// and shared across a GQA group); qHead/cHead are per-q-head scratch;
-	// swUp holds the SwiGLU up-projection.
-	qwQ, qwK, qwV     []float32 // [mPad×qDim], [mPad×kvDim], [mPad×kvDim]
-	qwKHead, qwVHeadT []float32 // [nkv×seq×dh], [nkv×dh×seq]
-	qwQHead, qwCHead  []float32 // [nq×seq×dh]
-	qwScores          []float32 // [nq×seq×seq]
-	qwCtx             []float32 // [seq×qDim]
-	qwUp              []float32 // [mPad×I]
+	// kHead/vHead are the per-kv-head normed+RoPE'd K and V, both row-major
+	// (key-contiguous), computed once and shared across a GQA group;
+	// qHead/cHead are per-q-head scratch; qwUp holds the SwiGLU
+	// up-projection.
+	qwQ, qwK, qwV    []float32 // [mPad×qDim], [mPad×kvDim], [mPad×kvDim]
+	qwKHead, qwVHead []float32 // [nkv×seq×dh] row-major (K and V, both key-contiguous)
+	qwQHead, qwCHead []float32 // [nq×seq×dh]
+	qwCtx            []float32 // [seq×qDim]
+	qwUp             []float32 // [mPad×I]
+	// Flash-attention per-head scratch (disjoint per concurrent head worker):
+	// one S block, the running softmax max/denom, and the output accumulator.
+	qwSblk []float32 // [nq×flashBlk×flashBlk]
+	qwAcc  []float32 // [nq×flashBlk×dh]
+	qwM    []float32 // [nq×flashBlk]
+	qwL    []float32 // [nq×flashBlk]
 }
 
 // grow reslices buf to n floats, reallocating only when capacity is short.
