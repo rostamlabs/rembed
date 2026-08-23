@@ -109,12 +109,17 @@ func DeriveConfig(dir, name string) (Config, error) {
 		}
 	case "qwen3":
 		// A causal decoder used as an embedder. SwiGLU uses SiLU (not the
-		// GELU the encoders use). Refuse the two things that would silently
-		// change the geometry: a rope scaling (YaRN — this checkpoint ships
-		// none) and any sliding-window attention (Qwen3-Embedding is full
-		// causal). Biases are already disabled (attention_bias false).
+		// GELU the encoders use). Refuse anything that would silently change
+		// the geometry: a rope scaling (YaRN — this checkpoint ships none),
+		// any sliding-window attention (Qwen3-Embedding is full causal), and
+		// attention_bias (the qwen3 loader allocates no bias tensors, so a
+		// biased checkpoint would drop them silently — QK-norm replaced the
+		// Qwen2 QKV bias, so real Qwen3 has none).
 		if hf.HiddenAct != "" && hf.HiddenAct != "silu" {
 			return c, fmt.Errorf("model dir %s: hidden_act=%q — qwen3 supports only silu (SwiGLU)", dir, hf.HiddenAct)
+		}
+		if hf.AttentionBias {
+			return c, fmt.Errorf("model dir %s: qwen3 with attention_bias is not supported (rembed's qwen3 path is bias-free)", dir)
 		}
 		if len(hf.RopeScaling) > 0 && string(hf.RopeScaling) != "null" {
 			return c, fmt.Errorf("model dir %s: qwen3 rope_scaling=%s is not supported (only default RoPE)", dir, hf.RopeScaling)

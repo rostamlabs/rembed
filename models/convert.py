@@ -192,6 +192,8 @@ def main() -> None:
         # rembed's path does not implement.
         if config.get("hidden_act", "silu") != "silu":
             raise SystemExit(f"hidden_act={config.get('hidden_act')!r}: qwen3 supports only silu")
+        if config.get("attention_bias"):
+            raise SystemExit("qwen3 with attention_bias is not supported (rembed's qwen3 path is bias-free)")
         if config.get("rope_scaling"):
             raise SystemExit(f"qwen3 rope_scaling={config.get('rope_scaling')!r} is not supported")
         if config.get("use_sliding_window") or config.get("sliding_window"):
