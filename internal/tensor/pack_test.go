@@ -159,17 +159,10 @@ func TestPackedPanelWidthsAgree(t *testing.T) {
 		if wide.panelW != 32 {
 			t.Fatalf("expected 32-wide panels on AVX-512 hardware, got %d", wide.panelW)
 		}
-		// Rebuild a 16-wide pack of the same weights by hand.
+		// 16-wide pack via the REAL packer (shared helper), so this test
+		// cannot drift from PackB's layout.
 		narrow := &PackedB{K: k, N: n, panelW: 16, data: make([]float32, k*n)}
-		for jp := range n / 16 {
-			panel := narrow.data[jp*k*16:]
-			for c := range 16 {
-				col := bT[(jp*16+c)*k:]
-				for pp := range k {
-					panel[pp*16+c] = col[pp]
-				}
-			}
-		}
+		packBInto(narrow.data, bT, k, n, 16)
 		mPad := PackAPad(m)
 		aPack := make([]float32, mPad*k)
 		got := make([]float32, mPad*n)

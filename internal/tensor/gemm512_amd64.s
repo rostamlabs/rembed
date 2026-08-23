@@ -27,14 +27,18 @@ TEXT ·gemm4x32(SB), NOSPLIT, $0-40
 	MOVQ k+32(FP), CX
 	SHLQ $2, DX // row stride in bytes
 
-	VXORPS Z0, Z0, Z0 // row 0, cols 0-15
-	VXORPS Z1, Z1, Z1 // row 0, cols 16-31
-	VXORPS Z2, Z2, Z2 // row 1
-	VXORPS Z3, Z3, Z3
-	VXORPS Z4, Z4, Z4 // row 2
-	VXORPS Z5, Z5, Z5
-	VXORPS Z6, Z6, Z6 // row 3
-	VXORPS Z7, Z7, Z7
+	// VPXORQ, not VXORPS: the EVEX.512 form of VXORPS is AVX512DQ, and
+	// the gate only promises AVX512F (KNL-class parts and hypervisor
+	// feature-masking expose F without DQ — the review caught the
+	// mismatch). The integer XOR is plain F and zeroes bits identically.
+	VPXORQ Z0, Z0, Z0 // row 0, cols 0-15
+	VPXORQ Z1, Z1, Z1 // row 0, cols 16-31
+	VPXORQ Z2, Z2, Z2 // row 1
+	VPXORQ Z3, Z3, Z3
+	VPXORQ Z4, Z4, Z4 // row 2
+	VPXORQ Z5, Z5, Z5
+	VPXORQ Z6, Z6, Z6 // row 3
+	VPXORQ Z7, Z7, Z7
 
 loop:
 	VMOVUPS      (BX), Z8

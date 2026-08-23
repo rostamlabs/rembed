@@ -500,10 +500,24 @@ iterations × 3 repeats, ymm vs zmm on identical packed data):
 Exactly what the kernel header predicts for Zen 4: 512-bit FMAs are
 double-pumped through 256-bit ports there, so peak FLOPs are unchanged
 and the win is front-end relief — half the instructions per k step —
-worth 5-10% on large shapes and nothing on small ones. End-to-end that
-is ~6% on mpnet, below this VM's noise floor, and the ORT fp32 rematch
+worth 5-10% on large shapes and nothing on small ones. The end-to-end
+PROJECTION from that is ~6% on mpnet — too small to resolve on this VM,
+whose round-to-round drift exceeds it, and the ORT fp32 rematch
 accordingly showed no movement (1.14×/1.18×, first round flagged). The
 2× peak-FLOPs story belongs to Intel server parts with two native
 512-bit FMA units (Sapphire Rapids+), where this same kernel is the
 enabler — hardware to measure that is the open item. Never slower,
 bit-identical, kept.
+
+Review addendum, applied before merge: (a) the accumulator zeroing was
+VXORPS on zmm — an AVX512DQ instruction behind an AVX512F-only gate, a
+latent SIGILL on F-without-DQ parts (KNL, hypervisor feature masks);
+now VPXORQ, pure F. (b) The parallel column chunk was counted in
+PANELS, so 32-wide panels silently halved the unit count — the review
+measured 18-26% lost on n=768 shapes of a many-core box via a ymm
+proxy. The chunk is now fixed in COLUMNS (64), width-neutral; with the
+fix the box re-measured the A/B under an 11-worker PARALLEL pool and
+the zmm win survives intact there: ffn2 28×3072×768 380→348 µs (~9%),
+long-seq ffn1 160×768×3072 740→662 µs (~11%), stable across repeats.
+This is exactly the class of interaction the serial-pool A/B was blind
+to, and the review caught it before it shipped.
