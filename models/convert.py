@@ -151,9 +151,25 @@ def main() -> None:
         return Path(hf_hub_download(args.model_id, filename))
 
     # --- model dir ---------------------------------------------------------
-    st = fetch("model.safetensors")
-    sanity_check_safetensors(st)
-    shutil.copyfile(st, out / "model.safetensors")
+    # A single model.safetensors is the common case; large checkpoints
+    # (Qwen3-4B/8B) ship a sharded set named by model.safetensors.index.json.
+    from huggingface_hub.errors import EntryNotFoundError as _ENF
+    try:
+        st = fetch("model.safetensors")
+        sanity_check_safetensors(st)
+        shutil.copyfile(st, out / "model.safetensors")
+    except _ENF:
+        idxp = fetch("model.safetensors.index.json")
+        shutil.copyfile(idxp, out / "model.safetensors.index.json")
+        weight_map = json.loads(idxp.read_text())["weight_map"]
+        for shard in sorted(set(weight_map.values())):
+            # The index is downloaded/untrusted: a shard name is joined into
+            # output paths, so reject anything that is not a plain filename.
+            if shard in ("", ".", "..") or "/" in shard or "\\" in shard:
+                raise SystemExit(f"unsafe shard name in index: {shard!r}")
+            sp = fetch(shard)
+            sanity_check_safetensors(sp)
+            shutil.copyfile(sp, out / shard)
 
     config = json.loads(fetch("config.json").read_text())
     # The sentencepiece.bpe.model FILE is the authority — tokenizer_class
@@ -328,8 +344,11 @@ def main() -> None:
     if model_type in ("modernbert", "qwen3"):
         import torch
         from transformers import AutoModel
+        # low_cpu_mem_usage avoids the ~2× load-time spike (materializing
+        # then copying) — essential for the 4B reference on a small box.
         torch_model = AutoModel.from_pretrained(
-            args.model_id, attn_implementation="eager", torch_dtype=torch.float32).eval()
+            args.model_id, attn_implementation="eager", torch_dtype=torch.float32,
+            low_cpu_mem_usage=True).eval()
 
         def run_last_hidden(ids, mask):
             with torch.no_grad():

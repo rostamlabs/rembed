@@ -51,6 +51,7 @@ type loadOptions struct {
 	int8    bool
 	int8act bool
 	workers int
+	diskWts bool
 }
 
 // WithInt8 selects weight-only int8 inference: transformer dense weights
@@ -74,6 +75,19 @@ func WithInt8() Option {
 // QuantizedActivations() when the mode matters. Implies WithInt8.
 func WithInt8Activations() Option {
 	return func(o *loadOptions) { o.int8, o.int8act = true, true }
+}
+
+// WithDiskWeights memory-maps the model's weights from a pack file on disk
+// instead of loading them into RAM: the OS pages weights in on access and
+// evicts them under memory pressure, so a model larger than RAM runs
+// (disk-bandwidth-bound, but it runs) and resident memory tracks the working
+// set. On first use the safetensors are packed to <dir>/weights.rembedpack
+// (streamed one tensor at a time, so the pack step also fits a small box);
+// later loads mmap it directly. Currently supported for qwen3 (the decoder
+// embedder whose 4B/8B sizes motivate it). The Embedder MUST be Closed to
+// unmap. Numerics are unchanged — only where the bytes live changes.
+func WithDiskWeights() Option {
+	return func(o *loadOptions) { o.diskWts = true }
 }
 
 // WithWorkers caps the number of CPU workers one Embed call uses.
@@ -203,12 +217,27 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 	case o.int8:
 		quant = model.QuantWeights
 	}
-	m, err := model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, quant, o.workers)
+	var m *model.Model
+	if o.diskWts {
+		// mmap the weights from a pack file (built on first use). int8 is
+		// not combined with disk-backed weights yet — the pack stores f32.
+		if o.int8 || o.int8act {
+			return nil, fmt.Errorf("rembed: WithDiskWeights cannot be combined with int8 modes yet")
+		}
+		m, err = model.LoadDisk(modelDir, cfg, o.workers)
+	} else {
+		m, err = model.Load(filepath.Join(modelDir, "model.safetensors"), cfg, quant, o.workers)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
 	return &Embedder{cfg: cfg, tok: tok, m: m}, nil
 }
+
+// Close releases resources held by the Embedder — the memory-mapped weights
+// file when loaded WithDiskWeights. It is a safe no-op for RAM-loaded models.
+// After Close, the Embedder must not be used.
+func (e *Embedder) Close() error { return e.m.Close() }
 
 // Embed returns one embedding per input text, each of length Dim(),
 // L2-normalized when the model manifest says so (true for the

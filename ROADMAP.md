@@ -237,6 +237,39 @@ golden-attribution failure modes (a mis-broadcast KV head or wrong
 QK-norm yields plausible-but-wrong cosines the golden matrix is built to
 catch).
 
+## R11 — mmap / disk-backed weights (run larger than RAM) ✅
+Done: `WithDiskWeights()` memory-maps a model's weights from a pack file
+instead of loading them into RAM. The OS pages weights in on access and
+evicts them under memory pressure (they are clean, file-backed), so
+resident memory tracks the working set and a model larger than RAM runs —
+disk-bandwidth-bound when it does not fit, full speed (warm page cache)
+when it does, the same trade ONNX Runtime's mmap mode makes. Numerics are
+unchanged; only where the bytes live changes.
+
+How: on first use the safetensors (single-file OR sharded — an
+index.json + shards load like one file) are streamed to
+`<dir>/weights.rembedpack`, one tensor at a time widened to f32 (peak
+memory is a single tensor, so an 8B model packs on a small box); later
+loads mmap it. The pack file is an 8-byte length + JSON header +
+64-byte-aligned contiguous f32 data; `packfile.Open` hands out `[]float32`
+slices that alias the mapping (zero copy). Disk mode uses the unpacked
+matmul reading the raw `[out,in]` weight straight from the map, so no
+packed-struct serialization and any dtype works. `internal/mmapfile`
+wraps `unix.Mmap` (MADV_SEQUENTIAL; a read-into-RAM fallback off unix),
+little-endian only (amd64/arm64). The hub fetches sharded checkpoints
+(Qwen3-4B/8B ship 2–4 shards). The Embedder must be Closed to unmap.
+
+Scoped to qwen3 — the architecture whose 4B/8B sizes motivate it; the five
+small encoders are untouched (the loader was refactored to a pluggable
+weight source: in-RAM packing vs disk mmap-raw). Validated: packfile
+round-trip incl. mmap alignment; Qwen3-0.6B `WithDiskWeights` matches the
+torch golden (maxAbs < 1e-4, cos ≥ 0.9999); the in-RAM goldens still pass.
+This is what lets Qwen3-4B run on a box that cannot hold it in fp32 RAM
+(strict 4B/8B golden validation needs a bigger box for the torch
+reference — 4B fp32 ≈ 16 GB, 8B ≈ 32 GB — so those goldens are generated
+where the RAM exists; the disk path itself is proven bit-close on 0.6B and
+is the same code at every size).
+
 ## Standing rules
 Every rung: golden validation against an independent reference, its own
 benchmark delta where perf-relevant, an adversarial review pass before
