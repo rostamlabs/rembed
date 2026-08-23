@@ -430,6 +430,44 @@ func TestGoldenTokens(t *testing.T) {
 	}
 }
 
+// benchText is ~120 tokens — long enough that attention (O(seq²)) and the
+// per-element ops (softmax/gelu/layernorm/rope) register against the matmuls.
+const benchText = "The history of mechanical computation stretches back further than most people assume, " +
+	"beginning with devices like the antikythera mechanism, a bronze assembly of interlocking gears " +
+	"recovered from a shipwreck in the aegean sea that modeled the motions of the sun and moon with " +
+	"startling precision across many decades of careful astronomical observation and calculation."
+
+// BenchmarkEmbedProfile measures a full forward pass on a ~120-token input,
+// SERIAL (WithWorkers(1)) so a CPU profile shows where compute actually goes
+// rather than pool-spin. Select the model with REMBED_BENCH_MODEL (default:
+// mpnet); this is the profiling counterpart to the parallel BenchmarkEmbed.
+//
+//	go test -run=^$ -bench=BenchmarkEmbedProfile -benchtime=3s -cpuprofile=/tmp/cpu.prof .
+//	go tool pprof -top -nodecount=30 /tmp/cpu.prof
+func BenchmarkEmbedProfile(b *testing.B) {
+	dir := os.Getenv("REMBED_BENCH_MODEL")
+	if dir == "" {
+		dir = "models/all-mpnet-base-v2"
+	}
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		b.Skipf("model dir %s not present", dir)
+	}
+	emb, err := Load(dir, WithWorkers(1))
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := emb.Embed(ctx, []string{benchText}); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := emb.Embed(ctx, []string{benchText}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // TestQwen3_4BDiskSanity exercises the R11 "run larger than RAM" path on a
 // real large model: Qwen3-Embedding-4B (sharded, ~15GB in fp32) loaded
 // WithDiskWeights. It has no torch golden here (the reference needs ~16GB of
