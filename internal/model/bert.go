@@ -5,7 +5,10 @@
 // post-LayerNorm) → mean pooling → L2 normalize. MPNet shares the entire
 // pipeline with two deltas: positions are offset by pad_token_id+1 and
 // there is no segment embedding, and every layer's attention scores add a
-// shared bucketed relative-position bias before softmax.
+// shared bucketed relative-position bias before softmax. ModernBERT is
+// different enough (rotary positions, pre-norm bias-free LayerNorms,
+// GeGLU, sliding-window local attention) to have its own load + forward
+// path in modernbert.go, reusing this package's kernels and scratch pool.
 package model
 
 import (
@@ -64,6 +67,16 @@ type Model struct {
 	relBias []float32
 
 	layers []layer
+
+	// ModernBERT path (cfg.ModelType == "modernbert"); nil otherwise.
+	// wordEmb doubles as the token embedding table; there are no position
+	// or segment tables. embNormG normalizes the embeddings; finalNormG
+	// normalizes the stack output; zeroBeta is the shared all-zeros beta
+	// for the bias-free LayerNorms.
+	mbLayers   []mbLayer
+	embNormG   []float32
+	finalNormG []float32
+	zeroBeta   []float32
 
 	scratchPool sync.Pool // *scratch, buffers grown on demand
 }
@@ -130,6 +143,15 @@ type scratch struct {
 	biasDelta  []float32    // [heads×(2seq−1)] MPNet rel-pos bias by (j−i); nil-length for BERT
 	qact       []uint8      // [mPad×kgMax·4] VNNI-quantized activations
 	ascales    []float32    // [mPad] per-row activation scales
+
+	// ModernBERT-only buffers (pre-norm sublayer input, GeGLU projection
+	// and its gated activation, and the RoPE cos/sin tables for the global
+	// and local thetas). Unused (nil-length) on the BERT path.
+	normed     []float32 // [seq×H]
+	wiOut      []float32 // [mPad×2I]
+	geglu      []float32 // [seq×I]
+	cosG, sinG []float32 // [seq×dh/2] global-theta RoPE table
+	cosL, sinL []float32 // [seq×dh/2] local-theta RoPE table
 }
 
 // grow reslices buf to n floats, reallocating only when capacity is short.
@@ -216,7 +238,10 @@ func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch
 		// inside the across-texts fan-out on non-packed targets).
 		tensor.MatMulWorkers(dst, x, w.raw, seq, w.in, w.out, s.fanout)
 	}
-	tensor.AddBias(dst, w.bias, seq, w.out)
+	// ModernBERT's linear layers are bias-free; nil bias means "no add".
+	if w.bias != nil {
+		tensor.AddBias(dst, w.bias, seq, w.out)
+	}
 }
 
 // Load builds a Model from a safetensors file and a validated Config.
@@ -227,6 +252,12 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 	tensors, err := safetensors.Load(weightsPath)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.ModelType == "modernbert" {
+		// ModernBERT diverges enough (RoPE, pre-norm, GeGLU, sliding-window
+		// attention, bias-free, no position/segment tables) to warrant a
+		// dedicated load + forward path — see modernbert.go.
+		return loadModernBERT(tensors, cfg, quantize, workers, weightsPath)
 	}
 	prefix := ""
 	for _, p := range []string{"bert.", "roberta.", "mpnet.", "distilbert."} {
@@ -422,6 +453,17 @@ func (m *Model) Workers() int { return m.workers }
 // requested int8 can check the mode took effect instead of discovering
 // fp32 memory and speed later.
 func (m *Model) Quantized() bool {
+	if m.mbLayers != nil {
+		for i := range m.mbLayers {
+			l := &m.mbLayers[i]
+			for _, w := range []*denseWeight{&l.qkv, &l.attnOut, &l.wi, &l.mlpOut} {
+				if w.packed8 == nil && w.packed8v == nil {
+					return false
+				}
+			}
+		}
+		return len(m.mbLayers) > 0
+	}
 	for i := range m.layers {
 		l := &m.layers[i]
 		for _, w := range []*denseWeight{&l.qkv, &l.attnOut, &l.ffn1, &l.ffn2} {
@@ -437,6 +479,17 @@ func (m *Model) Quantized() bool {
 // u8-activation path (QuantFull requested AND AVX-VNNI present AND every
 // shape packed).
 func (m *Model) QuantizedActivations() bool {
+	if m.mbLayers != nil {
+		for i := range m.mbLayers {
+			l := &m.mbLayers[i]
+			for _, w := range []*denseWeight{&l.qkv, &l.attnOut, &l.wi, &l.mlpOut} {
+				if w.packed8v == nil {
+					return false
+				}
+			}
+		}
+		return len(m.mbLayers) > 0
+	}
 	for i := range m.layers {
 		l := &m.layers[i]
 		for _, w := range []*denseWeight{&l.qkv, &l.attnOut, &l.ffn1, &l.ffn2} {
@@ -534,6 +587,9 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	}
 	if seq > m.cfg.MaxSeqLen() {
 		return nil, fmt.Errorf("sequence length %d exceeds the model's maximum %d", seq, m.cfg.MaxSeqLen())
+	}
+	if m.mbLayers != nil {
+		return m.encodeModernBERT(ids, workers)
 	}
 	H := m.cfg.HiddenSize
 	heads := m.cfg.NumAttentionHeads

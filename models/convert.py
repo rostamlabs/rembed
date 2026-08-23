@@ -136,7 +136,6 @@ def main() -> None:
             args.golden = REPO_ROOT / "testdata" / f"golden-{short}.json"
 
     from huggingface_hub import hf_hub_download
-    import onnxruntime as ort
     from transformers import AutoTokenizer
 
     out = args.out or Path(__file__).resolve().parent / args.model_id.split("/")[-1]
@@ -168,6 +167,10 @@ def main() -> None:
     elif config.get("model_type") == "roberta":
         shutil.copyfile(fetch("vocab.json"), out / "vocab.json")
         shutil.copyfile(fetch("merges.txt"), out / "merges.txt")
+    elif config.get("model_type") == "modernbert":
+        # ModernBERT ships only tokenizer.json (byte-level BPE, vocab and
+        # merges embedded); no vocab.json/merges.txt.
+        shutil.copyfile(fetch("tokenizer.json"), out / "tokenizer.json")
     else:
         shutil.copyfile(fetch("vocab.txt"), out / "vocab.txt")
     tok_config = json.loads(fetch("tokenizer_config.json").read_text())
@@ -175,8 +178,16 @@ def main() -> None:
     modules = json.loads(fetch("modules.json").read_text())
 
     model_type = config.get("model_type")
-    if model_type not in ("bert", "distilbert", "roberta", "mpnet"):
-        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, roberta, and mpnet models are supported")
+    if model_type not in ("bert", "distilbert", "modernbert", "roberta", "mpnet"):
+        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, modernbert, roberta, and mpnet models are supported")
+    if model_type == "modernbert":
+        # rembed's ModernBERT path is bias-free; refuse a checkpoint that
+        # enabled any bias (it would silently be dropped). Positions enter
+        # via RoPE, so position_embedding_type is a vestige and is ignored.
+        if config.get("norm_bias") or config.get("attention_bias") or config.get("mlp_bias"):
+            raise SystemExit("modernbert with norm_bias/attention_bias/mlp_bias is not supported")
+        if config.get("hidden_activation", "gelu") != "gelu":
+            raise SystemExit(f"hidden_activation={config.get('hidden_activation')!r}: only exact GELU is supported")
     if model_type == "distilbert":
         # Fold DistilBERT's config keys into the BERT names.
         if config.get("sinusoidal_pos_embds"):
@@ -237,13 +248,24 @@ def main() -> None:
         "vocab_size": config["vocab_size"],
         "max_position_embeddings": config["max_position_embeddings"],
         "layer_norm_eps": config.get("layer_norm_eps", 1e-12),
-        "do_lower_case": bool(tok_config.get("do_lower_case", False)) if (model_type == "roberta" or sentencepiece_tok) else bool(tok_config.get("do_lower_case", True)),
+        "do_lower_case": bool(tok_config.get("do_lower_case", False)) if (model_type in ("roberta", "modernbert") or sentencepiece_tok) else bool(tok_config.get("do_lower_case", True)),
         "cls_token": tok_str(tok_config.get("cls_token"), "[CLS]"),
         "sep_token": tok_str(tok_config.get("sep_token"), "[SEP]"),
         "unk_token": tok_str(tok_config.get("unk_token"), "<unk>" if (model_type == "roberta" or sentencepiece_tok) else "[UNK]"),
         "pooling": pool_mode,
         "normalize": normalize,
     }
+    if model_type == "modernbert":
+        # ModernBERT: RoPE positions (no learned table), pre-norm bias-free
+        # LayerNorm (norm_eps, not layer_norm_eps), GeGLU, and a global/local
+        # attention schedule — all read from config, unlike MPNet's hardcoded
+        # knobs.
+        manifest["model_type"] = "modernbert"
+        manifest["layer_norm_eps"] = config["norm_eps"]
+        manifest["global_attn_every_n_layers"] = config["global_attn_every_n_layers"]
+        manifest["local_attention"] = config["local_attention"]
+        manifest["global_rope_theta"] = config["global_rope_theta"]
+        manifest["local_rope_theta"] = config["local_rope_theta"]
     if model_type == "distilbert":
         manifest["model_type"] = "distilbert"
     if model_type == "mpnet":
@@ -260,13 +282,40 @@ def main() -> None:
         manifest["tokenizer"] = "sentencepiece"
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     vocab_files = ("sentencepiece.bpe.model" if sentencepiece_tok
-                   else "vocab.json merges.txt" if model_type == "roberta" else "vocab.txt")
+                   else "vocab.json merges.txt" if model_type == "roberta"
+                   else "tokenizer.json" if model_type == "modernbert" else "vocab.txt")
     print(f"wrote {out}/[model.safetensors {vocab_files} manifest.json]")
 
-    # --- golden reference (ONNX Runtime, per-text, no padding) -------------
+    # --- golden reference (per-text, no padding) --------------------------
+    # ModernBERT has no ONNX Runtime golden here (the reference is the
+    # canonical torch ModernBertModel, eager attention, fp32); every other
+    # architecture uses the repo's ONNX export via ONNX Runtime. Both are
+    # engines INDEPENDENT of the Go implementation under test — the point of
+    # a golden.
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    sess = ort.InferenceSession(fetch("onnx/model.onnx"), providers=["CPUExecutionProvider"])
-    input_names = {i.name for i in sess.get_inputs()}
+    if model_type == "modernbert":
+        import torch
+        from transformers import AutoModel
+        torch_model = AutoModel.from_pretrained(
+            args.model_id, attn_implementation="eager", torch_dtype=torch.float32).eval()
+
+        def run_last_hidden(ids, mask):
+            with torch.no_grad():
+                out = torch_model(input_ids=torch.tensor(ids), attention_mask=torch.tensor(mask))
+            return out.last_hidden_state.numpy()
+
+        input_names = set()
+    else:
+        import onnxruntime as ort
+        sess = ort.InferenceSession(fetch("onnx/model.onnx"), providers=["CPUExecutionProvider"])
+        input_names = {i.name for i in sess.get_inputs()}
+
+        def run_last_hidden(ids, mask):
+            feeds = {"input_ids": ids, "attention_mask": mask}
+            if "token_type_ids" in input_names:
+                feeds["token_type_ids"] = np.zeros_like(ids)
+            (last_hidden,) = sess.run(["last_hidden_state"], feeds)
+            return last_hidden
 
     max_len = manifest["max_position_embeddings"]
     if model_type in ("mpnet", "roberta"):
@@ -277,10 +326,7 @@ def main() -> None:
         enc = tokenizer(text, truncation=True, max_length=max_len)
         ids = np.array([enc["input_ids"]], dtype=np.int64)
         mask = np.array([enc["attention_mask"]], dtype=np.int64)
-        feeds = {"input_ids": ids, "attention_mask": mask}
-        if "token_type_ids" in input_names:
-            feeds["token_type_ids"] = np.zeros_like(ids)
-        (last_hidden,) = sess.run(["last_hidden_state"], feeds)
+        last_hidden = run_last_hidden(ids, mask)
         emb = pool(last_hidden[0], mask[0], pool_mode, normalize)
         golden.append(
             {
@@ -303,10 +349,8 @@ def main() -> None:
         for text in GOLDEN_TEXTS[:3]:
             enc = tokenizer(text, truncation=True, max_length=max_len)
             ids = np.array([enc["input_ids"]], dtype=np.int64)
-            feeds = {"input_ids": ids, "attention_mask": np.array([enc["attention_mask"]], dtype=np.int64)}
-            if "token_type_ids" in input_names:
-                feeds["token_type_ids"] = np.zeros_like(ids)
-            (last_hidden,) = sess.run(["last_hidden_state"], feeds)
+            mask = np.array([enc["attention_mask"]], dtype=np.int64)
+            last_hidden = run_last_hidden(ids, mask)
             tcases.append({
                 "text": text,
                 "input_ids": enc["input_ids"],

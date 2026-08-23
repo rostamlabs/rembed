@@ -17,10 +17,15 @@ import (
 	"os"
 	"strings"
 	"unicode"
+	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
-// Tokenizer is a loaded vocab.json + merges.txt byte-level BPE encoder.
-// It is safe for concurrent use after New: all state is read-only.
+// Tokenizer is a loaded byte-level BPE encoder (vocab.json + merges.txt for
+// RoBERTa, or an embedded vocab/merges from a tokenizer.json for
+// ModernBERT). It is safe for concurrent use after New: all state is
+// read-only.
 type Tokenizer struct {
 	vocab   map[string]int64
 	ranks   map[[2]string]int
@@ -28,6 +33,41 @@ type Tokenizer struct {
 	cls     int64
 	sep     int64
 	unk     int64
+	// nfc applies Unicode NFC normalization to the input before
+	// pre-tokenization. ModernBERT's tokenizer declares an NFC normalizer;
+	// RoBERTa/GPT-2 declare none, so it stays off there.
+	nfc bool
+	// added holds the tokenizer's added tokens (content → id) — ModernBERT's
+	// OLMo-inherited whitespace runs (2–24 spaces), |||MARKER||| tokens,
+	// specials and [unusedN]. HF matches these against the (normalized)
+	// text BEFORE BPE, leftmost-longest and non-overlapping; the gaps
+	// between matches then go through the byte-BPE pipeline. nil on the
+	// RoBERTa path (New), which frames with specials but never matches
+	// added tokens inside the text. addedFirst is a fast first-byte filter
+	// (most positions can't start an added token), addedMin/addedMax bound
+	// the match-length scan.
+	added              map[string]addedTok
+	addedFirst         [256]bool
+	addedMin, addedMax int
+	// lstripToks are the added tokens with lstrip=true ([MASK]). HF matches
+	// them as `\s*<content>` leftmost-longest, so a preceding whitespace run
+	// is consumed by the token (and never claimed as a whitespace-run added
+	// token). Tiny set, scanned linearly at whitespace positions.
+	lstripToks []addedContent
+}
+
+// addedContent pairs an added token's literal content with its id.
+type addedContent struct {
+	content string
+	id      int64
+}
+
+// addedTok is one added token's id plus its whitespace-absorption flags.
+// lstrip (true for [MASK]) eats whitespace immediately to its left;
+// rstrip eats whitespace to its right — matching HF's AddedToken flags.
+type addedTok struct {
+	id             int64
+	lstrip, rstrip bool
 }
 
 // byteToUnicode builds GPT-2's bytes_to_unicode table: the three printable
@@ -113,7 +153,131 @@ func New(vocabPath, mergesPath, clsTok, sepTok, unkTok string) (*Tokenizer, erro
 	return t, nil
 }
 
-// VocabSize returns the number of entries in vocab.json.
+// NewFromTokenizerJSON loads a byte-level BPE tokenizer from a HuggingFace
+// tokenizer.json (the ModernBERT case: no vocab.json/merges.txt ship). The
+// vocab and merges are embedded under "model", and the added_tokens carry
+// the specials (which the framing tokens are looked up in). NFC
+// normalization is enabled to match ModernBERT's declared normalizer.
+func NewFromTokenizerJSON(path, clsTok, sepTok, unkTok string) (*Tokenizer, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var tj struct {
+		Normalizer struct {
+			Type string `json:"type"`
+		} `json:"normalizer"`
+		AddedTokens []struct {
+			ID      int64  `json:"id"`
+			Content string `json:"content"`
+			Lstrip  bool   `json:"lstrip"`
+			Rstrip  bool   `json:"rstrip"`
+		} `json:"added_tokens"`
+		Model struct {
+			Type   string           `json:"type"`
+			Vocab  map[string]int64 `json:"vocab"`
+			Merges json.RawMessage  `json:"merges"`
+		} `json:"model"`
+	}
+	if err := json.Unmarshal(raw, &tj); err != nil {
+		return nil, fmt.Errorf("bpe: %s: %w", path, err)
+	}
+	if tj.Model.Type != "BPE" {
+		return nil, fmt.Errorf("bpe: %s: model.type %q is not BPE", path, tj.Model.Type)
+	}
+	if len(tj.Model.Vocab) == 0 {
+		return nil, fmt.Errorf("bpe: %s: empty model.vocab", path)
+	}
+	// added_tokens (specials, whitespace runs, OLMo markers) live outside
+	// model.vocab; merge them so the framing-token lookups resolve. They
+	// never collide with byte-encoded BPE symbols (those map space→Ġ etc.).
+	// The same set is kept separately in `added` for the leftmost-longest
+	// pre-BPE matching HF performs — Encode splits the text on these before
+	// running byte-BPE on the gaps.
+	vocab := tj.Model.Vocab
+	added := make(map[string]addedTok, len(tj.AddedTokens))
+	addedMin, addedMax := 1<<30, 0
+	var addedFirst [256]bool
+	var lstripToks []addedContent
+	for _, at := range tj.AddedTokens {
+		if at.Content == "" {
+			continue
+		}
+		vocab[at.Content] = at.ID
+		added[at.Content] = addedTok{id: at.ID, lstrip: at.Lstrip, rstrip: at.Rstrip}
+		addedFirst[at.Content[0]] = true
+		if at.Lstrip {
+			lstripToks = append(lstripToks, addedContent{content: at.Content, id: at.ID})
+		}
+		n := len(at.Content)
+		if n < addedMin {
+			addedMin = n
+		}
+		if n > addedMax {
+			addedMax = n
+		}
+	}
+
+	// merges is either the modern [["a","b"],…] or the legacy ["a b",…].
+	ranks := make(map[[2]string]int)
+	var pairs [][2]string
+	var arr2 [][]string
+	if err := json.Unmarshal(tj.Model.Merges, &arr2); err == nil {
+		for _, m := range arr2 {
+			if len(m) != 2 {
+				return nil, fmt.Errorf("bpe: %s: malformed merge %v", path, m)
+			}
+			pairs = append(pairs, [2]string{m[0], m[1]})
+		}
+	} else {
+		var arr1 []string
+		if err := json.Unmarshal(tj.Model.Merges, &arr1); err != nil {
+			return nil, fmt.Errorf("bpe: %s: merges are neither [[a,b]] nor [\"a b\"]: %w", path, err)
+		}
+		for _, line := range arr1 {
+			a, b, ok := strings.Cut(line, " ")
+			if !ok || a == "" || b == "" {
+				return nil, fmt.Errorf("bpe: %s: malformed merge %q", path, line)
+			}
+			pairs = append(pairs, [2]string{a, b})
+		}
+	}
+	if len(pairs) == 0 {
+		return nil, fmt.Errorf("bpe: %s: no merges", path)
+	}
+	for rank, p := range pairs {
+		ranks[p] = rank
+	}
+
+	if addedMin > addedMax {
+		addedMin = addedMax
+	}
+	t := &Tokenizer{
+		vocab: vocab, ranks: ranks, byteEnc: byteToUnicode(),
+		nfc:   tj.Normalizer.Type == "NFC",
+		added: added, addedFirst: addedFirst, addedMin: addedMin, addedMax: addedMax,
+		lstripToks: lstripToks,
+	}
+	lookup := func(tok, what string) (int64, error) {
+		id, ok := vocab[tok]
+		if !ok {
+			return 0, fmt.Errorf("bpe: %s token %q not in %s", what, tok, path)
+		}
+		return id, nil
+	}
+	if t.cls, err = lookup(clsTok, "cls"); err != nil {
+		return nil, err
+	}
+	if t.sep, err = lookup(sepTok, "sep"); err != nil {
+		return nil, err
+	}
+	if t.unk, err = lookup(unkTok, "unk"); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// VocabSize returns the number of entries in the loaded vocabulary.
 func (t *Tokenizer) VocabSize() int { return len(t.vocab) }
 
 // isNum reports \p{N} membership (all Number categories — Nd, Nl, No)
@@ -336,33 +500,144 @@ func (h *candHeap) Pop() any {
 // pads). Byte-level coverage means the unk id is unreachable for any
 // input, but the lookup keeps it as a guard.
 func (t *Tokenizer) Encode(text string, maxLen int) (ids, mask []int64) {
+	if t.nfc {
+		text = norm.NFC.String(text)
+	}
 	ids = append(ids, t.cls)
 	// Framing always survives: like the WordPiece path, maxLen < 2 clamps
 	// the content budget to zero and still returns [cls, sep].
 	budget := max(maxLen-2, 0)
+
+	// emitBPE runs the byte-BPE pipeline over one gap of ordinary text,
+	// appending ids until the budget runs out; returns false when it does.
 	var sb strings.Builder
-outer:
-	for _, pre := range t.preTokenize(text) {
-		sb.Reset()
-		for _, b := range []byte(pre) {
-			sb.WriteRune(t.byteEnc[b])
-		}
-		for _, sym := range t.bpe(sb.String()) {
-			if budget <= 0 {
-				break outer
+	emitBPE := func(gap string) bool {
+		for _, pre := range t.preTokenize(gap) {
+			sb.Reset()
+			for _, b := range []byte(pre) {
+				sb.WriteRune(t.byteEnc[b])
 			}
-			id, ok := t.vocab[sym]
+			for _, sym := range t.bpe(sb.String()) {
+				if budget <= 0 {
+					return false
+				}
+				id, ok := t.vocab[sym]
+				if !ok {
+					id = t.unk
+				}
+				ids = append(ids, id)
+				budget--
+			}
+		}
+		return true
+	}
+
+	if t.added == nil {
+		emitBPE(text)
+	} else {
+		// Leftmost-longest, non-overlapping match of added tokens against
+		// the (normalized) text — HF's AddedVocabulary pass. The gaps
+		// between matches go through byte-BPE; a match emits its id
+		// directly. Added-token contents are all ASCII, so byte scanning
+		// never splits a multibyte rune.
+		b := []byte(text)
+		gapStart := 0
+		i := 0
+		for i < len(b) {
+			ml, id, ok := t.matchAdded(b, i)
 			if !ok {
-				id = t.unk
+				i++
+				continue
+			}
+			// The consumed span [i, i+ml) — which for an lstrip token
+			// already includes the preceding whitespace run — emits only the
+			// token id; the gap before it goes through BPE.
+			if gapStart < i && !emitBPE(string(b[gapStart:i])) {
+				gapStart = len(b)
+				break
+			}
+			if budget <= 0 {
+				gapStart = len(b)
+				break
 			}
 			ids = append(ids, id)
 			budget--
+			i += ml
+			gapStart = i
+		}
+		if gapStart < len(b) {
+			emitBPE(string(b[gapStart:]))
 		}
 	}
+
 	ids = append(ids, t.sep)
 	mask = make([]int64, len(ids))
 	for i := range mask {
 		mask[i] = 1
 	}
 	return ids, mask
+}
+
+// matchAdded finds the longest added-token match whose consumed span
+// starts at b[i], returning the span's byte length, the token id, and ok.
+// It reproduces HF's leftmost-longest AddedVocabulary regex: a plain token
+// matches its literal content; an rstrip token additionally consumes the
+// whitespace run after it; and an lstrip token ([MASK]) matches as
+// `\s*<content>`, so when b[i] begins a whitespace run followed by the
+// content, the whole run+content is one span (the whitespace is eaten, not
+// tokenized). The longest competing span wins.
+func (t *Tokenizer) matchAdded(b []byte, i int) (int, int64, bool) {
+	best, bestID, found := 0, int64(0), false
+	// Plain content match at i (longest content first), plus rstrip's
+	// trailing-whitespace extension.
+	if t.addedFirst[b[i]] {
+		hi := t.addedMax
+		if rem := len(b) - i; rem < hi {
+			hi = rem
+		}
+		for l := hi; l >= t.addedMin; l-- {
+			if at, ok := t.added[string(b[i:i+l])]; ok {
+				consumed := l
+				if at.rstrip {
+					consumed += wsRun(b, i+l)
+				}
+				best, bestID, found = consumed, at.id, true
+				break
+			}
+		}
+	}
+	// lstrip tokens ([MASK]): a whitespace run at i followed by the content.
+	if w := i + wsRun(b, i); w > i {
+		for _, lt := range t.lstripToks {
+			if hasPrefixAt(b, w, lt.content) {
+				consumed := (w - i) + len(lt.content)
+				if at := t.added[lt.content]; at.rstrip {
+					consumed += wsRun(b, w+len(lt.content))
+				}
+				if consumed > best {
+					best, bestID, found = consumed, lt.id, true
+				}
+			}
+		}
+	}
+	return best, bestID, found
+}
+
+// wsRun returns the byte length of the Unicode-whitespace run starting at
+// b[pos] (matching HF's regex \s*, which is Unicode-aware).
+func wsRun(b []byte, pos int) int {
+	n := 0
+	for pos+n < len(b) {
+		r, sz := utf8.DecodeRune(b[pos+n:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		n += sz
+	}
+	return n
+}
+
+// hasPrefixAt reports whether b[pos:] begins with s.
+func hasPrefixAt(b []byte, pos int, s string) bool {
+	return pos+len(s) <= len(b) && string(b[pos:pos+len(s)]) == s
 }

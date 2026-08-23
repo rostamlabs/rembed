@@ -51,6 +51,17 @@ func DeriveConfig(dir, name string) (Config, error) {
 		HiddenDim          *int   `json:"hidden_dim"`
 		Activation         string `json:"activation"`
 		SinusoidalPosEmbds bool   `json:"sinusoidal_pos_embds"`
+
+		// ModernBERT spells its architecture and knobs its own way too.
+		HiddenActivation       string   `json:"hidden_activation"`
+		NormEps                *float32 `json:"norm_eps"`
+		NormBias               bool     `json:"norm_bias"`
+		AttentionBias          bool     `json:"attention_bias"`
+		MLPBias                bool     `json:"mlp_bias"`
+		GlobalAttnEveryNLayers int      `json:"global_attn_every_n_layers"`
+		LocalAttention         int      `json:"local_attention"`
+		GlobalRopeTheta        float64  `json:"global_rope_theta"`
+		LocalRopeTheta         float64  `json:"local_rope_theta"`
 	}
 	if err := readJSON("config.json", &hf); err != nil {
 		return c, err
@@ -76,6 +87,17 @@ func DeriveConfig(dir, name string) (Config, error) {
 	// convert.py's export-time guards).
 	switch hf.ModelType {
 	case "bert", "distilbert":
+	case "modernbert":
+		// ModernBERT is bias-free by design; the loader never allocates bias
+		// tensors, so a checkpoint that enabled any bias would silently drop
+		// it. Refuse loudly instead. (The one bias HF's ModernBERT carries —
+		// the MLM decoder — is not part of the embedding path.)
+		if hf.NormBias || hf.AttentionBias || hf.MLPBias {
+			return c, fmt.Errorf("model dir %s: modernbert with norm_bias/attention_bias/mlp_bias is not supported (rembed's modernbert path is bias-free)", dir)
+		}
+		if hf.HiddenActivation != "" && hf.HiddenActivation != "gelu" {
+			return c, fmt.Errorf("model dir %s: hidden_activation=%q — only exact GELU is supported", dir, hf.HiddenActivation)
+		}
 	case "roberta":
 		if hf.PadTokenID == nil {
 			// RoBERTa's position rows are offset by pad_token_id+1;
@@ -93,7 +115,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
 		}
 	default:
-		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, roberta, and mpnet encoders", dir, hf.ModelType)
+		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, roberta, and mpnet encoders", dir, hf.ModelType)
 	}
 	if hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
 		key := "hidden_act"
@@ -151,9 +173,9 @@ func DeriveConfig(dir, name string) (Config, error) {
 	doLower := false
 	switch {
 	case sentencePiece:
-	case hf.ModelType == "roberta":
+	case hf.ModelType == "roberta" || hf.ModelType == "modernbert":
 		if tok.DoLowerCase != nil && *tok.DoLowerCase {
-			return c, fmt.Errorf("model dir %s: do_lower_case=true on a roberta model — byte-level BPE is case-preserving", dir)
+			return c, fmt.Errorf("model dir %s: do_lower_case=true on a %s model — byte-level BPE is case-preserving", dir, hf.ModelType)
 		}
 	default:
 		if tok.DoLowerCase == nil {
@@ -210,6 +232,17 @@ func DeriveConfig(dir, name string) (Config, error) {
 		c.PadTokenID = *hf.PadTokenID
 	case "roberta":
 		c.PadTokenID = *hf.PadTokenID
+	case "modernbert":
+		// ModernBERT spells its LayerNorm eps norm_eps (not layer_norm_eps),
+		// so the block above never sets it; carry it here. The RoPE thetas
+		// and the global/local attention schedule are all read from config.
+		if hf.NormEps != nil {
+			c.LayerNormEps = *hf.NormEps
+		}
+		c.GlobalAttnEveryNLayers = hf.GlobalAttnEveryNLayers
+		c.LocalAttention = hf.LocalAttention
+		c.GlobalRopeTheta = hf.GlobalRopeTheta
+		c.LocalRopeTheta = hf.LocalRopeTheta
 	}
 	return c, validate(&c, dir)
 }

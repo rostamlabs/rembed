@@ -95,7 +95,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/rembed
-          key: rembed-models-v5
+          key: rembed-models-v6
       - name: fetch models via the hub loader
         run: |
           go run ./cmd/rembed embed -model sentence-transformers/all-MiniLM-L6-v2 "warm" > /dev/null
@@ -104,6 +104,7 @@ jobs:
           go run ./cmd/rembed embed -model sentence-transformers/all-distilroberta-v1 "warm" > /dev/null
           go run ./cmd/rembed embed -model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 "warm" > /dev/null
           go run ./cmd/rembed embed -model sentence-transformers/multi-qa-distilbert-cos-v1 "warm" > /dev/null
+          go run ./cmd/rembed embed -model nomic-ai/modernbert-embed-base "warm" > /dev/null
       - name: golden suite (fp32, int8, cls, allocs, concurrency)
         run: |
           export REMBED_MODEL_DIR=~/.cache/rembed/sentence-transformers--all-MiniLM-L6-v2
@@ -112,6 +113,7 @@ jobs:
           export REMBED_MODEL_ROBERTA=~/.cache/rembed/sentence-transformers--all-distilroberta-v1
           export REMBED_MODEL_XLMR=~/.cache/rembed/sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2
           export REMBED_MODEL_DISTIL=~/.cache/rembed/sentence-transformers--multi-qa-distilbert-cos-v1
+          export REMBED_MODEL_MODERNBERT=~/.cache/rembed/nomic-ai--modernbert-embed-base
           go test -v -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" . 2>&1 | tail -30
           go test -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" .
           # The BPE fixture needs real vocab/merges files; the hub cache

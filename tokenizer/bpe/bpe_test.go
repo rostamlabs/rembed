@@ -72,6 +72,60 @@ func TestFixtureAgainstHF(t *testing.T) {
 	}
 }
 
+// mbTok resolves and loads the ModernBERT tokenizer from its
+// tokenizer.json ($REMBED_MODEL_MODERNBERT in CI, or the convert.py dir).
+func mbTok(t *testing.T) *Tokenizer {
+	t.Helper()
+	dir := os.Getenv("REMBED_MODEL_MODERNBERT")
+	if dir == "" {
+		dir = "../../models/modernbert-embed-base"
+	}
+	path := filepath.Join(dir, "tokenizer.json")
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("tokenizer.json not present (%v) — run models/convert.py for nomic-ai/modernbert-embed-base", err)
+	}
+	tok, err := NewFromTokenizerJSON(path, "[CLS]", "[SEP]", "[UNK]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+// TestModernBERTFixtureAgainstHF requires token-for-token equality with
+// HF's ModernBERT tokenizer over the committed fixture (models/mb_fixture.py).
+// Beyond the shared byte-BPE branches it pins the two ModernBERT-specific
+// behaviors: NFC normalization (decomposed → composed folds), and the
+// leftmost-longest matching of the OLMo added tokens (whitespace runs of
+// 2..24 spaces, the |||MARKER||| tokens, and [unusedN]) before BPE.
+func TestModernBERTFixtureAgainstHF(t *testing.T) {
+	tok := mbTok(t)
+	raw, err := os.ReadFile("testdata/mb_fixture.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Cases []struct {
+			Text     string  `json:"text"`
+			InputIDs []int64 `json:"input_ids"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.Cases) < 40 {
+		t.Fatalf("suspiciously small fixture: %d cases", len(fixture.Cases))
+	}
+	for _, c := range fixture.Cases {
+		ids, mask := tok.Encode(c.Text, 512)
+		if !slices.Equal(ids, c.InputIDs) {
+			t.Errorf("%.50q:\n got %v\nwant %v", c.Text, ids, c.InputIDs)
+		}
+		if len(mask) != len(ids) {
+			t.Errorf("%.50q: mask length %d != ids length %d", c.Text, len(mask), len(ids))
+		}
+	}
+}
+
 // TestVocabSize pins the distilroberta vocab count (specials included).
 func TestVocabSize(t *testing.T) {
 	tok := loadTok(t)
