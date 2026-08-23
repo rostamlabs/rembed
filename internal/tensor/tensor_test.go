@@ -203,6 +203,9 @@ func TestGELU(t *testing.T) {
 // class (8-aligned bodies plus 1..7-element tails), including the values that
 // hit the exp underflow clamp and the erf sign fold.
 func TestGELUVectorMatchesScalar(t *testing.T) {
+	if !hasSIMD {
+		t.Skip("no AVX2 GELU on this CPU; GELU is geluScalar, so this would compare scalar to itself")
+	}
 	base := make([]float32, 0, 260)
 	for v := float32(-30); v <= 30; v += 0.2337 {
 		base = append(base, v)
