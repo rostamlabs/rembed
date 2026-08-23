@@ -198,6 +198,39 @@ func TestGELU(t *testing.T) {
 	almostEqual(t, x, want, 1e-6, "gelu")
 }
 
+// TestGELUVectorMatchesScalar pins that the vectorized GELU tracks the
+// scalar geluScalar to fp32 rounding across the input range and every length
+// class (8-aligned bodies plus 1..7-element tails), including the values that
+// hit the exp underflow clamp and the erf sign fold.
+func TestGELUVectorMatchesScalar(t *testing.T) {
+	if !hasSIMD {
+		t.Skip("no AVX2 GELU on this CPU; GELU is geluScalar, so this would compare scalar to itself")
+	}
+	base := make([]float32, 0, 260)
+	for v := float32(-30); v <= 30; v += 0.2337 {
+		base = append(base, v)
+	}
+	base = append(base, 0, -0, 1e-20, -1e-20, 90, -90, 12.5, -12.5)
+	for _, n := range []int{1, 2, 7, 8, 9, 15, 16, 17, 64, 129, len(base)} {
+		if n > len(base) {
+			n = len(base)
+		}
+		vec := append([]float32(nil), base[:n]...)
+		scal := append([]float32(nil), base[:n]...)
+		GELU(vec)
+		geluScalar(scal)
+		var maxd float64
+		for i := range vec {
+			if d := math.Abs(float64(vec[i] - scal[i])); d > maxd {
+				maxd = d
+			}
+		}
+		if maxd > 1e-6 {
+			t.Errorf("n=%d: vectorized GELU diverges from scalar by %g (> 1e-6)", n, maxd)
+		}
+	}
+}
+
 func TestL2Normalize(t *testing.T) {
 	x := []float32{3, 4}
 	L2Normalize(x)

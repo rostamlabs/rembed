@@ -480,15 +480,16 @@ func SiLU(x []float32) {
 	}
 }
 
-// GELU applies the erf-based Gaussian Error Linear Unit in place, matching
-// HuggingFace's "gelu" activation: 0.5x(1+erf(x/√2)), with the float32 erf
-// (~3e-7 absolute error — see fastmath.go; the golden tolerance is 1e-4).
-// The erf is written flat in the loop body (|x| fold via multiply, A&S
-// polynomial, inlinable exp) rather than calling erff32: a function call
+// geluScalar applies the erf-based Gaussian Error Linear Unit in place,
+// matching HuggingFace's "gelu" activation: 0.5x(1+erf(x/√2)), with the
+// float32 erf (~3e-7 absolute error — see fastmath.go; the golden tolerance
+// is 1e-4). The erf is written flat in the loop body (|x| fold via multiply,
+// A&S polynomial, inlinable exp) rather than calling erff32: a function call
 // per element blocks the out-of-order core from overlapping consecutive
 // elements' division/exp latency chains, and this loop runs on seq×I
-// elements per layer.
-func GELU(x []float32) {
+// elements per layer. GELU (platform files) vectorizes this with AVX2 where
+// available and falls back to geluScalar for the tail / non-amd64.
+func geluScalar(x []float32) {
 	const invSqrt2 = float32(0.7071067811865476)
 	for i, v := range x {
 		a := v * invSqrt2
