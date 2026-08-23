@@ -430,6 +430,70 @@ func TestGoldenTokens(t *testing.T) {
 	}
 }
 
+// TestQwen3_4BDiskSanity exercises the R11 "run larger than RAM" path on a
+// real large model: Qwen3-Embedding-4B (sharded, ~15GB in fp32) loaded
+// WithDiskWeights. It has no torch golden here (the reference needs ~16GB of
+// RAM this class of box lacks), so it asserts the properties a correct
+// embedder must have — right dimensionality, unit-normalized output, a
+// paraphrase scoring closer than an unrelated sentence, and deterministic
+// re-embedding — which together would catch a broken GQA/shard/mmap load.
+// Opt-in: set REMBED_MODEL_QWEN3_4B to a 4B model dir (or hub cache dir);
+// skips otherwise, so it never runs in CI.
+func TestQwen3_4BDiskSanity(t *testing.T) {
+	dir := os.Getenv("REMBED_MODEL_QWEN3_4B")
+	if dir == "" {
+		t.Skip("set REMBED_MODEL_QWEN3_4B to a Qwen3-Embedding-4B dir to run")
+	}
+	if _, err := os.Stat(dir + "/config.json"); err != nil {
+		t.Skipf("model dir %s not present", dir)
+	}
+	emb, err := Load(dir, WithDiskWeights(), WithWorkers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = emb.Close() }()
+	if emb.Dim() != 2560 {
+		t.Fatalf("dim %d, want 2560", emb.Dim())
+	}
+	texts := []string{
+		"The cat sat on the warm windowsill in the afternoon sun.",
+		"A feline rested by the sunny window during the day.",
+		"Quarterly revenue grew twelve percent driven by cloud services.",
+	}
+	v, err := emb.Embed(context.Background(), texts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, vec := range v {
+		var n float64
+		for _, x := range vec {
+			n += float64(x) * float64(x)
+		}
+		if math.Abs(math.Sqrt(n)-1) > 1e-3 {
+			t.Errorf("vec %d not unit-normalized: L2=%.6f", i, math.Sqrt(n))
+		}
+	}
+	cosf := func(a, b []float32) float64 {
+		var d, na, nb float64
+		for i := range a {
+			d += float64(a[i]) * float64(b[i])
+			na += float64(a[i]) * float64(a[i])
+			nb += float64(b[i]) * float64(b[i])
+		}
+		return d / math.Sqrt(na*nb)
+	}
+	if para, unrel := cosf(v[0], v[1]), cosf(v[0], v[2]); para <= unrel {
+		t.Errorf("paraphrase cos %.4f not > unrelated cos %.4f", para, unrel)
+	}
+	v2, err := emb.Embed(context.Background(), texts[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(v[0], v2[0]) {
+		t.Error("re-embed not deterministic")
+	}
+}
+
 // TestGoldenQwen3DiskWeights validates the memory-mapped disk-weights path
 // (WithDiskWeights) against the same torch golden: the weights are packed to
 // disk on first use, mmapped, and run through the unpacked matmul. This is

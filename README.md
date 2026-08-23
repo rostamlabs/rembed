@@ -110,6 +110,18 @@ beat ORT fp32 in every round — the flag-free rounds measured 0.70× and
 0.75× (5.9 ms vs 7.9 ms on mpnet) — while trading blows at parity with
 ORT's own AVX-512-VNNI int8 graphs.
 
+**Disk-backed weights (run larger than RAM).** `WithDiskWeights()`
+memory-maps the weights from a pack file instead of loading them into RAM:
+the OS pages weights in on access and evicts under pressure, so resident
+memory tracks the working set and a model larger than RAM runs
+(disk-bandwidth-bound when it does not fit, full speed with a warm page
+cache when it does — the same trade ORT's mmap mode makes). On first use
+the safetensors (single-file or sharded) are streamed to a pack file one
+tensor at a time, so even the pack step fits a small box. This is what
+lets Qwen3-Embedding-4B run cgo-free on a laptop that cannot hold it in
+fp32 RAM. Close the Embedder to unmap. Numerics are unchanged — only
+where the bytes live. (Currently wired for qwen3.)
+
 Expected compatible (same architecture, no committed golden yet): the
 remaining e5 sizes, the largest BGE/GTE variants, the msmarco families,
 other BERT/DistilBERT-based sentence-transformers checkpoints, and the
