@@ -802,6 +802,14 @@ func TestGoldenMatrix(t *testing.T) {
 		// cautionary 0.9747, so activation outliers are a per-checkpoint
 		// property, not a RoBERTa-family one.
 		{"testdata/golden-multilingual-e5-small.json", "models/multilingual-e5-small", "REMBED_MODEL_E5", 1e-4, 0, 1e-5, 0.9995, 0.998},
+		// multilingual-e5-base is a genuine model_type=xlm-roberta checkpoint
+		// (the RoBERTa encoder with the SentencePiece tokenizer) — it folds
+		// onto the roberta path and exercises the fairseq position offset with
+		// SentencePiece ids together for the first time. Reference is torch
+		// XLMRobertaModel (fp32, eager); XLM-R ST repos do not reliably ship
+		// ONNX. int8 bounds are measured worst cases less margin.
+		// int8 worst 0.999162, full int8 worst 0.984945 (measured), less margin.
+		{"testdata/golden-multilingual-e5-base.json", "models/multilingual-e5-base", "REMBED_MODEL_E5B", 1e-4, 0, 1e-5, 0.999, 0.98},
 		{"testdata/golden-bge-base-en-v1.5.json", "models/bge-base-en-v1.5", "REMBED_MODEL_BGEB", 1e-4, 0, 1e-5, 0.995, 0.958},
 		{"testdata/golden-gte-base.json", "models/gte-base", "REMBED_MODEL_GTEB", 1e-4, 0, 1e-5, 0.988, 0.973},
 		{"testdata/golden-paraphrase-mpnet-base-v2.json", "models/paraphrase-mpnet-base-v2", "REMBED_MODEL_PMPNET", 1e-4, 0, 1e-5, 0.9945, 0.986},

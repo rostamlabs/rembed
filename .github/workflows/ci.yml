@@ -95,7 +95,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/rembed
-          key: rembed-models-v7
+          key: rembed-models-v8
       - name: fetch models via the hub loader
         run: |
           go run ./cmd/rembed embed -model sentence-transformers/all-MiniLM-L6-v2 "warm" > /dev/null
@@ -103,6 +103,7 @@ jobs:
           go run ./cmd/rembed embed -model sentence-transformers/all-mpnet-base-v2 "warm" > /dev/null
           go run ./cmd/rembed embed -model sentence-transformers/all-distilroberta-v1 "warm" > /dev/null
           go run ./cmd/rembed embed -model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 "warm" > /dev/null
+          go run ./cmd/rembed embed -model intfloat/multilingual-e5-base "warm" > /dev/null
           go run ./cmd/rembed embed -model sentence-transformers/multi-qa-distilbert-cos-v1 "warm" > /dev/null
           go run ./cmd/rembed embed -model nomic-ai/modernbert-embed-base "warm" > /dev/null
           go run ./cmd/rembed embed -model Qwen/Qwen3-Embedding-0.6B "warm" > /dev/null
@@ -113,6 +114,7 @@ jobs:
           export REMBED_MODEL_MPNET=~/.cache/rembed/sentence-transformers--all-mpnet-base-v2
           export REMBED_MODEL_ROBERTA=~/.cache/rembed/sentence-transformers--all-distilroberta-v1
           export REMBED_MODEL_XLMR=~/.cache/rembed/sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2
+          export REMBED_MODEL_E5B=~/.cache/rembed/intfloat--multilingual-e5-base
           export REMBED_MODEL_DISTIL=~/.cache/rembed/sentence-transformers--multi-qa-distilbert-cos-v1
           export REMBED_MODEL_MODERNBERT=~/.cache/rembed/nomic-ai--modernbert-embed-base
           export REMBED_MODEL_QWEN3=~/.cache/rembed/Qwen--Qwen3-Embedding-0.6B

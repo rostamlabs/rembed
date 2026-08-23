@@ -127,11 +127,16 @@ func DeriveConfig(dir, name string) (Config, error) {
 		if hf.UseSlidingWindow || (hf.SlidingWindow != nil && *hf.SlidingWindow > 0) {
 			return c, fmt.Errorf("model dir %s: qwen3 sliding-window attention is not supported (only full causal)", dir)
 		}
-	case "roberta":
+	case "roberta", "xlm-roberta":
+		// XLM-RoBERTa is architecturally identical to RoBERTa (same encoder,
+		// same fairseq position offset); only the tokenizer differs — it wears
+		// the SentencePiece Unigram model instead of byte-level BPE. It is
+		// normalized to model_type="roberta" below so the whole RoBERTa
+		// forward/quantize path applies unchanged.
 		if hf.PadTokenID == nil {
 			// RoBERTa's position rows are offset by pad_token_id+1;
 			// guessing it wrong shifts every position embedding.
-			return c, fmt.Errorf("model dir %s: roberta config.json lacks pad_token_id", dir)
+			return c, fmt.Errorf("model dir %s: %s config.json lacks pad_token_id", dir, hf.ModelType)
 		}
 	case "mpnet":
 		if hf.RelAttnNumBuckets <= 0 {
@@ -144,7 +149,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
 		}
 	default:
-		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, qwen3, roberta, and mpnet encoders", dir, hf.ModelType)
+		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, qwen3, roberta, xlm-roberta, and mpnet encoders", dir, hf.ModelType)
 	}
 	// qwen3's activation (silu, for SwiGLU) is validated in its case above;
 	// the encoders' exact-GELU requirement does not apply to it.
@@ -187,7 +192,11 @@ func DeriveConfig(dir, name string) (Config, error) {
 	// multilingual exports are all model_type=bert); keying the file probe
 	// on that keeps a stray sentencepiece.bpe.model in e.g. a roberta dir
 	// from silently switching tokenizer family.
-	sentencePiece := hf.ModelType == "bert" && strings.HasPrefix(tok.TokenizerClass, "XLMRobertaTokenizer")
+	// XLM-RoBERTa always wears the SentencePiece Unigram tokenizer; a plain
+	// BERT-architecture multilingual export (multilingual-e5, paraphrase
+	// MiniLM) wears it too and is detected by class or file probe below.
+	sentencePiece := hf.ModelType == "xlm-roberta" ||
+		(hf.ModelType == "bert" && strings.HasPrefix(tok.TokenizerClass, "XLMRobertaTokenizer"))
 	if !sentencePiece && hf.ModelType == "bert" {
 		if fi, err := os.Stat(filepath.Join(dir, "sentencepiece.bpe.model")); err == nil && !fi.IsDir() {
 			sentencePiece = true
@@ -261,8 +270,12 @@ func DeriveConfig(dir, name string) (Config, error) {
 	case "mpnet":
 		c.RelativeAttentionNumBuckets = hf.RelAttnNumBuckets
 		c.PadTokenID = *hf.PadTokenID
-	case "roberta":
+	case "roberta", "xlm-roberta":
 		c.PadTokenID = *hf.PadTokenID
+		// XLM-RoBERTa collapses onto the RoBERTa architecture — the only
+		// distinction (its SentencePiece tokenizer) is already carried by
+		// c.Tokenizer above, so the rest of the engine sees plain roberta.
+		c.ModelType = "roberta"
 	case "modernbert":
 		// ModernBERT spells its LayerNorm eps norm_eps (not layer_norm_eps),
 		// so the block above never sets it; carry it here. The RoPE thetas

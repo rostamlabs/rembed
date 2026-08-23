@@ -270,6 +270,45 @@ reference — 4B fp32 ≈ 16 GB, 8B ≈ 32 GB — so those goldens are generated
 where the RAM exists; the disk path itself is proven bit-close on 0.6B and
 is the same code at every size).
 
+## R12 — XLM-RoBERTa model_type (multilingual-e5-base/large, bge-m3) ✅
+Done: `model_type=xlm-roberta` now derives and runs. XLM-RoBERTa is the
+RoBERTa encoder wearing the SentencePiece Unigram tokenizer (both already
+shipped, in R5 and R6) — the only thing that was missing was the derive
+step recognizing the model_type. It folds onto `roberta` at derive time
+(SentencePiece tokenizer forced, fairseq pad offset carried), so the
+entire RoBERTa forward/int8/disk path applies with zero new architecture
+code. This lights up the multilingual heavyweights that were blocked only
+by their model_type string: `intfloat/multilingual-e5-base`/`-large`,
+`BAAI/bge-m3`. Validation scope: `multilingual-e5-base` is the committed
+golden; `-large` is the identical path at larger size (mean pooling);
+`bge-m3` is the same path with CLS pooling (both pooling modes and larger
+encoders are independently covered in the golden matrix) and loads so long
+as its sentence-transformers modules are the standard Transformer/Pooling
+/Normalize set — an extra module fails loudly in DeriveConfig, never
+silently wrong.
+
+How: ~10 lines across `derive.go` (xlm-roberta → roberta + sentencepiece),
+`hub.go` (supported() + tokenizer probe → sentencepiece.bpe.model),
+`convert.py` (allowlist + fold, torch `XLMRobertaModel` reference since
+XLM-R ST repos do not reliably ship ONNX). Validated: `multilingual-e5-base`
+(a genuine xlm-roberta checkpoint) matches torch `XLMRobertaModel` at
+maxAbs 2.9e-7 fp32, through BOTH the manifest path and the DeriveConfig/hub
+path (dogfooded end to end), with token-for-token ids; int8 worst cosine
+0.999162 (weight-only) / 0.984945 (full int8), bounds enforced in the
+golden matrix. CI fetches it via the hub loader like every other model.
+
+## R13 — EmbeddingGemma (Gemma3 architecture) — in progress
+The current MMTEB state of the art for its size (Gemma3-backbone embedders
+top the multilingual board). High reuse of what exists: RoPE + GQA +
+RMSNorm (R9/R10), alternating global/local sliding-window attention (R9),
+GeGLU (R9); new bits are Gemma's 4-norm layer (pre/post attention +
+pre/post feed-forward), unit-offset RMSNorm, embedding scaling by
+√hidden, the Gemma SentencePiece tokenizer, and EmbeddingGemma's
+bidirectional-attention conversion + Matryoshka output dims. Gated on HF
+(Gemma license): the architecture can be written blind, but golden
+validation needs the weights, which need the user to accept the license
+and provide a token.
+
 ## Standing rules
 Every rung: golden validation against an independent reference, its own
 benchmark delta where perf-relevant, an adversarial review pass before

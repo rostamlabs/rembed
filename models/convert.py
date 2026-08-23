@@ -200,8 +200,18 @@ def main() -> None:
     modules = json.loads(fetch("modules.json").read_text())
 
     model_type = config.get("model_type")
-    if model_type not in ("bert", "distilbert", "modernbert", "qwen3", "roberta", "mpnet"):
-        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, modernbert, qwen3, roberta, and mpnet models are supported")
+    if model_type not in ("bert", "distilbert", "modernbert", "qwen3", "roberta", "xlm-roberta", "mpnet"):
+        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, modernbert, qwen3, roberta, xlm-roberta, and mpnet models are supported")
+    # XLM-RoBERTa is the RoBERTa encoder with a SentencePiece tokenizer
+    # (already handled above via sentencepiece_tok); fold it onto roberta so
+    # the manifest and every downstream branch treat it identically. The one
+    # place it stays distinct is the golden reference: XLM-R ST repos do not
+    # reliably ship an ONNX export, so the reference is transformers'
+    # XLMRobertaModel (eager, fp32) — an engine independent of the Go one,
+    # the same justification the modernbert/qwen3 goldens already use.
+    xlmr = model_type == "xlm-roberta"
+    if xlmr:
+        model_type = "roberta"
     if model_type == "qwen3":
         # Causal decoder embedder: SwiGLU (silu), full causal attention.
         # Refuse a rope scaling (YaRN) or sliding window — geometry changes
@@ -283,7 +293,10 @@ def main() -> None:
         "vocab_size": config["vocab_size"],
         "max_position_embeddings": config["max_position_embeddings"],
         "layer_norm_eps": config.get("layer_norm_eps", 1e-12),
-        "do_lower_case": bool(tok_config.get("do_lower_case", False)) if (model_type in ("roberta", "modernbert", "qwen3") or sentencepiece_tok) else bool(tok_config.get("do_lower_case", True)),
+        # SentencePiece (XLM-R) repos sometimes carry a stale do_lower_case
+        # that HF's tokenizer never reads and the Go SentencePiece path
+        # ignores; force False so the manifest matches DeriveConfig exactly.
+        "do_lower_case": False if sentencepiece_tok else bool(tok_config.get("do_lower_case", False)) if model_type in ("roberta", "modernbert", "qwen3") else bool(tok_config.get("do_lower_case", True)),
         "cls_token": tok_str(tok_config.get("cls_token"), "[CLS]"),
         "sep_token": tok_str(tok_config.get("sep_token"), "[SEP]"),
         "unk_token": tok_str(tok_config.get("unk_token"), "<unk>" if (model_type == "roberta" or sentencepiece_tok) else "[UNK]"),
@@ -341,7 +354,7 @@ def main() -> None:
     # engines INDEPENDENT of the Go implementation under test — the point of
     # a golden.
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    if model_type in ("modernbert", "qwen3"):
+    if model_type in ("modernbert", "qwen3") or xlmr:
         import torch
         from transformers import AutoModel
         # low_cpu_mem_usage avoids the ~2× load-time spike (materializing

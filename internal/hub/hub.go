@@ -47,7 +47,7 @@ var required = []string{
 // falls back to the model_type rules: byte-level BPE (RoBERTa) ships
 // vocab.json + merges.txt; WordPiece (BERT, MPNet) ships vocab.txt.
 func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe bool) {
-	if strings.HasPrefix(tokenizerClass, "XLMRobertaTokenizer") {
+	if modelType == "xlm-roberta" || strings.HasPrefix(tokenizerClass, "XLMRobertaTokenizer") {
 		return []string{"sentencepiece.bpe.model"}, false
 	}
 	if modelType == "roberta" {
@@ -66,7 +66,7 @@ func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe boo
 // cannot import internal/model (which would invert the dependency).
 func supported(modelType string) bool {
 	switch modelType {
-	case "bert", "distilbert", "modernbert", "qwen3", "roberta", "mpnet":
+	case "bert", "distilbert", "modernbert", "qwen3", "roberta", "xlm-roberta", "mpnet":
 		return true
 	}
 	return false
@@ -138,7 +138,7 @@ func Ensure(modelID, cacheDir string) (string, error) {
 	}
 	if !supported(hf.ModelType) {
 		cleanup("config.json")
-		return "", fmt.Errorf("hub: %s: model_type %q is not supported (rembed runs bert, distilbert, modernbert, qwen3, roberta, and mpnet encoders)", modelID, hf.ModelType)
+		return "", fmt.Errorf("hub: %s: model_type %q is not supported (rembed runs bert, distilbert, modernbert, qwen3, roberta, xlm-roberta, and mpnet encoders)", modelID, hf.ModelType)
 	}
 	fetched := []string{"config.json"}
 	if err := fetch(modelID, "tokenizer_config.json", dir); err != nil {
