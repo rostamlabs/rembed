@@ -96,7 +96,11 @@ func DeriveConfig(dir, name string) (Config, error) {
 		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, roberta, and mpnet encoders", dir, hf.ModelType)
 	}
 	if hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
-		return c, fmt.Errorf("model dir %s: hidden_act=%q — only exact GELU is supported", dir, hf.HiddenAct)
+		key := "hidden_act"
+		if hf.ModelType == "distilbert" {
+			key = "activation" // distilbert's spelling of the same knob
+		}
+		return c, fmt.Errorf("model dir %s: %s=%q — only exact GELU is supported", dir, key, hf.HiddenAct)
 	}
 	if hf.PositionEmbeddingType != "" && hf.PositionEmbeddingType != "absolute" {
 		return c, fmt.Errorf("model dir %s: position_embedding_type=%q — only absolute is supported", dir, hf.PositionEmbeddingType)
@@ -192,7 +196,9 @@ func DeriveConfig(dir, name string) (Config, error) {
 		Pooling:               mode,
 		Normalize:             normalize,
 	}
-	if hf.LayerNormEps != nil {
+	if hf.LayerNormEps != nil && hf.ModelType != "distilbert" {
+		// HF's DistilBERT hardcodes LayerNorm eps 1e-12 and never reads
+		// the config key; honoring a stray value would silently diverge.
 		c.LayerNormEps = *hf.LayerNormEps
 	}
 	if sentencePiece {

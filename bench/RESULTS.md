@@ -543,8 +543,12 @@ Two real fixes fell out of the expansion, both caught by goldens:
   with ids-match=false and a 0.0277 embedding error while
   last_hidden_state matched at 5e-6 — the numerics were perfect and the
   tokenizer was the culprit, exactly the attribution the golden design
-  intends. One-line fix (unicode.IsControl is Cc-only; unicode.C covers
-  Cf too), and Persian now matches at 2.5e-7 on every WordPiece model.
+  intends. Fixed to exact _clean_text parity (\t\n\r split; all other
+  Cc/Cf/Co/Cs deleted; Cn KEPT — the review's differential run showed
+  Go's combined unicode.C table would delete unassigned codepoints HF
+  keeps, i.e. anything newer than the toolchain's Unicode tables).
+  Persian ids now match on every WordPiece model, with per-model fp32
+  ranging 1.0e-7 (e5) to 3.8e-6 (gte-base) on the Persian case.
 - paraphrase-mpnet-base-v2 writes its special tokens in AddedToken
   object form ({"content": "<s>", …}); both convert.py and the Go
   derivation now unwrap it — a long-standing backlog item closed by the

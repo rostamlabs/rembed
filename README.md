@@ -70,15 +70,21 @@ test-enforced (worst golden cosine, full int8 vs weight-only):
 | model | full int8 | weight-only int8 |
 |-------|-----------|------------------|
 | MiniLM-L6 / L12 / L3 | 0.9917 / 0.9932 / 0.9979 | ≥ 0.9990 |
-| mpnet-base | 0.9912 | 0.9979 |
-| multilingual MiniLM | 0.9982 | 0.9996 |
-| gte-small | 0.9991 | 0.9998 |
-| **distilroberta** | **0.9747** | 0.9987 |
+| mpnet-base / paraphrase-mpnet | 0.9912 / 0.9867 | ≥ 0.9945 |
+| multilingual MiniLM / multilingual-e5 | 0.9982 / 0.9988 | ≥ 0.9995 |
+| gte-small / gte-base | 0.9991 / 0.9741 | ≥ 0.9880 |
+| multi-qa MiniLM / distilbert | 0.9949 / 0.9854 | ≥ 0.9940 |
+| arctic-embed-s | 0.9932 | 0.9953 |
+| distilroberta | 0.9747 | 0.9987 |
+| **bge-base** | **0.9593** | 0.9957 |
 
-RoBERTa-family checkpoints have markedly larger activation outliers, and
-the per-row absmax scheme loses ~3× more precision there — short texts
-degrade most. Full int8 is NOT recommended for RoBERTa-family models;
-prefer `WithInt8` (weight-only) for those.
+Activation outliers are a PER-CHECKPOINT property, not an architecture
+one: bge-base (a plain BERT) measures worst of all at 0.9593, below
+distilroberta's 0.9747, while its sibling bge-small is unremarkable.
+Check the table before enabling full int8 for a model — anything below
+~0.99 is a real retrieval-quality risk — and prefer `WithInt8`
+(weight-only, ≥ 0.988 everywhere) when in doubt. Every figure above is
+enforced in the golden matrix.
 
 Cross-engine, measured on a Zen 4 cloud box with a both-orders/median
 protocol (bench/RESULTS.md has the full data and every noise flag):
@@ -88,8 +94,9 @@ beat ORT fp32 in every round — the flag-free rounds measured 0.70× and
 ORT's own AVX-512-VNNI int8 graphs.
 
 Expected compatible (same architecture, no ONNX export on the Hub to
-validate against): the e5 family, larger BGE/GTE sizes, and other
-BERT-based sentence-transformers checkpoints. Caveat for retrieval
+validate against): the remaining e5 sizes, the largest BGE/GTE
+variants, the msmarco families, and other BERT/DistilBERT-based
+sentence-transformers checkpoints. Caveat for retrieval
 models: e5 requires "query: "/"passage: " prefixes and some models
 (e.g. arctic) declare prompt handling in their pooling config — rembed
 embeds exactly the text you pass and does not add prefixes; add them

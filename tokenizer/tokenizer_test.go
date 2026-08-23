@@ -210,3 +210,37 @@ func TestEncodeUnknownAndTruncate(t *testing.T) {
 		t.Fatalf("truncated ids=%v want [2 4 3]", ids2)
 	}
 }
+
+// TestCleanTextCategoryC pins HF _clean_text parity for category-C
+// characters, the review's differential findings distilled: \t\n\r are
+// the ONLY C characters that split; every other Cc/Cf/Co/Cs character is
+// deleted (joining its neighbors); unassigned codepoints (Cn) are KEPT —
+// HF keeps them, and Go's combined unicode.C table would have silently
+// deleted anything newer than the toolchain's Unicode tables.
+func TestCleanTextCategoryC(t *testing.T) {
+	tok, err := New(writeVocab(t, []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello", "world", "a", "b"}), true, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, text, want string
+	}{
+		{"tab splits", "hello\tworld", "hello world"},
+		{"vertical tab deletes+joins", "hello\vworld", "helloworld"},
+		{"form feed deletes+joins", "hello\fworld", "helloworld"},
+		{"NEL U+0085 deletes+joins", "hello\u0085world", "helloworld"},
+		{"soft hyphen U+00AD deletes", "hy\u00adphen", "hyphen"},
+		{"ZWSP U+200B deletes", "a\u200bb", "ab"},
+		{"ZWNJ U+200C deletes (Persian)", "a\u200cb", "ab"},
+		{"BOM U+FEFF deletes", "\ufeffhello", "hello"},
+		{"private use U+E000 deletes", "a\ue000b", "ab"},
+		{"unassigned U+0378 KEPT", "a\u0378b", "a\u0378b"},
+	}
+	for _, c := range cases {
+		got := strings.Join(tok.basicTokens(c.text), "|")
+		want := strings.Join(tok.basicTokens(c.want), "|")
+		if got != want {
+			t.Errorf("%s: basicTokens(%q) = %q, want same as %q (= %q)", c.name, c.text, got, c.want, want)
+		}
+	}
+}

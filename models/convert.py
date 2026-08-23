@@ -181,10 +181,15 @@ def main() -> None:
         # Fold DistilBERT's config keys into the BERT names.
         if config.get("sinusoidal_pos_embds"):
             raise SystemExit("sinusoidal_pos_embds=true is not supported")
+        missing = [k for k in ("dim", "n_layers", "n_heads", "hidden_dim") if k not in config]
+        if missing:
+            raise SystemExit(f"distilbert config.json lacks {missing}")
         config = dict(config,
                       hidden_size=config["dim"], num_hidden_layers=config["n_layers"],
                       num_attention_heads=config["n_heads"], intermediate_size=config["hidden_dim"],
-                      hidden_act=config.get("activation", "gelu"))
+                      hidden_act=config.get("activation", "gelu"),
+                      # HF hardcodes DistilBERT's LayerNorm eps; drop any stray key.
+                      layer_norm_eps=1e-12)
     if model_type == "mpnet":
         # HF's MPNet code hardcodes num_buckets=32 and padding_idx=1
         # regardless of config; the Go loader refuses anything else, so
