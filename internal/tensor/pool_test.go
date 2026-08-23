@@ -42,10 +42,12 @@ func TestPoolPropagatesPanicAfterJoin(t *testing.T) {
 		if got := completed.Load(); got != units {
 			t.Fatalf("panic surfaced before the join: %d/%d units completed", got, units)
 		}
-		// The pool must remain usable after a panicking task.
-		ok := false
-		p.Run(2, func(u int) { ok = true })
-		if !ok {
+		// The pool must remain usable after a panicking task. ok is atomic:
+		// the two units can run on different worker goroutines, so a plain
+		// bool would be a data race even though both writes store true.
+		var ok atomic.Bool
+		p.Run(2, func(u int) { ok.Store(true) })
+		if !ok.Load() {
 			t.Fatal("pool dead after panic")
 		}
 	}()
