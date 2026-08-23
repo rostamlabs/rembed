@@ -152,6 +152,12 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 	case cfg.ModelType == "roberta":
 		tok, err = bpe.New(filepath.Join(modelDir, "vocab.json"), filepath.Join(modelDir, "merges.txt"),
 			cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
+	case cfg.ModelType == "modernbert":
+		// ModernBERT ships byte-level BPE inside tokenizer.json (no
+		// vocab.json/merges.txt); the loader reads vocab+merges from there
+		// and applies the declared NFC normalizer.
+		tok, err = bpe.NewFromTokenizerJSON(filepath.Join(modelDir, "tokenizer.json"),
+			cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
 	default:
 		tok, err = tokenizer.New(filepath.Join(modelDir, "vocab.txt"), cfg.DoLowerCase, cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
 	}
@@ -172,6 +178,14 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 		// ids and no downstream bounds check can fire (the review
 		// demonstrated it with a 42-piece model).
 		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 64 {
+			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
+		}
+	case cfg.ModelType == "modernbert":
+		// ModernBERT pads its embedding table to a round number (50368 rows
+		// for ~50310 vocab+added tokens), so the check is one-sided like
+		// SentencePiece: a small positive gap is the padding; a negative or
+		// large gap means a mismatched tokenizer.json.
+		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 128 {
 			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 		}
 	case tok.VocabSize() != cfg.VocabSize:

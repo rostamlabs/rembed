@@ -40,6 +40,17 @@ type Config struct {
 	// attention scores share one bucketed relative-position bias table.
 	RelativeAttentionNumBuckets int `json:"relative_attention_num_buckets,omitempty"`
 	PadTokenID                  int `json:"pad_token_id,omitempty"`
+
+	// ModernBERT only. There are no learned position embeddings: positions
+	// enter through RoPE, applied per head with a theta that DIFFERS by
+	// attention type. Every GlobalAttnEveryNLayers-th layer (0, N, 2N, …)
+	// attends globally with GlobalRopeTheta; the rest attend within a
+	// sliding window of LocalAttention tokens (±LocalAttention/2) with
+	// LocalRopeTheta. All linear layers and LayerNorms are bias-free.
+	GlobalAttnEveryNLayers int     `json:"global_attn_every_n_layers,omitempty"`
+	LocalAttention         int     `json:"local_attention,omitempty"`
+	GlobalRopeTheta        float64 `json:"global_rope_theta,omitempty"`
+	LocalRopeTheta         float64 `json:"local_rope_theta,omitempty"`
 }
 
 // PositionOffset is the value added to a token's index to form its
@@ -92,6 +103,26 @@ func validate(c *Config, source string) error {
 	}
 	switch c.ModelType {
 	case "", "bert", "distilbert":
+	case "modernbert":
+		// ModernBERT has no learned position embeddings; positions enter
+		// through RoPE, and its attention alternates global/local layers.
+		// These knobs are all read from config (unlike MPNet's, which HF
+		// hardcodes) — refuse a manifest missing any of them rather than
+		// pick a plausible-but-wrong default.
+		if c.GlobalAttnEveryNLayers < 1 {
+			return fmt.Errorf("%s: modernbert requires global_attn_every_n_layers >= 1 (found %d)", source, c.GlobalAttnEveryNLayers)
+		}
+		if c.LocalAttention < 2 || c.LocalAttention%2 != 0 {
+			return fmt.Errorf("%s: modernbert requires an even local_attention >= 2 (found %d)", source, c.LocalAttention)
+		}
+		if c.GlobalRopeTheta <= 0 || c.LocalRopeTheta <= 0 {
+			return fmt.Errorf("%s: modernbert requires positive global_rope_theta and local_rope_theta (found %g and %g)", source, c.GlobalRopeTheta, c.LocalRopeTheta)
+		}
+		// RoPE rotates head_dim in pairs, so the per-head dimension must be
+		// even. HiddenSize%NumAttentionHeads==0 is checked above.
+		if dh := c.HiddenSize / c.NumAttentionHeads; dh%2 != 0 {
+			return fmt.Errorf("%s: modernbert head_dim %d must be even for RoPE", source, dh)
+		}
 	case "roberta":
 		// Unlike MPNet, HF's RoBERTa reads padding_idx from config — but
 		// zero is refused deliberately: PadTokenID is a plain int, so a
@@ -119,7 +150,7 @@ func validate(c *Config, source string) error {
 			return fmt.Errorf("%s: pad_token_id=%d — HF's MPNet embeddings hardcode padding_idx=1 regardless of config, so rembed only accepts 1", source, c.PadTokenID)
 		}
 	default:
-		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, roberta, or mpnet)", source, c.ModelType)
+		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, modernbert, roberta, or mpnet)", source, c.ModelType)
 	}
 	if c.LayerNormEps == 0 {
 		c.LayerNormEps = 1e-12

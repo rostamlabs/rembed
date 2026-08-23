@@ -329,6 +329,48 @@ func TestGoldenMPNetParallelMatchesSerial(t *testing.T) {
 	}
 }
 
+// TestGoldenModernBERTParallelMatchesSerial pins that ModernBERT's
+// parallel head fan-out (RoPE, the sliding-window mask, GeGLU all run
+// inside Pool.Run goroutines) is BIT-identical to the serial path, and
+// gives the race detector something to chew on for the ModernBERT code —
+// TestGoldenMatrix runs at WithWorkers(1). The input is long enough
+// (>=300 tokens) that the global/local attention split and the ±64 window
+// mask are exercised concurrently.
+func TestGoldenModernBERTParallelMatchesSerial(t *testing.T) {
+	dir := os.Getenv("REMBED_MODEL_MODERNBERT")
+	if dir == "" {
+		dir = "models/modernbert-embed-base"
+	}
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("model dir %s not present", dir)
+	}
+	serial, err := Load(dir, WithWorkers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parallel, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Repeat("the antikythera mechanism modeled the motions of the sun and moon with startling precision, ", 25)
+	if n := len(serial.Tokenize(text)); n < 300 {
+		t.Fatalf("test input tokenizes to %d tokens; need >=300 to exercise the sliding-window mask", n)
+	}
+	a, err := serial.Embed(context.Background(), []string{text})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := parallel.Embed(context.Background(), []string{text})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range a[0] {
+		if a[0][i] != b[0][i] {
+			t.Fatalf("parallel diverges from serial at [%d]: %v vs %v", i, b[0][i], a[0][i])
+		}
+	}
+}
+
 // TestGoldenTokens validates EmbedTokens — per-token hidden states —
 // against ONNX Runtime's last_hidden_state for the committed token-level
 // golden. This is the raw, unpooled output, so nothing downstream
@@ -445,6 +487,17 @@ func TestGoldenMatrix(t *testing.T) {
 		// DistilBERT: the fourth architecture, and the golden whose
 		// Persian case caught the WordPiece ZWNJ (Cf-dropping) gap.
 		{"testdata/golden-multi-qa-distilbert-cos-v1.json", "models/multi-qa-distilbert-cos-v1", "REMBED_MODEL_DISTIL", 1e-4, 0, 1e-5, 0.999, 0.985},
+		// ModernBERT: the fifth architecture — RoPE (dual theta), pre-norm,
+		// GeGLU, bias-free, sliding-window local attention. The golden's
+		// ~400-token case runs seq well past the 128-token local window, so
+		// the global/local split and the ±64 mask are exercised end to end.
+		// Reference is the canonical torch ModernBertModel (fp32, eager),
+		// not ONNX. int8 bounds are measured worst cases less margin:
+		// weight-only holds up well (0.9984, the Persian case), but FULL
+		// int8 drops to 0.966 — GeGLU's gated activations have outliers the
+		// per-row u8 scale can't hold, so like the RoBERTa family, full int8
+		// is not recommended for ModernBERT.
+		{"testdata/golden-modernbert-embed-base.json", "models/modernbert-embed-base", "REMBED_MODEL_MODERNBERT", 1e-4, 0, 1e-5, 0.998, 0.96},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {

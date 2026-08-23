@@ -51,6 +51,11 @@ func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe boo
 	if modelType == "roberta" {
 		return []string{"vocab.json", "merges.txt"}, true
 	}
+	if modelType == "modernbert" {
+		// Byte-level BPE with vocab and merges embedded in tokenizer.json;
+		// no sentencepiece probe.
+		return []string{"tokenizer.json"}, false
+	}
 	return []string{"vocab.txt"}, true
 }
 
@@ -59,7 +64,7 @@ func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe boo
 // cannot import internal/model (which would invert the dependency).
 func supported(modelType string) bool {
 	switch modelType {
-	case "bert", "distilbert", "roberta", "mpnet":
+	case "bert", "distilbert", "modernbert", "roberta", "mpnet":
 		return true
 	}
 	return false
@@ -131,7 +136,7 @@ func Ensure(modelID, cacheDir string) (string, error) {
 	}
 	if !supported(hf.ModelType) {
 		cleanup("config.json")
-		return "", fmt.Errorf("hub: %s: model_type %q is not supported (rembed runs bert, distilbert, roberta, and mpnet encoders)", modelID, hf.ModelType)
+		return "", fmt.Errorf("hub: %s: model_type %q is not supported (rembed runs bert, distilbert, modernbert, roberta, and mpnet encoders)", modelID, hf.ModelType)
 	}
 	fetched := []string{"config.json"}
 	if err := fetch(modelID, "tokenizer_config.json", dir); err != nil {

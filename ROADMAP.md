@@ -124,8 +124,30 @@ Remaining headroom: a zmm-wide kernel for 512-bit-native parts; a
 dedicated bare-metal box would still tighten the noise bands. GPU
 remains out of scope.
 
-## R9 — ModernBERT (RoPE encoder)
-Not started. The natural next architecture and a deliberate stepping
+## R9 — ModernBERT (RoPE encoder) ✅
+Done: model_type=modernbert end to end — the fifth architecture and the
+first with rotary positions. Dual-theta RoPE (θ=160000 on the global
+layers, every 3rd; θ=10000 on the local ones), a ±64 sliding-window mask
+on the local layers, pre-norm with bias-free LayerNorms (layer 0's
+attention norm is an Identity, as in HF), an embedding norm and a final
+norm, and a 2-matrix GeGLU MLP. The tokenizer reuses the R5 byte-level
+BPE scanner (ModernBERT's ByteLevel pre-tokenizer is the same GPT-2
+regex) with two additions read from tokenizer.json: NFC normalization,
+and leftmost-longest matching of the OLMo added tokens (whitespace runs
+of 2–24 spaces, |||MARKER||| tokens, [unusedN], and [MASK]'s lstrip)
+BEFORE the merges. Validated against the canonical PyTorch
+ModernBertModel (nomic-ai/modernbert-embed-base, mean pooling): fp32
+maxAbs < 1e-4 over the 13-case golden whose ~400-token case runs the
+seq well past the 128-token window (global/local split and the ±64 mask
+exercised end to end); the tokenizer matches HF token-for-token over a
+64-case committed fixture and 6k+ adversarial fuzz inputs (zero
+mismatches). int8: weight-only ≥ 0.998, but FULL int8 drops to 0.966 —
+GeGLU's gated activations have outliers the per-row u8 scale can't hold,
+so full int8 is not recommended for ModernBERT (same caveat as the
+RoBERTa family). Parallel head fan-out is bit-identical to serial. The
+original scope, for the record — needed:
+
+The natural next architecture and a deliberate stepping
 stone: it introduces rotary positions and bias-free norms while staying
 inside rembed's encoder / mean-pool lane, so the golden harness,
 convert.py, DeriveConfig, and the R5 byte-level BPE tokenizer all carry
