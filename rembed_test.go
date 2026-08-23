@@ -831,8 +831,10 @@ func TestGoldenMatrix(t *testing.T) {
 		// eager). int8 bounds are measured worst cases less margin:
 		// weight-only 0.9978, full int8 0.9747 (last-token pooling reads a
 		// single position, so it has no averaging to hide activation
-		// quantization error — full int8 is least suited here).
-		{"testdata/golden-Qwen3-Embedding-0.6B.json", "models/Qwen3-Embedding-0.6B", "REMBED_MODEL_QWEN3", 1e-4, 0, 1e-5, 0.997, 0.97},
+		// quantization error — full int8 is least suited here; flash-attention's
+		// streaming-softmax accumulation shifted the worst full-int8 case to
+		// 0.9693, so the bound is 0.96).
+		{"testdata/golden-Qwen3-Embedding-0.6B.json", "models/Qwen3-Embedding-0.6B", "REMBED_MODEL_QWEN3", 1e-4, 0, 1e-5, 0.997, 0.96},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {

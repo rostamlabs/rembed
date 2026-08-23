@@ -304,6 +304,91 @@ func loadQwen3Disk(pk *packfile.Pack, cfg Config, workers int) (*Model, error) {
 	return m, nil
 }
 
+// flashBlk is the query/key block size for flash-attention.
+const flashBlk = 64
+
+// flashAttnCausalHead computes causal scaled-dot-product attention for one
+// head with online (streaming) softmax, writing [seq×dh] into out. It equals
+// softmax(mask(Q·Kᵀ·scale))·V but never materializes the full seq×seq score
+// matrix and SKIPS key blocks beyond each query block — the causal upper
+// triangle rembed used to compute and then throw away — roughly halving the
+// attention matmul work. qH/kH/vH are [seq×dh] row-major (key-contiguous);
+// sblk (>= bq·bq), acc (>= bq·dh), mrow/lrow (>= bq) are per-head scratch
+// with bq=min(flashBlk,seq). Online softmax is numerically exact; only the
+// fp32 accumulation order differs from a full-row softmax (within tolerance).
+func flashAttnCausalHead(qH, kH, vH, out []float32, seq, dh int, scale float32, sblk, acc, mrow, lrow []float32) {
+	const negInf = float32(-1e30)
+	for q0 := 0; q0 < seq; q0 += flashBlk {
+		q1 := min(q0+flashBlk, seq)
+		nq := q1 - q0
+		for r := 0; r < nq; r++ {
+			mrow[r], lrow[r] = negInf, 0
+		}
+		clear(acc[:nq*dh])
+		// Keys only up to q1: no query in [q0,q1) attends past q1-1 (causal),
+		// so every key block at k0 >= q1 is skipped entirely.
+		for k0 := 0; k0 < q1; k0 += flashBlk {
+			k1 := min(k0+flashBlk, q1)
+			nk := k1 - k0
+			// S = Qblk[nq×dh] · Kblk[nk×dh]ᵀ (kH row-major is the bT layout).
+			tensor.MatMulSerial(sblk, qH[q0*dh:q1*dh], kH[k0*dh:k1*dh], nq, dh, nk)
+			for r := 0; r < nq; r++ {
+				i := q0 + r
+				srow := sblk[r*nk : r*nk+nk]
+				rmax := negInf
+				for c := 0; c < nk; c++ {
+					if k0+c > i {
+						srow[c] = negInf // causal (diagonal block only)
+					} else {
+						srow[c] *= scale
+						if srow[c] > rmax {
+							rmax = srow[c]
+						}
+					}
+				}
+				if rmax == negInf {
+					continue // whole block is in row i's future
+				}
+				mprev := mrow[r]
+				mnew := mprev
+				if rmax > mnew {
+					mnew = rmax
+				}
+				ar := acc[r*dh : r*dh+dh]
+				if mprev != negInf && mnew != mprev {
+					// A new running max: rescale the accumulator and denom.
+					corr := tensor.ExpNeg(mprev - mnew)
+					lrow[r] *= corr
+					for d := range ar {
+						ar[d] *= corr
+					}
+				}
+				lr := lrow[r]
+				for c := 0; c < nk; c++ {
+					if k0+c > i {
+						continue
+					}
+					p := tensor.ExpNeg(srow[c] - mnew)
+					lr += p
+					vk := vH[(k0+c)*dh : (k0+c)*dh+dh]
+					for d := range ar {
+						ar[d] += p * vk[d]
+					}
+				}
+				lrow[r], mrow[r] = lr, mnew
+			}
+		}
+		for r := 0; r < nq; r++ {
+			ar := acc[r*dh : r*dh+dh]
+			inv := 1 / lrow[r]
+			o := out[(q0+r)*dh : (q0+r)*dh+dh]
+			for d := range o {
+				o[d] = ar[d] * inv
+			}
+		}
+	}
+}
+
 // encodeQwen3 runs the Qwen3 causal-decoder stack, leaving the final hidden
 // states in the returned scratch's x[:seq*H]. Last-token pooling happens in
 // ForwardWorkers (reads the final row). Caller returns the scratch.
@@ -332,11 +417,16 @@ func (m *Model) encodeQwen3(ids []int64, workers int) (*scratch, error) {
 	s.qwK = grow(s.qwK, mPad*kvDim)
 	s.qwV = grow(s.qwV, mPad*kvDim)
 	s.qwKHead = grow(s.qwKHead, nkv*seq*dh)
-	s.qwVHeadT = grow(s.qwVHeadT, nkv*dh*seq)
+	s.qwVHead = grow(s.qwVHead, nkv*seq*dh)
 	s.qwQHead = grow(s.qwQHead, nq*seq*dh)
 	s.qwCHead = grow(s.qwCHead, nq*seq*dh)
-	s.qwScores = grow(s.qwScores, nq*seq*seq)
 	s.qwCtx = grow(s.qwCtx, seq*qDim)
+	// Flash-attention per-head scratch.
+	bq := min(flashBlk, seq)
+	s.qwSblk = grow(s.qwSblk, nq*bq*bq)
+	s.qwAcc = grow(s.qwAcc, nq*bq*dh)
+	s.qwM = grow(s.qwM, nq*bq)
+	s.qwL = grow(s.qwL, nq*bq)
 	s.attnOut = grow(s.attnOut, mPad*H)
 	s.wiOut = grow(s.wiOut, mPad*I) // SwiGLU gate projection
 	s.qwUp = grow(s.qwUp, mPad*I)   // SwiGLU up projection
@@ -373,9 +463,8 @@ func (m *Model) encodeQwen3(ids []int64, workers int) (*scratch, error) {
 
 	normed := s.normed
 	q, k, v := s.qwQ, s.qwK, s.qwV
-	kHead, vHeadT := s.qwKHead, s.qwVHeadT
+	kHead, vHead := s.qwKHead, s.qwVHead
 	qHead, cHead := s.qwQHead, s.qwCHead
-	scores := s.qwScores
 	ctx := s.qwCtx
 	attnOut := s.attnOut
 	gate, up, act, down := s.wiOut, s.qwUp, s.geglu, s.ffnOut
@@ -395,13 +484,12 @@ func (m *Model) encodeQwen3(ids []int64, workers int) (*scratch, error) {
 		// and RoPE the K once here so the group's query heads reuse it.
 		s.pool.Run(nkv, func(kv int) {
 			kH := kHead[kv*seq*dh : (kv+1)*seq*dh]
-			vHT := vHeadT[kv*dh*seq : (kv+1)*dh*seq]
+			vH := vHead[kv*seq*dh : (kv+1)*seq*dh]
 			for i := range seq {
 				copy(kH[i*dh:i*dh+dh], k[i*kvDim+kv*dh:i*kvDim+kv*dh+dh])
-				vRow := v[i*kvDim+kv*dh:]
-				for d := range dh {
-					vHT[d*seq+i] = vRow[d]
-				}
+				// V stored row-major (key-contiguous) so flash-attention's
+				// P·V is a contiguous axpy that can skip future keys.
+				copy(vH[i*dh:i*dh+dh], v[i*kvDim+kv*dh:i*kvDim+kv*dh+dh])
 			}
 			tensor.RMSNorm(kH, l.kNormG, seq, dh, eps)
 			applyRoPE(kH, seq, dh, cos, sin)
@@ -419,22 +507,13 @@ func (m *Model) encodeQwen3(ids []int64, workers int) (*scratch, error) {
 
 			kv := hh / group
 			kH := kHead[kv*seq*dh : (kv+1)*seq*dh]
-			vHT := vHeadT[kv*dh*seq : (kv+1)*dh*seq]
-			sc := scores[hh*seq*seq : (hh+1)*seq*seq]
-			tensor.MatMulSerial(sc, qH, kH, seq, dh, seq)
-			for i := range seq {
-				row := sc[i*seq : i*seq+seq]
-				for j := range row {
-					if j > i {
-						row[j] = -1e30 // causal: no attention to the future
-					} else {
-						row[j] *= scale
-					}
-				}
-			}
-			tensor.Softmax(sc, seq, seq)
+			vH := vHead[kv*seq*dh : (kv+1)*seq*dh]
 			chH := cHead[hh*seq*dh : (hh+1)*seq*dh]
-			tensor.MatMulSerial(chH, sc, vHT, seq, seq, dh)
+			bq := min(flashBlk, seq)
+			flashAttnCausalHead(qH, kH, vH, chH, seq, dh, scale,
+				s.qwSblk[hh*bq*bq:(hh+1)*bq*bq],
+				s.qwAcc[hh*bq*dh:(hh+1)*bq*dh],
+				s.qwM[hh*bq:(hh+1)*bq], s.qwL[hh*bq:(hh+1)*bq])
 			for i := range seq {
 				copy(ctx[i*qDim+hh*dh:i*qDim+hh*dh+dh], chH[i*dh:i*dh+dh])
 			}
