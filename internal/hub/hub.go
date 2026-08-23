@@ -353,7 +353,7 @@ func fetch(modelID, name, dir string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "rembed/0.1")
+	req.Header.Set("User-Agent", "rembed/0.3")
 	if tok := hfToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
