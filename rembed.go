@@ -43,6 +43,7 @@ type Embedder struct {
 	cfg model.Config
 	tok textTokenizer
 	m   *model.Model
+	dim int // output dimensionality (cfg.HiddenSize, or the WithDim truncation)
 }
 
 // Option configures Load.
@@ -53,6 +54,7 @@ type loadOptions struct {
 	int8act bool
 	workers int
 	diskWts bool
+	dim     int
 }
 
 // WithInt8 selects weight-only int8 inference: transformer dense weights
@@ -89,6 +91,19 @@ func WithInt8Activations() Option {
 // unmap. Numerics are unchanged — only where the bytes live changes.
 func WithDiskWeights() Option {
 	return func(o *loadOptions) { o.diskWts = true }
+}
+
+// WithDim truncates each embedding to its first d dimensions and
+// re-L2-normalizes — Matryoshka Representation Learning (MRL). Models
+// trained for it (EmbeddingGemma: 768→512/256/128; nomic-embed) keep most
+// of their quality at a fraction of the storage and search cost. d must be
+// in [1, full dim]; d equal to the full dim is a no-op. The truncation is a
+// deterministic slice-then-renormalize of the final vector, so it is
+// meaningful only for MRL-trained models — on others it still runs but the
+// shorter vector is not a faithful embedding. Dim() reflects the truncated
+// size.
+func WithDim(d int) Option {
+	return func(o *loadOptions) { o.dim = d }
 }
 
 // WithWorkers caps the number of CPU workers one Embed call uses.
@@ -243,7 +258,14 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rembed: %w", err)
 	}
-	return &Embedder{cfg: cfg, tok: tok, m: m}, nil
+	dim := cfg.HiddenSize
+	if o.dim != 0 {
+		if o.dim < 1 || o.dim > cfg.HiddenSize {
+			return nil, fmt.Errorf("rembed: WithDim(%d) out of range [1, %d]", o.dim, cfg.HiddenSize)
+		}
+		dim = o.dim
+	}
+	return &Embedder{cfg: cfg, tok: tok, m: m, dim: dim}, nil
 }
 
 // Close releases resources held by the Embedder — the memory-mapped weights
@@ -278,7 +300,7 @@ func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, erro
 			if err != nil {
 				return nil, fmt.Errorf("rembed: text %d: %w", i, err)
 			}
-			out[i] = vec
+			out[i] = e.truncate(vec)
 		}
 		return out, nil
 	}
@@ -303,7 +325,7 @@ func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, erro
 			errs[i] = fmt.Errorf("rembed: text %d: %w", i, err)
 			return
 		}
-		out[i] = vec
+		out[i] = e.truncate(vec)
 	})
 	return out, firstError(errs)
 }
@@ -408,5 +430,18 @@ func (e *Embedder) Quantized() bool { return e.m.Quantized() }
 // is active for every dense weight.
 func (e *Embedder) QuantizedActivations() bool { return e.m.QuantizedActivations() }
 
-// Dim returns the embedding dimensionality.
-func (e *Embedder) Dim() int { return e.cfg.HiddenSize }
+// Dim returns the embedding dimensionality — the WithDim truncation when
+// set, else the model's full hidden size.
+func (e *Embedder) Dim() int { return e.dim }
+
+// truncate applies the Matryoshka WithDim reduction: keep the first e.dim
+// components and re-L2-normalize. A no-op at full dimensionality. vec is a
+// per-forward allocation, so slicing and normalizing it in place is safe.
+func (e *Embedder) truncate(vec []float32) []float32 {
+	if e.dim >= len(vec) {
+		return vec
+	}
+	vec = vec[:e.dim]
+	tensor.L2Normalize(vec)
+	return vec
+}

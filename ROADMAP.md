@@ -325,9 +325,12 @@ support (`HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN`, or the `hf login` token file)
 so gated repos like Gemma download in pure Go; CI fetches it when the
 `HF_TOKEN` secret is set and skips it otherwise (the model is gated).
 
-Deferred (not needed for the base embedding): Matryoshka truncation
-(768→512/256/128 is a caller-side slice+renormalize of the 768-d output)
-and the task-prompt prefixes (a usage convention applied by the caller).
+Matryoshka truncation is now a first-class option: `WithDim(d)` (CLI
+`-dim`) keeps the first d dimensions and re-L2-normalizes (768→512/256/128).
+Validated at each dim against the deterministic slice+renormalize of the
+full-768 torch golden (maxAbs < 1e-4), and range-guarded at Load. Still
+deferred (a caller-side usage convention, not model correctness): the
+task-prompt prefixes ("task: search result | query: …").
 
 ## Standing rules
 Every rung: golden validation against an independent reference, its own
