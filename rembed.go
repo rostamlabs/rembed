@@ -22,6 +22,7 @@ import (
 	"github.com/rostamlabs/rembed/internal/tensor"
 	"github.com/rostamlabs/rembed/tokenizer"
 	"github.com/rostamlabs/rembed/tokenizer/bpe"
+	"github.com/rostamlabs/rembed/tokenizer/gemma"
 	"github.com/rostamlabs/rembed/tokenizer/sentencepiece"
 )
 
@@ -161,6 +162,10 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 	}
 	var tok textTokenizer
 	switch {
+	case cfg.Tokenizer == "gemma":
+		// EmbeddingGemma: SentencePiece-style byte-fallback BPE in
+		// tokenizer.json (metaspace normalization, <bos>…<eos> framing).
+		tok, err = gemma.New(filepath.Join(modelDir, "tokenizer.json"))
 	case cfg.Tokenizer == "sentencepiece":
 		tok, err = sentencepiece.New(filepath.Join(modelDir, "sentencepiece.bpe.model"))
 	case cfg.ModelType == "roberta":
@@ -197,6 +202,13 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 		// ids and no downstream bounds check can fire (the review
 		// demonstrated it with a 42-piece model).
 		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 64 {
+			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
+		}
+	case cfg.Tokenizer == "gemma":
+		// EmbeddingGemma's embed table and tokenizer vocab are both 262144;
+		// keep the one-sided check (a negative or large gap means a mismatched
+		// tokenizer.json), tolerant of small padding.
+		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 128 {
 			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 		}
 	case cfg.ModelType == "modernbert" || cfg.ModelType == "qwen3":

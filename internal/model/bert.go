@@ -86,6 +86,15 @@ type Model struct {
 	// is the trailing RMSNorm (reused). There is no embedding norm.
 	qwLayers []qwLayer
 
+	// Gemma3 path (cfg.ModelType == "gemma3", EmbeddingGemma); nil otherwise.
+	// A bidirectional Gemma 3 backbone — see gemma3.go. wordEmb is
+	// embed_tokens (scaled by √H at encode time); finalNormG is the trailing
+	// RMSNorm. gmDense1/gmDense2 are the two bias-free Dense-head matrices
+	// ([DenseHidden×H] and [H×DenseHidden]) applied to the mean-pooled vector.
+	gmLayers []gmLayer
+	gmDense1 []float32
+	gmDense2 []float32
+
 	// pack is the mmapped disk-weights file when the model was loaded with
 	// WithDiskWeights (nil otherwise); Close unmaps it. Weight slices alias
 	// this mapping, so it must outlive every Forward.
@@ -310,6 +319,12 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 		// SwiGLU, last-token pooling) — dedicated path in qwen3.go.
 		return loadQwen3(tensors, cfg, quantize, workers, weightsPath)
 	}
+	if cfg.ModelType == "gemma3" {
+		// EmbeddingGemma: a bidirectional Gemma 3 backbone (unit-offset
+		// RMSNorm, QK-norm, GQA, dual-theta RoPE, sliding/global attention,
+		// GeGLU, mean pooling + a Dense head) — dedicated path in gemma3.go.
+		return loadGemma3(tensors, cfg, quantize, workers, weightsPath)
+	}
 	prefix := ""
 	for _, p := range []string{"bert.", "roberta.", "mpnet.", "distilbert."} {
 		if _, ok := tensors[p+"embeddings.word_embeddings.weight"]; ok {
@@ -515,6 +530,17 @@ func (m *Model) Quantized() bool {
 		}
 		return len(m.qwLayers) > 0
 	}
+	if m.gmLayers != nil {
+		for i := range m.gmLayers {
+			l := &m.gmLayers[i]
+			for _, w := range []*denseWeight{&l.qProj, &l.kProj, &l.vProj, &l.oProj, &l.gateProj, &l.upProj, &l.downProj} {
+				if w.packed8 == nil && w.packed8v == nil {
+					return false
+				}
+			}
+		}
+		return len(m.gmLayers) > 0
+	}
 	if m.mbLayers != nil {
 		for i := range m.mbLayers {
 			l := &m.mbLayers[i]
@@ -551,6 +577,17 @@ func (m *Model) QuantizedActivations() bool {
 			}
 		}
 		return len(m.qwLayers) > 0
+	}
+	if m.gmLayers != nil {
+		for i := range m.gmLayers {
+			l := &m.gmLayers[i]
+			for _, w := range []*denseWeight{&l.qProj, &l.kProj, &l.vProj, &l.oProj, &l.gateProj, &l.upProj, &l.downProj} {
+				if w.packed8v == nil {
+					return false
+				}
+			}
+		}
+		return len(m.gmLayers) > 0
 	}
 	if m.mbLayers != nil {
 		for i := range m.mbLayers {
@@ -607,6 +644,11 @@ func (m *Model) ForwardWorkers(ids []int64, workers int) ([]float32, error) {
 		copy(pooled, x[(seq-1)*H:seq*H])
 	default:
 		poolMean(pooled, x, seq, H)
+	}
+	// EmbeddingGemma projects the mean-pooled vector through a two-layer
+	// bias-free Dense head before normalization.
+	if m.gmLayers != nil {
+		pooled = m.applyGemmaDenseHead(pooled)
 	}
 	if m.cfg.Normalize {
 		tensor.L2Normalize(pooled)
@@ -676,6 +718,9 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	}
 	if m.qwLayers != nil {
 		return m.encodeQwen3(ids, workers)
+	}
+	if m.gmLayers != nil {
+		return m.encodeGemma3(ids, workers)
 	}
 	H := m.cfg.HiddenSize
 	heads := m.cfg.NumAttentionHeads

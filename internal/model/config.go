@@ -60,6 +60,21 @@ type Config struct {
 	HeadDim          int     `json:"head_dim,omitempty"`
 	NumKeyValueHeads int     `json:"num_key_value_heads,omitempty"`
 	RopeTheta        float64 `json:"rope_theta,omitempty"`
+
+	// Gemma3 (EmbeddingGemma) only. A Gemma 3 text backbone run as a
+	// bidirectional embedder. Reuses HeadDim/NumKeyValueHeads (GQA, and
+	// HeadDim=256≠HiddenSize/heads) and GlobalRopeTheta/LocalRopeTheta
+	// (rope_theta / rope_local_base_freq). Attention alternates: every
+	// SlidingWindowPattern-th layer (indices pattern-1, 2·pattern-1, …)
+	// attends globally with GlobalRopeTheta; the rest attend bidirectionally
+	// within ±SlidingWindow tokens (|i−j| < SlidingWindow) with LocalRopeTheta.
+	// QueryPreAttnScalar sets the attention scale (1/√scalar), RMSNorms are
+	// unit-offset, embeddings are scaled by √HiddenSize, and a two-layer
+	// bias-free Dense head projects the mean-pooled vector (H→DenseHidden→H).
+	SlidingWindow        int `json:"sliding_window,omitempty"`
+	SlidingWindowPattern int `json:"sliding_window_pattern,omitempty"`
+	QueryPreAttnScalar   int `json:"query_pre_attn_scalar,omitempty"`
+	DenseHidden          int `json:"dense_hidden,omitempty"`
 }
 
 // PositionOffset is the value added to a token's index to form its
@@ -106,9 +121,9 @@ func validate(c *Config, source string) error {
 		return fmt.Errorf("%s: pooling %q unsupported (mean, cls, or lasttoken)", source, c.Pooling)
 	}
 	switch c.Tokenizer {
-	case "", "sentencepiece":
+	case "", "sentencepiece", "gemma":
 	default:
-		return fmt.Errorf("%s: tokenizer %q unsupported (\"\" or sentencepiece)", source, c.Tokenizer)
+		return fmt.Errorf("%s: tokenizer %q unsupported (\"\", sentencepiece, or gemma)", source, c.Tokenizer)
 	}
 	switch c.ModelType {
 	case "", "bert", "distilbert":
@@ -145,6 +160,29 @@ func validate(c *Config, source string) error {
 		if c.RopeTheta <= 0 {
 			return fmt.Errorf("%s: qwen3 requires a positive rope_theta (found %g)", source, c.RopeTheta)
 		}
+	case "gemma3":
+		// EmbeddingGemma: bidirectional Gemma 3 backbone. head_dim is explicit
+		// and even for RoPE; GQA needs the query heads to partition over the kv
+		// heads; the sliding window, its period, the attention scalar, and both
+		// RoPE thetas are all read from config (refuse a manifest missing any).
+		if c.HeadDim <= 0 || c.HeadDim%2 != 0 {
+			return fmt.Errorf("%s: gemma3 requires an even head_dim > 0 (found %d)", source, c.HeadDim)
+		}
+		if c.NumKeyValueHeads <= 0 || c.NumAttentionHeads%c.NumKeyValueHeads != 0 {
+			return fmt.Errorf("%s: gemma3 requires num_attention_heads (%d) divisible by num_key_value_heads (%d)", source, c.NumAttentionHeads, c.NumKeyValueHeads)
+		}
+		if c.SlidingWindow < 1 || c.SlidingWindowPattern < 1 {
+			return fmt.Errorf("%s: gemma3 requires positive sliding_window and sliding_window_pattern (found %d and %d)", source, c.SlidingWindow, c.SlidingWindowPattern)
+		}
+		if c.QueryPreAttnScalar < 1 {
+			return fmt.Errorf("%s: gemma3 requires a positive query_pre_attn_scalar (found %d)", source, c.QueryPreAttnScalar)
+		}
+		if c.GlobalRopeTheta <= 0 || c.LocalRopeTheta <= 0 {
+			return fmt.Errorf("%s: gemma3 requires positive global_rope_theta and local_rope_theta (found %g and %g)", source, c.GlobalRopeTheta, c.LocalRopeTheta)
+		}
+		if c.DenseHidden < 1 {
+			return fmt.Errorf("%s: gemma3 requires a positive dense_hidden (found %d)", source, c.DenseHidden)
+		}
 	case "roberta":
 		// Unlike MPNet, HF's RoBERTa reads padding_idx from config — but
 		// zero is refused deliberately: PadTokenID is a plain int, so a
@@ -172,7 +210,7 @@ func validate(c *Config, source string) error {
 			return fmt.Errorf("%s: pad_token_id=%d — HF's MPNet embeddings hardcode padding_idx=1 regardless of config, so rembed only accepts 1", source, c.PadTokenID)
 		}
 	default:
-		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, modernbert, qwen3, roberta, or mpnet)", source, c.ModelType)
+		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, modernbert, qwen3, gemma3, roberta, or mpnet)", source, c.ModelType)
 	}
 	if c.LayerNormEps == 0 {
 		c.LayerNormEps = 1e-12

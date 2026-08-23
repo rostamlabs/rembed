@@ -97,6 +97,12 @@ jobs:
           path: ~/.cache/rembed
           key: rembed-models-v8
       - name: fetch models via the hub loader
+        env:
+          # EmbeddingGemma is gated: set repo secret HF_TOKEN to a token whose
+          # HF account has accepted the Gemma license to include it. Absent,
+          # the gemma fetch and its golden are skipped (the matrix skips a
+          # model whose dir is not present).
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           go run ./cmd/rembed embed -model sentence-transformers/all-MiniLM-L6-v2 "warm" > /dev/null
           go run ./cmd/rembed embed -model BAAI/bge-small-en-v1.5 "warm" > /dev/null
@@ -107,6 +113,9 @@ jobs:
           go run ./cmd/rembed embed -model sentence-transformers/multi-qa-distilbert-cos-v1 "warm" > /dev/null
           go run ./cmd/rembed embed -model nomic-ai/modernbert-embed-base "warm" > /dev/null
           go run ./cmd/rembed embed -model Qwen/Qwen3-Embedding-0.6B "warm" > /dev/null
+          if [ -n "$HF_TOKEN" ]; then
+            go run ./cmd/rembed embed -model google/embeddinggemma-300m "warm" > /dev/null
+          fi
       - name: golden suite (fp32, int8, cls, allocs, concurrency)
         run: |
           export REMBED_MODEL_DIR=~/.cache/rembed/sentence-transformers--all-MiniLM-L6-v2
@@ -118,6 +127,9 @@ jobs:
           export REMBED_MODEL_DISTIL=~/.cache/rembed/sentence-transformers--multi-qa-distilbert-cos-v1
           export REMBED_MODEL_MODERNBERT=~/.cache/rembed/nomic-ai--modernbert-embed-base
           export REMBED_MODEL_QWEN3=~/.cache/rembed/Qwen--Qwen3-Embedding-0.6B
+          # EmbeddingGemma: present only when HF_TOKEN was set above; the
+          # golden and tokenizer tests skip when the dir is absent.
+          export REMBED_MODEL_GEMMA=~/.cache/rembed/google--embeddinggemma-300m
           go test -v -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" . 2>&1 | tail -30
           go test -run "Golden|SteadyState|Concurrent|WithWorkers|Batch|Tokens" .
           # The BPE fixture needs real vocab/merges files; the hub cache
@@ -125,3 +137,4 @@ jobs:
           # here rather than silently skipping suite-wide.
           go test -v ./tokenizer/bpe
           go test -v ./tokenizer/sentencepiece
+          go test -v ./tokenizer/gemma

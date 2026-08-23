@@ -843,6 +843,14 @@ func TestGoldenMatrix(t *testing.T) {
 		// streaming-softmax accumulation shifted the worst full-int8 case to
 		// 0.9693, so the bound is 0.96).
 		{"testdata/golden-Qwen3-Embedding-0.6B.json", "models/Qwen3-Embedding-0.6B", "REMBED_MODEL_QWEN3", 1e-4, 0, 1e-5, 0.997, 0.96},
+		// EmbeddingGemma: the seventh architecture — a bidirectional Gemma 3
+		// backbone (unit-offset RMSNorm, per-head QK-norm, GQA, dual-theta
+		// RoPE, alternating sliding/global bidirectional attention, tanh-GELU
+		// GeGLU, four LayerNorms per layer) plus mean pooling and a two-layer
+		// bias-free Dense head. Reference is torch Gemma3TextModel (fp32, eager)
+		// with the explicit ST pooling+dense+normalize pipeline.
+		// int8 worst 0.998140, full int8 worst 0.993849 (measured), less margin.
+		{"testdata/golden-embeddinggemma-300m.json", "models/embeddinggemma-300m", "REMBED_MODEL_GEMMA", 1e-4, 0, 1e-5, 0.998, 0.99},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {
