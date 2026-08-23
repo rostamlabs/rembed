@@ -126,6 +126,67 @@ func TestModernBERTFixtureAgainstHF(t *testing.T) {
 	}
 }
 
+// qwenTok resolves and loads the Qwen3 tokenizer from its tokenizer.json.
+func qwenTok(t *testing.T) *Tokenizer {
+	t.Helper()
+	dir := os.Getenv("REMBED_MODEL_QWEN3")
+	if dir == "" {
+		dir = "../../models/Qwen3-Embedding-0.6B"
+	}
+	path := filepath.Join(dir, "tokenizer.json")
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("tokenizer.json not present (%v) — run models/convert.py for Qwen/Qwen3-Embedding-0.6B", err)
+	}
+	tok, err := NewQwenFromTokenizerJSON(path, "<|endoftext|>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+// TestQwenFixtureAgainstHF requires token-for-token equality with HF's
+// Qwen3 tokenizer over the committed fixture (models/qwen_fixture.py). It
+// pins the GPT-NeoX/Qwen pre-tokenizer's departures from GPT-2
+// (case-insensitive contractions, single-digit splitting, the broad letter
+// prefix, newline handling), NFC, and the suffix-only framing (a trailing
+// <|endoftext|>, no CLS).
+func TestQwenFixtureAgainstHF(t *testing.T) {
+	tok := qwenTok(t)
+	raw, err := os.ReadFile("testdata/qwen_fixture.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Cases []struct {
+			Text     string  `json:"text"`
+			InputIDs []int64 `json:"input_ids"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.Cases) < 20 {
+		t.Fatalf("suspiciously small fixture: %d cases", len(fixture.Cases))
+	}
+	for _, c := range fixture.Cases {
+		ids, mask := tok.Encode(c.Text, 512)
+		if !slices.Equal(ids, c.InputIDs) {
+			t.Errorf("%.50q:\n got %v\nwant %v", c.Text, ids, c.InputIDs)
+		}
+		if len(mask) != len(ids) {
+			t.Errorf("%.50q: mask length %d != ids length %d", c.Text, len(mask), len(ids))
+		}
+	}
+	// Framing: no prefix, a trailing <|endoftext|> (151643).
+	ids, _ := tok.Encode("hi", 512)
+	if len(ids) < 2 || ids[len(ids)-1] != 151643 {
+		t.Fatalf("qwen framing wrong: %v (want trailing 151643, no prefix)", ids)
+	}
+	if ids[0] == 151643 {
+		t.Fatalf("qwen must not prepend a prefix token: %v", ids)
+	}
+}
+
 // TestVocabSize pins the distilroberta vocab count (specials included).
 func TestVocabSize(t *testing.T) {
 	tok := loadTok(t)

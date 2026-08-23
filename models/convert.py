@@ -106,6 +106,12 @@ def pool(last_hidden: np.ndarray, mask: np.ndarray, mode: str, normalize: bool) 
     """
     if mode == "cls":
         pooled = last_hidden[0].astype(np.float32)
+    elif mode == "lasttoken":
+        # Qwen3-Embedding: the last non-padded token (the appended
+        # <|endoftext|>). Per-text with no padding, that is simply the
+        # final row.
+        idx = int(mask.sum()) - 1
+        pooled = last_hidden[idx].astype(np.float32)
     else:
         m = mask.astype(np.float32)[:, None]
         pooled = (last_hidden * m).sum(axis=0) / np.maximum(m.sum(), 1e-9)
@@ -167,9 +173,9 @@ def main() -> None:
     elif config.get("model_type") == "roberta":
         shutil.copyfile(fetch("vocab.json"), out / "vocab.json")
         shutil.copyfile(fetch("merges.txt"), out / "merges.txt")
-    elif config.get("model_type") == "modernbert":
-        # ModernBERT ships only tokenizer.json (byte-level BPE, vocab and
-        # merges embedded); no vocab.json/merges.txt.
+    elif config.get("model_type") in ("modernbert", "qwen3"):
+        # ModernBERT and Qwen3 ship only tokenizer.json (byte-level BPE,
+        # vocab and merges embedded); no vocab.json/merges.txt.
         shutil.copyfile(fetch("tokenizer.json"), out / "tokenizer.json")
     else:
         shutil.copyfile(fetch("vocab.txt"), out / "vocab.txt")
@@ -178,8 +184,18 @@ def main() -> None:
     modules = json.loads(fetch("modules.json").read_text())
 
     model_type = config.get("model_type")
-    if model_type not in ("bert", "distilbert", "modernbert", "roberta", "mpnet"):
-        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, modernbert, roberta, and mpnet models are supported")
+    if model_type not in ("bert", "distilbert", "modernbert", "qwen3", "roberta", "mpnet"):
+        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, modernbert, qwen3, roberta, and mpnet models are supported")
+    if model_type == "qwen3":
+        # Causal decoder embedder: SwiGLU (silu), full causal attention.
+        # Refuse a rope scaling (YaRN) or sliding window — geometry changes
+        # rembed's path does not implement.
+        if config.get("hidden_act", "silu") != "silu":
+            raise SystemExit(f"hidden_act={config.get('hidden_act')!r}: qwen3 supports only silu")
+        if config.get("rope_scaling"):
+            raise SystemExit(f"qwen3 rope_scaling={config.get('rope_scaling')!r} is not supported")
+        if config.get("use_sliding_window") or config.get("sliding_window"):
+            raise SystemExit("qwen3 sliding-window attention is not supported")
     if model_type == "modernbert":
         # rembed's ModernBERT path is bias-free; refuse a checkpoint that
         # enabled any bias (it would silently be dropped). Positions enter
@@ -212,18 +228,19 @@ def main() -> None:
     # The Go engine hardcodes exact-erf GELU and absolute position embeddings;
     # anything else would produce a valid-looking model dir that computes the
     # wrong thing, so refuse at export time.
-    if config.get("hidden_act", "gelu") != "gelu":
+    if model_type != "qwen3" and config.get("hidden_act", "gelu") != "gelu":
         raise SystemExit(f"hidden_act={config.get('hidden_act')!r}: only exact GELU is supported")
     if config.get("position_embedding_type", "absolute") != "absolute":
         raise SystemExit(f"position_embedding_type={config.get('position_embedding_type')!r}: only absolute is supported")
     mean = bool(pooling.get("pooling_mode_mean_tokens"))
     cls = bool(pooling.get("pooling_mode_cls_token"))
+    last = bool(pooling.get("pooling_mode_lasttoken"))
     other = any(pooling.get(k) for k in (
-        "pooling_mode_max_tokens", "pooling_mode_lasttoken",
+        "pooling_mode_max_tokens",
         "pooling_mode_mean_sqrt_len_tokens", "pooling_mode_weightedmean_tokens"))
-    if other or mean == cls:
-        raise SystemExit(f"unsupported pooling config (rembed supports mean or cls): {pooling}")
-    pool_mode = "mean" if mean else "cls"
+    if other or (mean + cls + last) != 1:
+        raise SystemExit(f"unsupported pooling config (rembed supports mean, cls, or lasttoken): {pooling}")
+    pool_mode = "mean" if mean else "cls" if cls else "lasttoken"
     # Any ST module beyond Transformer/Pooling/Normalize (e.g. a Dense head)
     # would make the real model differ from what rembed computes.
     known = ("models.Transformer", "models.Pooling", "models.Normalize")
@@ -248,7 +265,7 @@ def main() -> None:
         "vocab_size": config["vocab_size"],
         "max_position_embeddings": config["max_position_embeddings"],
         "layer_norm_eps": config.get("layer_norm_eps", 1e-12),
-        "do_lower_case": bool(tok_config.get("do_lower_case", False)) if (model_type in ("roberta", "modernbert") or sentencepiece_tok) else bool(tok_config.get("do_lower_case", True)),
+        "do_lower_case": bool(tok_config.get("do_lower_case", False)) if (model_type in ("roberta", "modernbert", "qwen3") or sentencepiece_tok) else bool(tok_config.get("do_lower_case", True)),
         "cls_token": tok_str(tok_config.get("cls_token"), "[CLS]"),
         "sep_token": tok_str(tok_config.get("sep_token"), "[SEP]"),
         "unk_token": tok_str(tok_config.get("unk_token"), "<unk>" if (model_type == "roberta" or sentencepiece_tok) else "[UNK]"),
@@ -266,6 +283,19 @@ def main() -> None:
         manifest["local_attention"] = config["local_attention"]
         manifest["global_rope_theta"] = config["global_rope_theta"]
         manifest["local_rope_theta"] = config["local_rope_theta"]
+    if model_type == "qwen3":
+        # Qwen3 causal decoder embedder: RMSNorm (rms_norm_eps), explicit
+        # head_dim (!= hidden/heads), GQA (num_key_value_heads), SwiGLU, and
+        # last-token pooling. Framing appends <|endoftext|> (the token
+        # config.eos_token_id points at, which last-token pooling reads);
+        # there is no CLS prefix.
+        manifest["model_type"] = "qwen3"
+        manifest["layer_norm_eps"] = config["rms_norm_eps"]
+        manifest["head_dim"] = config["head_dim"]
+        manifest["num_key_value_heads"] = config["num_key_value_heads"]
+        manifest["rope_theta"] = config["rope_theta"]
+        manifest["cls_token"] = ""
+        manifest["sep_token"] = "<|endoftext|>"
     if model_type == "distilbert":
         manifest["model_type"] = "distilbert"
     if model_type == "mpnet":
@@ -283,7 +313,7 @@ def main() -> None:
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     vocab_files = ("sentencepiece.bpe.model" if sentencepiece_tok
                    else "vocab.json merges.txt" if model_type == "roberta"
-                   else "tokenizer.json" if model_type == "modernbert" else "vocab.txt")
+                   else "tokenizer.json" if model_type in ("modernbert", "qwen3") else "vocab.txt")
     print(f"wrote {out}/[model.safetensors {vocab_files} manifest.json]")
 
     # --- golden reference (per-text, no padding) --------------------------
@@ -293,7 +323,7 @@ def main() -> None:
     # engines INDEPENDENT of the Go implementation under test — the point of
     # a golden.
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    if model_type == "modernbert":
+    if model_type in ("modernbert", "qwen3"):
         import torch
         from transformers import AutoModel
         torch_model = AutoModel.from_pretrained(

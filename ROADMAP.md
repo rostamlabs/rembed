@@ -178,10 +178,27 @@ pooling; note its search_query:/search_document: prefixes). Sizes: base
 22L/768/12h/1152, large 28L/1024/16h/2624, ctx 8192. Risk: low — the
 only new math is RoPE and the window mask. Roughly one R3-sized rung.
 
-## R10 — Qwen3-Embedding (decoder embedder)
-Not started, and the largest rung on the board — the first DECODER-based
-embedder, comparable in effort to R1–R8 combined, so realistically 3–4
-reviewed sub-branches. It reuses the golden harness, the byte-BPE
+## R10 — Qwen3-Embedding (decoder embedder) ✅
+Done: model_type=qwen3 end to end — the sixth architecture and the first
+causal DECODER used as an embedder. A dedicated path (qwen3.go) reusing
+R9's RoPE plus new math: RMSNorm; per-head QK-norm (an RMSNorm over
+head_dim applied to Q and K before RoPE); grouped-query attention (16
+query heads sharing 8 kv heads, head_dim=128 carried explicitly since it
+is not hidden/heads); a full causal mask; SwiGLU (silu(gate)·up); and
+last-token pooling on the appended <|endoftext|>. The tokenizer is a new
+hand-written GPT-NeoX/Qwen pre-tokenizer scanner (case-insensitive
+contractions, single-digit splitting, a broad letter prefix, newline
+handling — none of which the GPT-2 scanner does) with NFC and suffix-only
+framing, sharing the byte-BPE core with R9. Validated against the
+canonical PyTorch Qwen3Model (Qwen/Qwen3-Embedding-0.6B): fp32 maxAbs
+< 1e-4 over the 13-case golden; tokenizer token-for-token vs HF over a
+27-case fixture and 6k+ adversarial fuzz inputs (zero mismatches);
+parallel head fan-out bit-identical to serial. int8: weight-only ≥ 0.997,
+full int8 0.9747 (last-token pooling reads one position, so it has no
+averaging to hide activation error). BF16 weights load through the
+existing safetensors path. The original scope, for the record — needed:
+
+It reuses the golden harness, the byte-BPE
 tokenizer (Qwen2, GPT-2-style), L2 normalization, and the RoPE built in
 R9; everything else is new attention math:
 - **RMSNorm** (`internal/model/rmsnorm.go`) — replaces LayerNorm

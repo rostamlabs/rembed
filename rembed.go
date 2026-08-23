@@ -158,6 +158,11 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 		// and applies the declared NFC normalizer.
 		tok, err = bpe.NewFromTokenizerJSON(filepath.Join(modelDir, "tokenizer.json"),
 			cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
+	case cfg.ModelType == "qwen3":
+		// Qwen3 also ships byte-level BPE in tokenizer.json, but with the
+		// GPT-NeoX/Qwen pre-tokenizer and suffix-only framing (append the
+		// eos in cfg.SepToken; no CLS prefix).
+		tok, err = bpe.NewQwenFromTokenizerJSON(filepath.Join(modelDir, "tokenizer.json"), cfg.SepToken)
 	default:
 		tok, err = tokenizer.New(filepath.Join(modelDir, "vocab.txt"), cfg.DoLowerCase, cfg.ClsToken, cfg.SepToken, cfg.UnkToken)
 	}
@@ -180,11 +185,11 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 64 {
 			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 		}
-	case cfg.ModelType == "modernbert":
-		// ModernBERT pads its embedding table to a round number (50368 rows
-		// for ~50310 vocab+added tokens), so the check is one-sided like
-		// SentencePiece: a small positive gap is the padding; a negative or
-		// large gap means a mismatched tokenizer.json.
+	case cfg.ModelType == "modernbert" || cfg.ModelType == "qwen3":
+		// ModernBERT and Qwen3 pad their embedding tables to round numbers
+		// (ModernBERT 50368 rows for ~50310 tokens; Qwen3 151669), so the
+		// check is one-sided like SentencePiece: a small positive gap is the
+		// padding; a negative or large gap means a mismatched tokenizer.json.
 		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 128 {
 			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 		}

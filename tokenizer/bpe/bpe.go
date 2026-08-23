@@ -49,6 +49,11 @@ type Tokenizer struct {
 	added              map[string]addedTok
 	addedFirst         [256]bool
 	addedMin, addedMax int
+	// qwenPre selects the GPT-NeoX/Qwen pre-tokenizer instead of GPT-2's.
+	// noPrefix skips the cls/bos prefix at Encode (Qwen3 frames with only a
+	// trailing eos in sep).
+	qwenPre  bool
+	noPrefix bool
 	// lstripToks are the added tokens with lstrip=true ([MASK]). HF matches
 	// them as `\s*<content>` leftmost-longest, so a preceding whitespace run
 	// is consumed by the token (and never claimed as a whitespace-run added
@@ -153,12 +158,12 @@ func New(vocabPath, mergesPath, clsTok, sepTok, unkTok string) (*Tokenizer, erro
 	return t, nil
 }
 
-// NewFromTokenizerJSON loads a byte-level BPE tokenizer from a HuggingFace
-// tokenizer.json (the ModernBERT case: no vocab.json/merges.txt ship). The
-// vocab and merges are embedded under "model", and the added_tokens carry
-// the specials (which the framing tokens are looked up in). NFC
-// normalization is enabled to match ModernBERT's declared normalizer.
-func NewFromTokenizerJSON(path, clsTok, sepTok, unkTok string) (*Tokenizer, error) {
+// parseBPEJSON builds a base Tokenizer (vocab, merges, added tokens,
+// normalizer) from a HuggingFace tokenizer.json — the shared core of the
+// ModernBERT and Qwen3 loaders, which then differ only in framing and
+// pre-tokenizer variant. The framing tokens (cls/sep/unk) and the
+// qwenPre/noPrefix flags are left for the caller to set.
+func parseBPEJSON(path string) (*Tokenizer, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -258,22 +263,55 @@ func NewFromTokenizerJSON(path, clsTok, sepTok, unkTok string) (*Tokenizer, erro
 		added: added, addedFirst: addedFirst, addedMin: addedMin, addedMax: addedMax,
 		lstripToks: lstripToks,
 	}
-	lookup := func(tok, what string) (int64, error) {
-		id, ok := vocab[tok]
-		if !ok {
-			return 0, fmt.Errorf("bpe: %s token %q not in %s", what, tok, path)
-		}
-		return id, nil
+	return t, nil
+}
+
+// lookupTok resolves a token content to its id in the loaded vocab.
+func (t *Tokenizer) lookupTok(tok, what, path string) (int64, error) {
+	id, ok := t.vocab[tok]
+	if !ok {
+		return 0, fmt.Errorf("bpe: %s token %q not in %s", what, tok, path)
 	}
-	if t.cls, err = lookup(clsTok, "cls"); err != nil {
+	return id, nil
+}
+
+// NewFromTokenizerJSON loads a byte-level BPE tokenizer from a HuggingFace
+// tokenizer.json (the ModernBERT case: no vocab.json/merges.txt ship),
+// framing with cls…sep like RoBERTa and using the GPT-2 pre-tokenizer. NFC
+// normalization is enabled to match ModernBERT's declared normalizer.
+func NewFromTokenizerJSON(path, clsTok, sepTok, unkTok string) (*Tokenizer, error) {
+	t, err := parseBPEJSON(path)
+	if err != nil {
 		return nil, err
 	}
-	if t.sep, err = lookup(sepTok, "sep"); err != nil {
+	if t.cls, err = t.lookupTok(clsTok, "cls", path); err != nil {
 		return nil, err
 	}
-	if t.unk, err = lookup(unkTok, "unk"); err != nil {
+	if t.sep, err = t.lookupTok(sepTok, "sep", path); err != nil {
 		return nil, err
 	}
+	if t.unk, err = t.lookupTok(unkTok, "unk", path); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// NewQwenFromTokenizerJSON loads Qwen3's byte-level BPE tokenizer: the
+// GPT-NeoX/Qwen pre-tokenizer (different from GPT-2 — case-insensitive
+// contractions, single-digit splitting, a broader letter prefix), NFC
+// normalization, and SUFFIX-ONLY framing — no CLS/BOS prefix, and eosTok
+// (<|endoftext|>) appended, which last-token pooling then reads.
+func NewQwenFromTokenizerJSON(path, eosTok string) (*Tokenizer, error) {
+	t, err := parseBPEJSON(path)
+	if err != nil {
+		return nil, err
+	}
+	t.qwenPre = true
+	t.noPrefix = true
+	if t.sep, err = t.lookupTok(eosTok, "eos", path); err != nil {
+		return nil, err
+	}
+	t.unk = t.sep // byte-level BPE never emits unk; keep a valid guard id
 	return t, nil
 }
 
@@ -392,6 +430,129 @@ func (t *Tokenizer) preTokenize(text string) []string {
 	return out
 }
 
+// preTok dispatches to the pre-tokenizer variant this tokenizer uses.
+func (t *Tokenizer) preTok(text string) []string {
+	if t.qwenPre {
+		return t.preTokenizeQwen(text)
+	}
+	return t.preTokenize(text)
+}
+
+// preTokenizeQwen splits text with the GPT-NeoX/Qwen pattern (the ByteLevel
+// pre-tokenizer's Split step):
+//
+//	(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+//
+// Go's regexp has no lookahead or ordered-alternation semantics the way HF's
+// Rust regex applies them, so the scanner reproduces the leftmost-first
+// alternation by hand. Differences from GPT-2 (preTokenize): contractions
+// are case-INSENSITIVE; a letter run may take ANY single non-newline
+// non-alphanumeric prefix (not just a space); digits are emitted ONE at a
+// time; punctuation runs may absorb trailing newlines; and a whitespace run
+// containing a newline is cut at its last newline.
+func (t *Tokenizer) preTokenizeQwen(text string) []string {
+	isNL := func(r rune) bool { return r == '\r' || r == '\n' }
+	var out []string
+	rs := []rune(text)
+	i, n := 0, len([]rune(text))
+	for i < n {
+		r := rs[i]
+		// 1. (?i:'s|'t|'re|'ve|'m|'ll|'d) — case-insensitive, apostrophe-led.
+		if r == '\'' && i+1 < n {
+			rest := rs[i+1:]
+			matched := ""
+			for _, suf := range [...]string{"s", "t", "re", "ve", "m", "ll", "d"} {
+				sr := []rune(suf)
+				if len(rest) >= len(sr) && strings.EqualFold(string(rest[:len(sr)]), suf) {
+					matched = string(rest[:len(sr)])
+					break
+				}
+			}
+			if matched != "" {
+				out = append(out, "'"+matched)
+				i += 1 + len([]rune(matched))
+				continue
+			}
+		}
+		// 2. [^\r\n\p{L}\p{N}]?\p{L}+ — letters with an optional single
+		// non-newline, non-alphanumeric prefix (space, punct, tab, …).
+		{
+			j := i
+			if !isNL(r) && !unicode.IsLetter(r) && !isNum(r) && i+1 < n && unicode.IsLetter(rs[i+1]) {
+				j = i + 1
+			}
+			if j < n && unicode.IsLetter(rs[j]) {
+				k := j
+				for k < n && unicode.IsLetter(rs[k]) {
+					k++
+				}
+				out = append(out, string(rs[i:k]))
+				i = k
+				continue
+			}
+		}
+		// 3. \p{N} — a single digit.
+		if isNum(r) {
+			out = append(out, string(r))
+			i++
+			continue
+		}
+		// 4.  ?[^\s\p{L}\p{N}]+[\r\n]* — optional space, a run of
+		// non-space/non-alphanumeric, then trailing newlines.
+		{
+			j := i
+			if r == ' ' {
+				j++
+			}
+			if j < n && !unicode.IsSpace(rs[j]) && !unicode.IsLetter(rs[j]) && !isNum(rs[j]) {
+				k := j
+				for k < n && !unicode.IsSpace(rs[k]) && !unicode.IsLetter(rs[k]) && !isNum(rs[k]) {
+					k++
+				}
+				for k < n && isNL(rs[k]) {
+					k++
+				}
+				out = append(out, string(rs[i:k]))
+				i = k
+				continue
+			}
+		}
+		// Remaining branches are whitespace runs. Find the run [i,k).
+		k := i
+		for k < n && unicode.IsSpace(rs[k]) {
+			k++
+		}
+		// 5. \s*[\r\n]+ — a run containing a newline is cut after its LAST
+		// newline; the rest re-enters the loop.
+		last := -1
+		for p := i; p < k; p++ {
+			if isNL(rs[p]) {
+				last = p
+			}
+		}
+		if last >= 0 {
+			out = append(out, string(rs[i:last+1]))
+			i = last + 1
+			continue
+		}
+		// 6. \s+(?!\S) / 7. \s+ — a newline-free space run: the whole run at
+		// end-of-text, else all but the last char (which prefixes the next
+		// token, matching GPT-2's backtrack).
+		switch {
+		case k == n:
+			out = append(out, string(rs[i:k]))
+			i = k
+		case k-i > 1:
+			out = append(out, string(rs[i:k-1]))
+			i = k - 1
+		default:
+			out = append(out, string(rs[i:k]))
+			i = k
+		}
+	}
+	return out
+}
+
 // bpe merges one byte-encoded pre-token into vocabulary symbols with a
 // doubly-linked symbol list and a min-heap of merge candidates ordered by
 // (rank, position) — the algorithm HF's fast (Rust) tokenizer uses.
@@ -503,16 +664,22 @@ func (t *Tokenizer) Encode(text string, maxLen int) (ids, mask []int64) {
 	if t.nfc {
 		text = norm.NFC.String(text)
 	}
-	ids = append(ids, t.cls)
-	// Framing always survives: like the WordPiece path, maxLen < 2 clamps
-	// the content budget to zero and still returns [cls, sep].
-	budget := max(maxLen-2, 0)
+	// Framing: RoBERTa/ModernBERT prepend cls and append sep; Qwen3 appends
+	// only the eos (in sep) with no prefix. The suffix always survives, so
+	// maxLen below the framing count clamps the content budget to zero and
+	// still returns the framing.
+	framing := 1
+	if !t.noPrefix {
+		ids = append(ids, t.cls)
+		framing++
+	}
+	budget := max(maxLen-framing, 0)
 
 	// emitBPE runs the byte-BPE pipeline over one gap of ordinary text,
 	// appending ids until the budget runs out; returns false when it does.
 	var sb strings.Builder
 	emitBPE := func(gap string) bool {
-		for _, pre := range t.preTokenize(gap) {
+		for _, pre := range t.preTok(gap) {
 			sb.Reset()
 			for _, b := range []byte(pre) {
 				sb.WriteRune(t.byteEnc[b])
