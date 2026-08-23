@@ -14,7 +14,7 @@ import (
 // sentence-transformers pooling config.
 type Config struct {
 	Name                  string  `json:"name"`
-	ModelType             string  `json:"model_type,omitempty"` // "" or "bert", or "mpnet"
+	ModelType             string  `json:"model_type,omitempty"` // "", bert, distilbert, roberta, or mpnet
 	HiddenSize            int     `json:"hidden_size"`
 	NumHiddenLayers       int     `json:"num_hidden_layers"`
 	NumAttentionHeads     int     `json:"num_attention_heads"`
@@ -91,7 +91,7 @@ func validate(c *Config, source string) error {
 		return fmt.Errorf("%s: tokenizer %q unsupported (\"\" or sentencepiece)", source, c.Tokenizer)
 	}
 	switch c.ModelType {
-	case "", "bert":
+	case "", "bert", "distilbert":
 	case "roberta":
 		// Unlike MPNet, HF's RoBERTa reads padding_idx from config — but
 		// zero is refused deliberately: PadTokenID is a plain int, so a
@@ -119,7 +119,7 @@ func validate(c *Config, source string) error {
 			return fmt.Errorf("%s: pad_token_id=%d — HF's MPNet embeddings hardcode padding_idx=1 regardless of config, so rembed only accepts 1", source, c.PadTokenID)
 		}
 	default:
-		return fmt.Errorf("%s: model_type %q unsupported (bert, roberta, or mpnet)", source, c.ModelType)
+		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, roberta, or mpnet)", source, c.ModelType)
 	}
 	if c.LayerNormEps == 0 {
 		c.LayerNormEps = 1e-12

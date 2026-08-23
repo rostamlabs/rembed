@@ -521,3 +521,35 @@ the zmm win survives intact there: ffn2 28×3072×768 380→348 µs (~9%),
 long-seq ffn1 160×768×3072 740→662 µs (~11%), stable across repeats.
 This is exactly the class of interaction the serial-pool A/B was blind
 to, and the review caught it before it shipped.
+
+## Coverage expansion — 15 validated models, 4 architectures (2026-08-23)
+
+Seven models added in one pass. Six were free — architectures rembed
+already runs, needing only ONNX golden validation: multilingual-e5-small
+(fp32 1.7e-7 — the e5 family is now VALIDATED, not just "expected
+compatible"), bge-base-en-v1.5 (7.4e-7, cls), gte-base (3.8e-6),
+paraphrase-mpnet-base-v2 (1.2e-6), multi-qa-MiniLM-L6-cos-v1 (2.1e-7),
+snowflake-arctic-embed-s (2.5e-7, cls). The seventh is a new (fourth)
+architecture: DistilBERT — same post-LN flow as BERT with renamed
+tensors and config keys, no token-type table —
+multi-qa-distilbert-cos-v1 at 2.5e-7. Weight-only int8 bounds measured
+and matrix-enforced for all seven.
+
+Two real fixes fell out of the expansion, both caught by goldens:
+
+- The WordPiece tokenizer kept Cf format characters that HF's
+  _clean_text drops — most visibly U+200C ZWNJ, which Persian uses
+  INSIDE words («می‌کند»). The distilbert golden's Persian case failed
+  with ids-match=false and a 0.0277 embedding error while
+  last_hidden_state matched at 5e-6 — the numerics were perfect and the
+  tokenizer was the culprit, exactly the attribution the golden design
+  intends. Fixed to exact _clean_text parity (\t\n\r split; all other
+  Cc/Cf/Co/Cs deleted; Cn KEPT — the review's differential run showed
+  Go's combined unicode.C table would delete unassigned codepoints HF
+  keeps, i.e. anything newer than the toolchain's Unicode tables).
+  Persian ids now match on every WordPiece model, with per-model fp32
+  ranging 1.0e-7 (e5) to 3.8e-6 (gte-base) on the Persian case.
+- paraphrase-mpnet-base-v2 writes its special tokens in AddedToken
+  object form ({"content": "<s>", …}); both convert.py and the Go
+  derivation now unwrap it — a long-standing backlog item closed by the
+  first repo that actually shipped the form.

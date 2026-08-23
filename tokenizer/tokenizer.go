@@ -127,10 +127,26 @@ func (t *Tokenizer) basicTokens(text string) []string {
 			// accent stripping: drop combining marks exposed by NFD
 		case r == 0xFFFD:
 			// drop, mirroring HF _clean_text
+		case r == '\t' || r == '\n' || r == '\r':
+			// HF's _clean_text: exactly these three category-C characters
+			// are whitespace; every OTHER C character is DELETED (below)
+			// before whitespace mapping runs — so \v, \f, and U+0085,
+			// which Go's IsSpace would otherwise treat as separators, must
+			// not reach it (HF deletes them and JOINS the neighbors).
+			flush()
+		case unicode.In(r, unicode.Cc, unicode.Cf, unicode.Co, unicode.Cs):
+			// Drop Cc controls AND Cf format characters — the zero-width
+			// non-joiner U+200C that Persian uses inside words («می‌کند»),
+			// ZWJ, soft hyphen, direction marks (caught by the distilbert
+			// golden's Persian case; Go's IsControl is Cc-only). The four
+			// categories are listed explicitly: Go's combined unicode.C
+			// table ALSO covers Cn (unassigned), which HF KEEPS — using it
+			// would silently delete every codepoint newer than the Go
+			// toolchain's Unicode tables (the review measured 7/10
+			// unassigned probes diverging). After this drop, IsSpace below
+			// reduces to exactly Zs∪Zl∪Zp — HF's whitespace set.
 		case unicode.IsSpace(r):
 			flush()
-		case unicode.IsControl(r):
-			// drop
 		case isCJKIdeograph(r):
 			flush()
 			out = append(out, string(r))

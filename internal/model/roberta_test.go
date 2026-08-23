@@ -137,3 +137,48 @@ func TestDeriveConfigSentencePiece(t *testing.T) {
 		t.Fatalf("file-presence detection or stale do_lower_case handling wrong: %+v", cfg)
 	}
 }
+
+// TestDeriveConfigDistilBERT: DistilBERT spells its architecture with
+// different config keys (dim/n_layers/n_heads/hidden_dim/activation) —
+// the derivation folds them into the BERT names, and refuses the
+// sinusoidal-position variant the engine cannot represent.
+func TestDeriveConfigDistilBERT(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("config.json", `{"model_type":"distilbert","activation":"gelu","dim":768,
+		"n_layers":6,"n_heads":12,"hidden_dim":3072,"vocab_size":30522,
+		"max_position_embeddings":512,"sinusoidal_pos_embds":false}`)
+	write("tokenizer_config.json", `{"do_lower_case":true,"cls_token":"[CLS]","sep_token":"[SEP]","unk_token":"[UNK]"}`)
+	write("1_Pooling/config.json", `{"pooling_mode_mean_tokens":true,"pooling_mode_cls_token":false}`)
+	write("modules.json", `[{"type":"sentence_transformers.models.Transformer"},
+		{"type":"sentence_transformers.models.Pooling"},
+		{"type":"sentence_transformers.models.Normalize"}]`)
+
+	cfg, err := DeriveConfig(dir, "test-distil")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelType != "distilbert" || cfg.HiddenSize != 768 || cfg.NumHiddenLayers != 6 ||
+		cfg.NumAttentionHeads != 12 || cfg.IntermediateSize != 3072 {
+		t.Fatalf("distilbert key folding wrong: %+v", cfg)
+	}
+	if cfg.PositionOffset() != 0 || cfg.MaxSeqLen() != 512 || cfg.LayerNormEps != 1e-12 {
+		t.Fatalf("distilbert defaults wrong: %+v", cfg)
+	}
+
+	write("config.json", `{"model_type":"distilbert","activation":"gelu","dim":768,
+		"n_layers":6,"n_heads":12,"hidden_dim":3072,"vocab_size":30522,
+		"max_position_embeddings":512,"sinusoidal_pos_embds":true}`)
+	if _, err := DeriveConfig(dir, "test-distil"); err == nil {
+		t.Fatal("expected refusal for sinusoidal_pos_embds=true")
+	}
+}
