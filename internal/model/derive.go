@@ -62,6 +62,15 @@ func DeriveConfig(dir, name string) (Config, error) {
 		LocalAttention         int      `json:"local_attention"`
 		GlobalRopeTheta        float64  `json:"global_rope_theta"`
 		LocalRopeTheta         float64  `json:"local_rope_theta"`
+
+		// Qwen3 (decoder embedder).
+		HeadDim          int             `json:"head_dim"`
+		NumKeyValueHeads int             `json:"num_key_value_heads"`
+		RopeTheta        float64         `json:"rope_theta"`
+		RMSNormEps       *float32        `json:"rms_norm_eps"`
+		RopeScaling      json.RawMessage `json:"rope_scaling"`
+		SlidingWindow    *int            `json:"sliding_window"`
+		UseSlidingWindow bool            `json:"use_sliding_window"`
 	}
 	if err := readJSON("config.json", &hf); err != nil {
 		return c, err
@@ -98,6 +107,26 @@ func DeriveConfig(dir, name string) (Config, error) {
 		if hf.HiddenActivation != "" && hf.HiddenActivation != "gelu" {
 			return c, fmt.Errorf("model dir %s: hidden_activation=%q — only exact GELU is supported", dir, hf.HiddenActivation)
 		}
+	case "qwen3":
+		// A causal decoder used as an embedder. SwiGLU uses SiLU (not the
+		// GELU the encoders use). Refuse anything that would silently change
+		// the geometry: a rope scaling (YaRN — this checkpoint ships none),
+		// any sliding-window attention (Qwen3-Embedding is full causal), and
+		// attention_bias (the qwen3 loader allocates no bias tensors, so a
+		// biased checkpoint would drop them silently — QK-norm replaced the
+		// Qwen2 QKV bias, so real Qwen3 has none).
+		if hf.HiddenAct != "" && hf.HiddenAct != "silu" {
+			return c, fmt.Errorf("model dir %s: hidden_act=%q — qwen3 supports only silu (SwiGLU)", dir, hf.HiddenAct)
+		}
+		if hf.AttentionBias {
+			return c, fmt.Errorf("model dir %s: qwen3 with attention_bias is not supported (rembed's qwen3 path is bias-free)", dir)
+		}
+		if len(hf.RopeScaling) > 0 && string(hf.RopeScaling) != "null" {
+			return c, fmt.Errorf("model dir %s: qwen3 rope_scaling=%s is not supported (only default RoPE)", dir, hf.RopeScaling)
+		}
+		if hf.UseSlidingWindow || (hf.SlidingWindow != nil && *hf.SlidingWindow > 0) {
+			return c, fmt.Errorf("model dir %s: qwen3 sliding-window attention is not supported (only full causal)", dir)
+		}
 	case "roberta":
 		if hf.PadTokenID == nil {
 			// RoBERTa's position rows are offset by pad_token_id+1;
@@ -115,9 +144,11 @@ func DeriveConfig(dir, name string) (Config, error) {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
 		}
 	default:
-		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, roberta, and mpnet encoders", dir, hf.ModelType)
+		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, qwen3, roberta, and mpnet encoders", dir, hf.ModelType)
 	}
-	if hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
+	// qwen3's activation (silu, for SwiGLU) is validated in its case above;
+	// the encoders' exact-GELU requirement does not apply to it.
+	if hf.ModelType != "qwen3" && hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
 		key := "hidden_act"
 		if hf.ModelType == "distilbert" {
 			key = "activation" // distilbert's spelling of the same knob
@@ -173,7 +204,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 	doLower := false
 	switch {
 	case sentencePiece:
-	case hf.ModelType == "roberta" || hf.ModelType == "modernbert":
+	case hf.ModelType == "roberta" || hf.ModelType == "modernbert" || hf.ModelType == "qwen3":
 		if tok.DoLowerCase != nil && *tok.DoLowerCase {
 			return c, fmt.Errorf("model dir %s: do_lower_case=true on a %s model — byte-level BPE is case-preserving", dir, hf.ModelType)
 		}
@@ -243,6 +274,20 @@ func DeriveConfig(dir, name string) (Config, error) {
 		c.LocalAttention = hf.LocalAttention
 		c.GlobalRopeTheta = hf.GlobalRopeTheta
 		c.LocalRopeTheta = hf.LocalRopeTheta
+	case "qwen3":
+		// Qwen3 spells its norm eps rms_norm_eps; carry it plus the explicit
+		// head_dim, the kv-head count (GQA), and the RoPE base.
+		if hf.RMSNormEps != nil {
+			c.LayerNormEps = *hf.RMSNormEps
+		}
+		c.HeadDim = hf.HeadDim
+		c.NumKeyValueHeads = hf.NumKeyValueHeads
+		c.RopeTheta = hf.RopeTheta
+		// Qwen3-Embedding frames with a trailing <|endoftext|> (the token
+		// config.eos_token_id points at, id 151643) and no prefix; last-token
+		// pooling reads that position. SepToken carries the suffix content.
+		c.ClsToken = ""
+		c.SepToken = "<|endoftext|>"
 	}
 	return c, validate(&c, dir)
 }
@@ -264,7 +309,7 @@ func poolingMode(p map[string]any) (string, error) {
 			return false
 		}
 	}
-	var mean, cls bool
+	var mean, cls, last bool
 	for k, v := range p {
 		if !strings.HasPrefix(k, "pooling_mode_") || !truthy(v) {
 			continue
@@ -274,18 +319,29 @@ func poolingMode(p map[string]any) (string, error) {
 			mean = true
 		case "pooling_mode_cls_token":
 			cls = true
+		case "pooling_mode_lasttoken":
+			last = true
 		default:
-			return "", fmt.Errorf("unsupported pooling mode %q (rembed supports mean or cls)", k)
+			return "", fmt.Errorf("unsupported pooling mode %q (rembed supports mean, cls, or lasttoken)", k)
 		}
 	}
 	switch {
-	case mean && cls, !mean && !cls:
-		return "", fmt.Errorf("unsupported pooling config %v (rembed supports exactly one of mean or cls)", p)
+	case b2i(mean)+b2i(cls)+b2i(last) != 1:
+		return "", fmt.Errorf("unsupported pooling config %v (rembed supports exactly one of mean, cls, or lasttoken)", p)
 	case mean:
 		return "mean", nil
-	default:
+	case cls:
 		return "cls", nil
+	default:
+		return "lasttoken", nil
 	}
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // LoadConfigOrDerive prefers manifest.json (a converted model dir) and

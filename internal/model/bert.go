@@ -5,10 +5,12 @@
 // post-LayerNorm) → mean pooling → L2 normalize. MPNet shares the entire
 // pipeline with two deltas: positions are offset by pad_token_id+1 and
 // there is no segment embedding, and every layer's attention scores add a
-// shared bucketed relative-position bias before softmax. ModernBERT is
-// different enough (rotary positions, pre-norm bias-free LayerNorms,
-// GeGLU, sliding-window local attention) to have its own load + forward
-// path in modernbert.go, reusing this package's kernels and scratch pool.
+// shared bucketed relative-position bias before softmax. ModernBERT
+// (rotary positions, pre-norm bias-free LayerNorms, GeGLU, sliding-window
+// local attention) and Qwen3 (a causal decoder embedder: RMSNorm, QK-norm,
+// grouped-query attention, SwiGLU, last-token pooling) are each different
+// enough to have their own load + forward path — modernbert.go and
+// qwen3.go — reusing this package's kernels and scratch pool.
 package model
 
 import (
@@ -77,6 +79,11 @@ type Model struct {
 	embNormG   []float32
 	finalNormG []float32
 	zeroBeta   []float32
+
+	// Qwen3 path (cfg.ModelType == "qwen3"); nil otherwise. A causal
+	// decoder embedder — see qwen3.go. wordEmb is embed_tokens; finalNormG
+	// is the trailing RMSNorm (reused). There is no embedding norm.
+	qwLayers []qwLayer
 
 	scratchPool sync.Pool // *scratch, buffers grown on demand
 }
@@ -152,6 +159,17 @@ type scratch struct {
 	geglu      []float32 // [seq×I]
 	cosG, sinG []float32 // [seq×dh/2] global-theta RoPE table
 	cosL, sinL []float32 // [seq×dh/2] local-theta RoPE table
+
+	// Qwen3-only buffers. q/k/v are the separate (non-fused) projections;
+	// kHead/vHeadT are the per-kv-head normed+RoPE'd K and Vᵀ (computed once
+	// and shared across a GQA group); qHead/cHead are per-q-head scratch;
+	// swUp holds the SwiGLU up-projection.
+	qwQ, qwK, qwV     []float32 // [mPad×qDim], [mPad×kvDim], [mPad×kvDim]
+	qwKHead, qwVHeadT []float32 // [nkv×seq×dh], [nkv×dh×seq]
+	qwQHead, qwCHead  []float32 // [nq×seq×dh]
+	qwScores          []float32 // [nq×seq×seq]
+	qwCtx             []float32 // [seq×qDim]
+	qwUp              []float32 // [mPad×I]
 }
 
 // grow reslices buf to n floats, reallocating only when capacity is short.
@@ -258,6 +276,11 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 		// attention, bias-free, no position/segment tables) to warrant a
 		// dedicated load + forward path — see modernbert.go.
 		return loadModernBERT(tensors, cfg, quantize, workers, weightsPath)
+	}
+	if cfg.ModelType == "qwen3" {
+		// Qwen3: a causal decoder embedder (RMSNorm, QK-norm, GQA, RoPE,
+		// SwiGLU, last-token pooling) — dedicated path in qwen3.go.
+		return loadQwen3(tensors, cfg, quantize, workers, weightsPath)
 	}
 	prefix := ""
 	for _, p := range []string{"bert.", "roberta.", "mpnet.", "distilbert."} {
@@ -453,6 +476,17 @@ func (m *Model) Workers() int { return m.workers }
 // requested int8 can check the mode took effect instead of discovering
 // fp32 memory and speed later.
 func (m *Model) Quantized() bool {
+	if m.qwLayers != nil {
+		for i := range m.qwLayers {
+			l := &m.qwLayers[i]
+			for _, w := range []*denseWeight{&l.qProj, &l.kProj, &l.vProj, &l.oProj, &l.gateProj, &l.upProj, &l.downProj} {
+				if w.packed8 == nil && w.packed8v == nil {
+					return false
+				}
+			}
+		}
+		return len(m.qwLayers) > 0
+	}
 	if m.mbLayers != nil {
 		for i := range m.mbLayers {
 			l := &m.mbLayers[i]
@@ -479,6 +513,17 @@ func (m *Model) Quantized() bool {
 // u8-activation path (QuantFull requested AND AVX-VNNI present AND every
 // shape packed).
 func (m *Model) QuantizedActivations() bool {
+	if m.qwLayers != nil {
+		for i := range m.qwLayers {
+			l := &m.qwLayers[i]
+			for _, w := range []*denseWeight{&l.qProj, &l.kProj, &l.vProj, &l.oProj, &l.gateProj, &l.upProj, &l.downProj} {
+				if w.packed8v == nil {
+					return false
+				}
+			}
+		}
+		return len(m.qwLayers) > 0
+	}
 	if m.mbLayers != nil {
 		for i := range m.mbLayers {
 			l := &m.mbLayers[i]
@@ -525,24 +570,34 @@ func (m *Model) ForwardWorkers(ids []int64, workers int) ([]float32, error) {
 	// normalization. cls takes the first token's hidden state (BGE-style
 	// models); mean averages all positions (sentence-transformers style).
 	pooled := make([]float32, H)
-	if m.cfg.Pooling == "cls" {
+	switch m.cfg.Pooling {
+	case "cls":
 		copy(pooled, x[:H])
-	} else {
-		for i := range seq {
-			row := x[i*H : i*H+H]
-			for j := range pooled {
-				pooled[j] += row[j]
-			}
-		}
-		inv := 1 / float32(seq)
-		for j := range pooled {
-			pooled[j] *= inv
-		}
+	case "lasttoken":
+		// Qwen3: the final token's hidden state (the appended <|endoftext|>).
+		// No padding, so it is the last row.
+		copy(pooled, x[(seq-1)*H:seq*H])
+	default:
+		poolMean(pooled, x, seq, H)
 	}
 	if m.cfg.Normalize {
 		tensor.L2Normalize(pooled)
 	}
 	return pooled, nil
+}
+
+// poolMean averages all seq rows of x[seq×H] into pooled[H].
+func poolMean(pooled, x []float32, seq, H int) {
+	for i := range seq {
+		row := x[i*H : i*H+H]
+		for j := range pooled {
+			pooled[j] += row[j]
+		}
+	}
+	inv := 1 / float32(seq)
+	for j := range pooled {
+		pooled[j] *= inv
+	}
 }
 
 // ForwardTokens returns the final-layer hidden state for every token —
@@ -590,6 +645,9 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	}
 	if m.mbLayers != nil {
 		return m.encodeModernBERT(ids, workers)
+	}
+	if m.qwLayers != nil {
+		return m.encodeQwen3(ids, workers)
 	}
 	H := m.cfg.HiddenSize
 	heads := m.cfg.NumAttentionHeads

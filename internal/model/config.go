@@ -51,6 +51,15 @@ type Config struct {
 	LocalAttention         int     `json:"local_attention,omitempty"`
 	GlobalRopeTheta        float64 `json:"global_rope_theta,omitempty"`
 	LocalRopeTheta         float64 `json:"local_rope_theta,omitempty"`
+
+	// Qwen3 (decoder embedder) only. A causal decoder used for embeddings:
+	// RoPE (single RopeTheta), RMSNorm, per-head QK-norm, grouped-query
+	// attention (NumKeyValueHeads < NumAttentionHeads), SwiGLU, and
+	// last-token pooling. HeadDim is carried explicitly because it is NOT
+	// HiddenSize/NumAttentionHeads (Qwen3-0.6B: 128 vs 1024/16=64).
+	HeadDim          int     `json:"head_dim,omitempty"`
+	NumKeyValueHeads int     `json:"num_key_value_heads,omitempty"`
+	RopeTheta        float64 `json:"rope_theta,omitempty"`
 }
 
 // PositionOffset is the value added to a token's index to form its
@@ -93,8 +102,8 @@ func validate(c *Config, source string) error {
 	if c.HiddenSize%c.NumAttentionHeads != 0 {
 		return fmt.Errorf("%s: hidden_size %d not divisible by num_attention_heads %d", source, c.HiddenSize, c.NumAttentionHeads)
 	}
-	if c.Pooling != "mean" && c.Pooling != "cls" {
-		return fmt.Errorf("%s: pooling %q unsupported (mean or cls)", source, c.Pooling)
+	if c.Pooling != "mean" && c.Pooling != "cls" && c.Pooling != "lasttoken" {
+		return fmt.Errorf("%s: pooling %q unsupported (mean, cls, or lasttoken)", source, c.Pooling)
 	}
 	switch c.Tokenizer {
 	case "", "sentencepiece":
@@ -123,6 +132,19 @@ func validate(c *Config, source string) error {
 		if dh := c.HiddenSize / c.NumAttentionHeads; dh%2 != 0 {
 			return fmt.Errorf("%s: modernbert head_dim %d must be even for RoPE", source, dh)
 		}
+	case "qwen3":
+		// A causal decoder used as an embedder. head_dim is explicit (not
+		// HiddenSize/heads) and even for RoPE; GQA requires the query heads
+		// to partition evenly over the kv heads.
+		if c.HeadDim <= 0 || c.HeadDim%2 != 0 {
+			return fmt.Errorf("%s: qwen3 requires an even head_dim > 0 (found %d)", source, c.HeadDim)
+		}
+		if c.NumKeyValueHeads <= 0 || c.NumAttentionHeads%c.NumKeyValueHeads != 0 {
+			return fmt.Errorf("%s: qwen3 requires num_attention_heads (%d) divisible by num_key_value_heads (%d)", source, c.NumAttentionHeads, c.NumKeyValueHeads)
+		}
+		if c.RopeTheta <= 0 {
+			return fmt.Errorf("%s: qwen3 requires a positive rope_theta (found %g)", source, c.RopeTheta)
+		}
 	case "roberta":
 		// Unlike MPNet, HF's RoBERTa reads padding_idx from config — but
 		// zero is refused deliberately: PadTokenID is a plain int, so a
@@ -150,7 +172,7 @@ func validate(c *Config, source string) error {
 			return fmt.Errorf("%s: pad_token_id=%d — HF's MPNet embeddings hardcode padding_idx=1 regardless of config, so rembed only accepts 1", source, c.PadTokenID)
 		}
 	default:
-		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, modernbert, roberta, or mpnet)", source, c.ModelType)
+		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, modernbert, qwen3, roberta, or mpnet)", source, c.ModelType)
 	}
 	if c.LayerNormEps == 0 {
 		c.LayerNormEps = 1e-12

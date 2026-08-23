@@ -35,16 +35,20 @@ throughput-saturated servers.
 
 ## Supported models
 
-BERT-family, DistilBERT, MPNet, RoBERTa, and ModernBERT encoders in
-sentence-transformers format: mean or CLS pooling; WordPiece, byte-level
-BPE, or SentencePiece Unigram tokenization (the XLM-R tokenizer —
-multilingual models work, 50+ languages); absolute positions (plus
-MPNet's bucketed relative-position attention bias) OR ModernBERT's rotary
-positions (RoPE) with alternating global/local sliding-window attention;
-exact GELU, and ModernBERT's GeGLU; F32/F16/BF16 safetensors.
-Validated end-to-end against each model's own ONNX Runtime reference
-(ModernBERT against the canonical PyTorch `ModernBertModel`, since its
-nomic ONNX export bundles pooling):
+Six architectures: BERT-family, DistilBERT, MPNet, RoBERTa, and
+ModernBERT encoders, plus **Qwen3-Embedding** — a causal *decoder*
+embedder (the current state of the art for retrieval). sentence-
+transformers format: mean, CLS, or last-token pooling; WordPiece,
+byte-level BPE, or SentencePiece Unigram tokenization (the XLM-R
+tokenizer — multilingual models work, 50+ languages); absolute positions
+(plus MPNet's bucketed relative-position bias) OR rotary positions (RoPE,
+ModernBERT and Qwen3); alternating global/local sliding-window attention
+(ModernBERT) or full causal attention with grouped-query attention and
+QK-norm (Qwen3); exact GELU, ModernBERT's GeGLU, and Qwen3's SwiGLU;
+LayerNorm and RMSNorm; F32/F16/BF16 safetensors. Validated end-to-end
+against each model's own ONNX Runtime reference (ModernBERT and Qwen3
+against the canonical PyTorch `ModernBertModel` / `Qwen3Model`, since
+their ONNX exports bundle or omit the pooling rembed reproduces):
 
 | model | pooling | dtype | fp32 vs ONNX | int8 |
 |-------|---------|-------|--------------|------|
@@ -63,6 +67,7 @@ nomic ONNX export bundles pooling):
 | Snowflake/snowflake-arctic-embed-s | cls | F32 | 2.5e-7 | cosine ≥ 0.995 |
 | sentence-transformers/multi-qa-distilbert-cos-v1 | mean | F32 | 2.5e-7 | cosine ≥ 0.999 |
 | nomic-ai/modernbert-embed-base | mean | F32 | < 1e-4 (vs PyTorch) | cosine ≥ 0.998 |
+| Qwen/Qwen3-Embedding-0.6B | lasttoken | BF16 | < 1e-4 (vs PyTorch) | cosine ≥ 0.997 |
 | thenlper/gte-small | mean | F16 | 2e-3 maxAbs + cosine ≥ 0.9999 + meanAbs ≤ 2e-4 (the repo's ONNX export is fp32 while its safetensors are f16, so maxAbs is dominated by the checkpoint's own rounding; the cosine/mean bounds are what actually constrain rembed) | — |
 
 On CPUs with AVX-VNNI — Intel Alder Lake (2021) onward and Sapphire
@@ -82,13 +87,17 @@ test-enforced (worst golden cosine, full int8 vs weight-only):
 | arctic-embed-s | 0.9932 | 0.9953 |
 | distilroberta | 0.9747 | 0.9987 |
 | modernbert-embed | 0.9660 | 0.9984 |
+| qwen3-embedding-0.6B | 0.9747 | 0.9978 |
 | **bge-base** | **0.9593** | 0.9957 |
 
 Activation outliers are a PER-CHECKPOINT property, not an architecture
 one: bge-base (a plain BERT) measures worst of all at 0.9593, below
 distilroberta's 0.9747 and modernbert-embed's 0.9660 (whose GeGLU gate
 activations have a range the per-row u8 scale can't hold), while
-bge-base's sibling bge-small is unremarkable.
+bge-base's sibling bge-small is unremarkable. Qwen3-Embedding compounds
+this: last-token pooling reads a single position, so there is no
+averaging across tokens to soften activation-quantization error — prefer
+`WithInt8` (weight-only) there.
 Check the table before enabling full int8 for a model — anything below
 ~0.99 is a real retrieval-quality risk — and prefer `WithInt8`
 (weight-only, ≥ 0.988 everywhere) when in doubt. Every figure above is
@@ -101,11 +110,13 @@ beat ORT fp32 in every round — the flag-free rounds measured 0.70× and
 0.75× (5.9 ms vs 7.9 ms on mpnet) — while trading blows at parity with
 ORT's own AVX-512-VNNI int8 graphs.
 
-Expected compatible (same architecture, no ONNX export on the Hub to
-validate against): the remaining e5 sizes, the largest BGE/GTE
-variants, the msmarco families, and other BERT/DistilBERT-based
-sentence-transformers checkpoints. Caveat for retrieval
-models: e5 requires "query: "/"passage: " prefixes and some models
+Expected compatible (same architecture, no committed golden yet): the
+remaining e5 sizes, the largest BGE/GTE variants, the msmarco families,
+other BERT/DistilBERT-based sentence-transformers checkpoints, and the
+larger Qwen3-Embedding sizes (4B/8B — same architecture, far larger).
+Caveat for retrieval models: e5 requires "query: "/"passage: " prefixes,
+Qwen3-Embedding expects an instruction on queries only
+("Instruct: {task}\nQuery:{text}", with documents left bare), and some models
 (e.g. arctic) declare prompt handling in their pooling config — rembed
 embeds exactly the text you pass and does not add prefixes; add them
 yourself or retrieval quality silently degrades. Validated models in

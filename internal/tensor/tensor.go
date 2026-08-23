@@ -451,6 +451,35 @@ func LayerNorm(x, gamma, beta []float32, m, n int, eps float32) {
 	}
 }
 
+// RMSNorm normalizes each of the m rows of x (length n) in place:
+// x / sqrt(mean(x²)+eps) * gamma — no mean subtraction and no bias, matching
+// Qwen3's RMSNorm (and Llama's). The sum of squares accumulates in float32
+// to mirror LayerNorm's reduction style; float64 would be marginally more
+// accurate but the golden tolerance (1e-4) does not need it.
+func RMSNorm(x, gamma []float32, m, n int, eps float32) {
+	for i := range m {
+		row := x[i*n : i*n+n]
+		var ss float32
+		for _, v := range row {
+			ss += v * v
+		}
+		inv := 1 / float32(math.Sqrt(float64(ss/float32(n)+eps)))
+		for j, v := range row {
+			row[j] = v * inv * gamma[j]
+		}
+	}
+}
+
+// SiLU applies the sigmoid-weighted linear unit x·σ(x) in place — Qwen3's
+// SwiGLU gate activation (hidden_act "silu"). The sigmoid is computed via
+// a float64 exp for accuracy; unlike GELU this is not yet the hot inner
+// loop, so it favors clarity over the inlined-polynomial trick.
+func SiLU(x []float32) {
+	for i, v := range x {
+		x[i] = v / float32(1+math.Exp(-float64(v)))
+	}
+}
+
 // GELU applies the erf-based Gaussian Error Linear Unit in place, matching
 // HuggingFace's "gelu" activation: 0.5x(1+erf(x/√2)), with the float32 erf
 // (~3e-7 absolute error — see fastmath.go; the golden tolerance is 1e-4).

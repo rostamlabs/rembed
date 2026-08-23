@@ -430,6 +430,105 @@ func TestGoldenTokens(t *testing.T) {
 	}
 }
 
+// TestGoldenQwen3ParallelMatchesSerial pins that Qwen3's parallel head
+// fan-out (GQA repack, QK-norm, RoPE, causal mask all run inside Pool.Run
+// goroutines) is BIT-identical to serial, and gives the race detector the
+// Qwen3 code to exercise (the golden matrix runs WithWorkers(1)).
+func TestGoldenQwen3ParallelMatchesSerial(t *testing.T) {
+	dir := os.Getenv("REMBED_MODEL_QWEN3")
+	if dir == "" {
+		dir = "models/Qwen3-Embedding-0.6B"
+	}
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("model dir %s not present", dir)
+	}
+	serial, err := Load(dir, WithWorkers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parallel, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Repeat("the antikythera mechanism modeled the motions of the sun and moon, ", 20)
+	a, err := serial.Embed(context.Background(), []string{text})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := parallel.Embed(context.Background(), []string{text})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range a[0] {
+		if a[0][i] != b[0][i] {
+			t.Fatalf("parallel diverges from serial at [%d]: %v vs %v", i, b[0][i], a[0][i])
+		}
+	}
+}
+
+// TestGoldenQwen3Tokens validates Qwen3's RAW per-token hidden states
+// (EmbedTokens) against the torch reference — the unpooled output, so a
+// per-token defect that last-token pooling would only expose at the final
+// position is caught at every position. Tolerance is 5e-4 on the ~O(10)
+// unnormalized magnitudes (28-layer fp32 accumulation, as for ModernBERT).
+func TestGoldenQwen3Tokens(t *testing.T) {
+	dir := os.Getenv("REMBED_MODEL_QWEN3")
+	if dir == "" {
+		dir = "models/Qwen3-Embedding-0.6B"
+	}
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("model dir %s not present", dir)
+	}
+	raw, err := os.ReadFile("testdata/golden-tokens-qwen3.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden struct {
+		Cases []struct {
+			Text     string      `json:"text"`
+			InputIDs []int64     `json:"input_ids"`
+			Hidden   [][]float32 `json:"hidden"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	if len(golden.Cases) == 0 {
+		t.Fatal("empty token golden")
+	}
+	emb, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range golden.Cases {
+		res, err := emb.EmbedTokens(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		te := res[0]
+		if !slices.Equal(te.IDs, c.InputIDs) {
+			t.Errorf("%.40q: tokenizer mismatch", c.Text)
+			continue
+		}
+		if len(te.Vectors) != len(c.Hidden) {
+			t.Fatalf("%.40q: %d token vectors, want %d", c.Text, len(te.Vectors), len(c.Hidden))
+		}
+		var maxd float64
+		for i, wantRow := range c.Hidden {
+			for j, want := range wantRow {
+				if d := math.Abs(float64(te.Vectors[i][j] - want)); d > maxd {
+					maxd = d
+				}
+			}
+		}
+		if maxd > 5e-4 {
+			t.Errorf("%.40q: token maxAbsDiff=%g > 5e-4", c.Text, maxd)
+		} else {
+			t.Logf("%.40q: %d tokens, maxAbsDiff=%.2e", c.Text, len(te.Vectors), maxd)
+		}
+	}
+}
+
 // TestGoldenModernBERTTokens validates ModernBERT's RAW per-token hidden
 // states (EmbedTokens) against the torch reference — the unpooled output,
 // so nothing downstream (mean pooling, normalization) can average out a
@@ -573,6 +672,15 @@ func TestGoldenMatrix(t *testing.T) {
 		// the per-row u8 scale can't hold, so like the RoBERTa family, full
 		// int8 is not recommended for ModernBERT.
 		{"testdata/golden-modernbert-embed-base.json", "models/modernbert-embed-base", "REMBED_MODEL_MODERNBERT", 1e-4, 0, 1e-5, 0.998, 0.96},
+		// Qwen3-Embedding: the sixth architecture and the first DECODER
+		// embedder — causal attention, RMSNorm, per-head QK-norm, GQA
+		// (16 q / 8 kv), SwiGLU, RoPE, and last-token pooling on the appended
+		// <|endoftext|>. Reference is the canonical torch Qwen3Model (fp32,
+		// eager). int8 bounds are measured worst cases less margin:
+		// weight-only 0.9978, full int8 0.9747 (last-token pooling reads a
+		// single position, so it has no averaging to hide activation
+		// quantization error — full int8 is least suited here).
+		{"testdata/golden-Qwen3-Embedding-0.6B.json", "models/Qwen3-Embedding-0.6B", "REMBED_MODEL_QWEN3", 1e-4, 0, 1e-5, 0.997, 0.97},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {
