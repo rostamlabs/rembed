@@ -5,8 +5,11 @@ package model
 import (
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"runtime"
 
+	"github.com/rostamlabs/rembed/internal/packfile"
 	"github.com/rostamlabs/rembed/internal/safetensors"
 	"github.com/rostamlabs/rembed/internal/tensor"
 )
@@ -33,33 +36,89 @@ type qwLayer struct {
 // prefix (embed_tokens.weight, layers.N.*, norm.weight); weights are tied
 // so there is no lm_head, and the LM head is unused for embedding anyway.
 func loadQwen3(tensors map[string]safetensors.Tensor, cfg Config, quantize QuantMode, workers int, weightsPath string) (*Model, error) {
+	src := qwSource{
+		f32: func(name string, wantShape ...int) ([]float32, error) {
+			t, ok := tensors[name]
+			if !ok {
+				return nil, fmt.Errorf("weights %s: missing tensor %q", weightsPath, name)
+			}
+			if !shapeEq(t.Shape, wantShape) {
+				return nil, fmt.Errorf("weights %s: tensor %q has shape %v, want %v", weightsPath, name, t.Shape, wantShape)
+			}
+			return t.Data, nil
+		},
+		dense: func(raw []float32, in, out int) denseWeight {
+			return newDense(raw, nil, in, out, quantize)
+		},
+	}
+	return loadQwen3FromSource(src, cfg, workers)
+}
+
+// qwSource abstracts where a Qwen3 weight comes from: f32 returns a tensor's
+// data (from an in-RAM safetensors map, or a mmapped pack file); dense turns
+// a projection's raw [out,in] weight into a denseWeight (packed for the
+// in-RAM path, or kept raw pointing into the mmap for the disk path). This
+// lets one loader serve both without the compute path knowing the difference.
+type qwSource struct {
+	f32   func(name string, shape ...int) ([]float32, error)
+	dense func(raw []float32, in, out int) denseWeight
+}
+
+func shapeEq(got, want []int) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// qwen3Tensors lists every tensor a Qwen3 model needs, with its shape, in the
+// order the loader consumes them — the authority for both packing (specs) and
+// loading (names/shapes are re-checked on fetch, so any drift fails loudly).
+func qwen3Tensors(cfg Config) []packfile.Spec {
 	H, I := cfg.HiddenSize, cfg.IntermediateSize
 	nq, nkv, dh := cfg.NumAttentionHeads, cfg.NumKeyValueHeads, cfg.HeadDim
 	qDim, kvDim := nq*dh, nkv*dh
-	get := func(name string, wantShape ...int) ([]float32, error) {
-		t, ok := tensors[name]
-		if !ok {
-			return nil, fmt.Errorf("weights %s: missing tensor %q", weightsPath, name)
-		}
-		if len(t.Shape) != len(wantShape) {
-			return nil, fmt.Errorf("weights %s: tensor %q has shape %v, want %v", weightsPath, name, t.Shape, wantShape)
-		}
-		for i, d := range wantShape {
-			if t.Shape[i] != d {
-				return nil, fmt.Errorf("weights %s: tensor %q has shape %v, want %v", weightsPath, name, t.Shape, wantShape)
-			}
-		}
-		return t.Data, nil
+	specs := []packfile.Spec{
+		{Name: "embed_tokens.weight", Shape: []int{cfg.VocabSize, H}},
+		{Name: "norm.weight", Shape: []int{H}},
 	}
+	for i := range cfg.NumHiddenLayers {
+		p := fmt.Sprintf("layers.%d.", i)
+		specs = append(specs,
+			packfile.Spec{Name: p + "input_layernorm.weight", Shape: []int{H}},
+			packfile.Spec{Name: p + "self_attn.q_proj.weight", Shape: []int{qDim, H}},
+			packfile.Spec{Name: p + "self_attn.k_proj.weight", Shape: []int{kvDim, H}},
+			packfile.Spec{Name: p + "self_attn.v_proj.weight", Shape: []int{kvDim, H}},
+			packfile.Spec{Name: p + "self_attn.o_proj.weight", Shape: []int{H, qDim}},
+			packfile.Spec{Name: p + "self_attn.q_norm.weight", Shape: []int{dh}},
+			packfile.Spec{Name: p + "self_attn.k_norm.weight", Shape: []int{dh}},
+			packfile.Spec{Name: p + "post_attention_layernorm.weight", Shape: []int{H}},
+			packfile.Spec{Name: p + "mlp.gate_proj.weight", Shape: []int{I, H}},
+			packfile.Spec{Name: p + "mlp.up_proj.weight", Shape: []int{I, H}},
+			packfile.Spec{Name: p + "mlp.down_proj.weight", Shape: []int{H, I}},
+		)
+	}
+	return specs
+}
+
+func loadQwen3FromSource(src qwSource, cfg Config, workers int) (*Model, error) {
+	H, I := cfg.HiddenSize, cfg.IntermediateSize
+	nq, nkv, dh := cfg.NumAttentionHeads, cfg.NumKeyValueHeads, cfg.HeadDim
+	qDim, kvDim := nq*dh, nkv*dh
 
 	m := &Model{cfg: cfg, workers: workers, posOff: 0}
 	m.scratchPool.New = func() any { return new(scratch) }
 
 	var err error
-	if m.wordEmb, err = get("embed_tokens.weight", cfg.VocabSize, H); err != nil {
+	if m.wordEmb, err = src.f32("embed_tokens.weight", cfg.VocabSize, H); err != nil {
 		return nil, err
 	}
-	if m.finalNormG, err = get("norm.weight", H); err != nil {
+	if m.finalNormG, err = src.f32("norm.weight", H); err != nil {
 		return nil, err
 	}
 
@@ -67,39 +126,115 @@ func loadQwen3(tensors map[string]safetensors.Tensor, cfg Config, quantize Quant
 	for i := range m.qwLayers {
 		l := &m.qwLayers[i]
 		p := fmt.Sprintf("layers.%d.", i)
-		var qw, kw, vw, ow, gw, uw, dw []float32
-		loads := []struct {
-			dst   *[]float32
-			name  string
-			shape []int
-		}{
-			{&l.inNormG, p + "input_layernorm.weight", []int{H}},
-			{&qw, p + "self_attn.q_proj.weight", []int{qDim, H}},
-			{&kw, p + "self_attn.k_proj.weight", []int{kvDim, H}},
-			{&vw, p + "self_attn.v_proj.weight", []int{kvDim, H}},
-			{&ow, p + "self_attn.o_proj.weight", []int{H, qDim}},
-			{&l.qNormG, p + "self_attn.q_norm.weight", []int{dh}},
-			{&l.kNormG, p + "self_attn.k_norm.weight", []int{dh}},
-			{&l.postNorm, p + "post_attention_layernorm.weight", []int{H}},
-			{&gw, p + "mlp.gate_proj.weight", []int{I, H}},
-			{&uw, p + "mlp.up_proj.weight", []int{I, H}},
-			{&dw, p + "mlp.down_proj.weight", []int{H, I}},
+		norm := func(name string, dst *[]float32, dim int) error {
+			v, e := src.f32(p+name, dim)
+			*dst = v
+			return e
 		}
-		for _, ld := range loads {
-			data, err := get(ld.name, ld.shape...)
-			if err != nil {
+		proj := func(name string, in, out int) (denseWeight, error) {
+			raw, e := src.f32(p+name, out, in)
+			if e != nil {
+				return denseWeight{}, e
+			}
+			return src.dense(raw, in, out), nil
+		}
+		if err = norm("input_layernorm.weight", &l.inNormG, H); err != nil {
+			return nil, err
+		}
+		if err = norm("self_attn.q_norm.weight", &l.qNormG, dh); err != nil {
+			return nil, err
+		}
+		if err = norm("self_attn.k_norm.weight", &l.kNormG, dh); err != nil {
+			return nil, err
+		}
+		if err = norm("post_attention_layernorm.weight", &l.postNorm, H); err != nil {
+			return nil, err
+		}
+		for _, pr := range []struct {
+			dst     *denseWeight
+			name    string
+			in, out int
+		}{
+			{&l.qProj, "self_attn.q_proj.weight", H, qDim},
+			{&l.kProj, "self_attn.k_proj.weight", H, kvDim},
+			{&l.vProj, "self_attn.v_proj.weight", H, kvDim},
+			{&l.oProj, "self_attn.o_proj.weight", qDim, H},
+			{&l.gateProj, "mlp.gate_proj.weight", H, I},
+			{&l.upProj, "mlp.up_proj.weight", H, I},
+			{&l.downProj, "mlp.down_proj.weight", I, H},
+		} {
+			if *pr.dst, err = proj(pr.name, pr.in, pr.out); err != nil {
 				return nil, err
 			}
-			*ld.dst = data
 		}
-		l.qProj = newDense(qw, nil, H, qDim, quantize)
-		l.kProj = newDense(kw, nil, H, kvDim, quantize)
-		l.vProj = newDense(vw, nil, H, kvDim, quantize)
-		l.oProj = newDense(ow, nil, qDim, H, quantize)
-		l.gateProj = newDense(gw, nil, H, I, quantize)
-		l.upProj = newDense(uw, nil, H, I, quantize)
-		l.downProj = newDense(dw, nil, I, H, quantize)
 	}
+	return m, nil
+}
+
+// PackQwen3ToDisk streams a Qwen3 checkpoint into a rembed pack file: each
+// tensor is read from the (possibly sharded) safetensors, widened to
+// float32, and appended — so peak memory is a single tensor, and an 8B model
+// packs on a small box. The result mmaps for inference (see loadQwen3Disk).
+func PackQwen3ToDisk(weightsPath, packPath string, cfg Config) error {
+	r, err := safetensors.OpenReader(weightsPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = r.Close() }()
+	specs := qwen3Tensors(cfg)
+	shapeOf := make(map[string][]int, len(specs))
+	for _, s := range specs {
+		shapeOf[s.Name] = s.Shape
+	}
+	return packfile.Write(packPath, specs, func(name string) ([]float32, error) {
+		return r.F32(name, shapeOf[name]...)
+	})
+}
+
+// LoadDisk builds a Model whose weights are memory-mapped from a rembed pack
+// file in modelDir, packing the safetensors to disk on first use. Only qwen3
+// is supported today — the architecture whose size (4B/8B) motivates running
+// larger than RAM. The caller MUST Close the returned Model to unmap.
+func LoadDisk(modelDir string, cfg Config, workers int) (*Model, error) {
+	if cfg.ModelType != "qwen3" {
+		return nil, fmt.Errorf("disk-backed weights are only supported for qwen3 models (got %q)", cfg.ModelType)
+	}
+	packPath := filepath.Join(modelDir, "weights.rembedpack")
+	if _, err := os.Stat(packPath); err != nil {
+		if err := PackQwen3ToDisk(filepath.Join(modelDir, "model.safetensors"), packPath, cfg); err != nil {
+			return nil, fmt.Errorf("packing weights to %s: %w", packPath, err)
+		}
+	}
+	pk, err := packfile.Open(packPath)
+	if err != nil {
+		return nil, err
+	}
+	m, err := loadQwen3Disk(pk, cfg, workers)
+	if err != nil {
+		_ = pk.Close()
+		return nil, err
+	}
+	return m, nil
+}
+
+// loadQwen3Disk builds a Qwen3 Model whose weights alias the mmapped pack
+// file: projections keep their raw [out,in] slice (the unpacked matmul reads
+// it directly), so the resident cost is only the pages the OS keeps live.
+// The Model owns the Pack and unmaps it on Close.
+func loadQwen3Disk(pk *packfile.Pack, cfg Config, workers int) (*Model, error) {
+	src := qwSource{
+		f32: func(name string, shape ...int) ([]float32, error) {
+			return pk.F32(name, shape...)
+		},
+		dense: func(raw []float32, in, out int) denseWeight {
+			return denseWeight{raw: raw, in: in, out: out}
+		},
+	}
+	m, err := loadQwen3FromSource(src, cfg, workers)
+	if err != nil {
+		return nil, err
+	}
+	m.pack = pk
 	return m, nil
 }
 

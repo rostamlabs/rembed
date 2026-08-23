@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -35,6 +37,69 @@ type headerEntry struct {
 	Dtype       string    `json:"dtype"`
 	Shape       []int     `json:"shape"`
 	DataOffsets [2]uint64 `json:"data_offsets"`
+}
+
+// LoadAny loads weights from a single model.safetensors file, or — when
+// that file is absent but a model.safetensors.index.json sits beside it —
+// from the sharded set the index names. Large checkpoints ship 2+ shards
+// (Qwen3-4B: 2, 8B: 4); this loads them through the same path as
+// single-file models. path is the expected single-file location; its
+// directory is where the index and shards are looked for.
+func LoadAny(path string) (map[string]Tensor, error) {
+	if _, err := os.Stat(path); err == nil {
+		return Load(path)
+	}
+	idx := filepath.Join(filepath.Dir(path), "model.safetensors.index.json")
+	if _, err := os.Stat(idx); err != nil {
+		return nil, fmt.Errorf("safetensors: %s not found (and no model.safetensors.index.json beside it)", path)
+	}
+	return loadSharded(idx)
+}
+
+// loadSharded reads a HuggingFace sharded checkpoint: model.safetensors.index.json
+// maps every tensor name to the shard file that holds it; each distinct
+// shard is loaded once and the maps merged. Shards load in sorted order so
+// a partial-load failure is deterministic.
+func loadSharded(indexPath string) (map[string]Tensor, error) {
+	raw, err := os.ReadFile(indexPath)
+	if err != nil {
+		return nil, err
+	}
+	var idx struct {
+		WeightMap map[string]string `json:"weight_map"`
+	}
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		return nil, fmt.Errorf("safetensors %s: bad index JSON: %w", indexPath, err)
+	}
+	if len(idx.WeightMap) == 0 {
+		return nil, fmt.Errorf("safetensors %s: index weight_map is empty", indexPath)
+	}
+	shardSet := make(map[string]struct{})
+	for _, f := range idx.WeightMap {
+		shardSet[f] = struct{}{}
+	}
+	shards := make([]string, 0, len(shardSet))
+	for f := range shardSet {
+		shards = append(shards, f)
+	}
+	sort.Strings(shards)
+	dir := filepath.Dir(indexPath)
+	out := make(map[string]Tensor, len(idx.WeightMap))
+	for _, f := range shards {
+		m, err := Load(filepath.Join(dir, filepath.FromSlash(f)))
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range m {
+			out[k] = v
+		}
+	}
+	for name := range idx.WeightMap {
+		if _, ok := out[name]; !ok {
+			return nil, fmt.Errorf("safetensors %s: index names %q but no shard provided it", indexPath, name)
+		}
+	}
+	return out, nil
 }
 
 // Load reads every tensor in the file into memory. Offsets are validated
@@ -98,26 +163,31 @@ func Load(path string) (map[string]Tensor, error) {
 		if uint64(n)*uint64(elemSize) != end-start {
 			return nil, fmt.Errorf("safetensors %s: tensor %q shape %v (%d elems × %d B) does not match byte range %d", path, name, e.Shape, n, elemSize, end-start)
 		}
-		buf := data[start:end]
-		vals := make([]float32, n)
-		switch e.Dtype {
-		case "F32":
-			for i := range vals {
-				vals[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[i*4:]))
-			}
-		case "F16":
-			for i := range vals {
-				vals[i] = f16to32(binary.LittleEndian.Uint16(buf[i*2:]))
-			}
-		case "BF16":
-			for i := range vals {
-				// bfloat16 is float32's top 16 bits.
-				vals[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(buf[i*2:])) << 16)
-			}
-		}
-		out[name] = Tensor{Shape: e.Shape, Data: vals}
+		out[name] = Tensor{Shape: e.Shape, Data: decodeF32(e.Dtype, data[start:end], n)}
 	}
 	return out, nil
+}
+
+// decodeF32 widens a tensor's raw bytes (F32/F16/BF16, little-endian) into a
+// fresh float32 slice of n elements. Shared by Load and the mmap Reader.
+func decodeF32(dtype string, buf []byte, n int) []float32 {
+	vals := make([]float32, n)
+	switch dtype {
+	case "F32":
+		for i := range vals {
+			vals[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[i*4:]))
+		}
+	case "F16":
+		for i := range vals {
+			vals[i] = f16to32(binary.LittleEndian.Uint16(buf[i*2:]))
+		}
+	case "BF16":
+		for i := range vals {
+			// bfloat16 is float32's top 16 bits.
+			vals[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(buf[i*2:])) << 16)
+		}
+	}
+	return vals
 }
 
 // f16to32 widens an IEEE-754 half-precision value to float32, covering

@@ -430,6 +430,56 @@ func TestGoldenTokens(t *testing.T) {
 	}
 }
 
+// TestGoldenQwen3DiskWeights validates the memory-mapped disk-weights path
+// (WithDiskWeights) against the same torch golden: the weights are packed to
+// disk on first use, mmapped, and run through the unpacked matmul. This is
+// the R11 "run larger than RAM" path — here proven correct on the 0.6B, where
+// it also fits in RAM. Tolerance is the golden rule's 1e-4 (the unpacked
+// matmul's accumulation order differs slightly from the packed path, but both
+// match the reference).
+func TestGoldenQwen3DiskWeights(t *testing.T) {
+	dir := os.Getenv("REMBED_MODEL_QWEN3")
+	if dir == "" {
+		dir = "models/Qwen3-Embedding-0.6B"
+	}
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("model dir %s not present", dir)
+	}
+	raw, err := os.ReadFile("testdata/golden-Qwen3-Embedding-0.6B.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden goldenFile
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	emb, err := Load(dir, WithDiskWeights(), WithWorkers(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = emb.Close() }()
+	for _, c := range golden.Cases {
+		v, err := emb.Embed(context.Background(), []string{c.Text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var maxd, dot, na, nb float64
+		for i, want := range c.Embedding {
+			g, w := float64(v[0][i]), float64(want)
+			if d := math.Abs(g - w); d > maxd {
+				maxd = d
+			}
+			dot += g * w
+			na += g * g
+			nb += w * w
+		}
+		cos := dot / math.Sqrt(na*nb)
+		if maxd > 1e-4 || cos < 0.9999 {
+			t.Errorf("%.40q: disk maxAbs=%.3g cos=%.6f (want <=1e-4, >=0.9999)", c.Text, maxd, cos)
+		}
+	}
+}
+
 // TestGoldenQwen3ParallelMatchesSerial pins that Qwen3's parallel head
 // fan-out (GQA repack, QK-norm, RoPE, causal mask all run inside Pool.Run
 // goroutines) is BIT-identical to serial, and gives the race detector the

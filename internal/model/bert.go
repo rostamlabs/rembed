@@ -15,6 +15,7 @@ package model
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"runtime"
 	"sync"
@@ -85,7 +86,24 @@ type Model struct {
 	// is the trailing RMSNorm (reused). There is no embedding norm.
 	qwLayers []qwLayer
 
+	// pack is the mmapped disk-weights file when the model was loaded with
+	// WithDiskWeights (nil otherwise); Close unmaps it. Weight slices alias
+	// this mapping, so it must outlive every Forward.
+	pack io.Closer
+
 	scratchPool sync.Pool // *scratch, buffers grown on demand
+}
+
+// Close releases resources held by the model — currently the mmapped
+// disk-weights file, if any. After Close, the model must not be used.
+// Models loaded fully into RAM need no Close (it is a safe no-op).
+func (m *Model) Close() error {
+	if m.pack != nil {
+		err := m.pack.Close()
+		m.pack = nil
+		return err
+	}
+	return nil
 }
 
 // relMaxDistance is the bucketing horizon of MPNet's relative-position

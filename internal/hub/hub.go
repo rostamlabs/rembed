@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -33,7 +34,6 @@ import (
 var required = []string{
 	"1_Pooling/config.json",
 	"modules.json",
-	"model.safetensors",
 }
 
 // tokenizerFiles returns the tokenizer artifacts to fetch and whether
@@ -178,7 +178,61 @@ func Ensure(modelID, cacheDir string) (string, error) {
 		}
 		fetched = append(fetched, f)
 	}
+	// Weights come last (largest). A single model.safetensors is the common
+	// case; large checkpoints (Qwen3-4B/8B) ship a sharded set named by
+	// model.safetensors.index.json, so a 404 there falls back to fetching the
+	// index and every shard it lists.
+	weightFiles, err := fetchWeights(modelID, dir)
+	if err != nil {
+		cleanup(fetched...)
+		return "", err
+	}
+	fetched = append(fetched, weightFiles...)
 	return dir, nil
+}
+
+// fetchWeights downloads model.safetensors, or — when the repo shards its
+// weights — model.safetensors.index.json plus every shard it names. Returns
+// the files fetched (for cleanup on a later error).
+func fetchWeights(modelID, dir string) ([]string, error) {
+	err := fetch(modelID, "model.safetensors", dir)
+	if err == nil {
+		return []string{"model.safetensors"}, nil
+	}
+	if !errors.Is(err, errNotFound) {
+		return nil, err
+	}
+	if err := fetch(modelID, "model.safetensors.index.json", dir); err != nil {
+		return nil, fmt.Errorf("hub: %s has neither model.safetensors nor a shard index: %w", modelID, err)
+	}
+	got := []string{"model.safetensors.index.json"}
+	raw, err := os.ReadFile(filepath.Join(dir, "model.safetensors.index.json"))
+	if err != nil {
+		return got, err
+	}
+	var idx struct {
+		WeightMap map[string]string `json:"weight_map"`
+	}
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		return got, fmt.Errorf("hub: %s: bad shard index: %w", modelID, err)
+	}
+	seen := make(map[string]struct{})
+	shards := make([]string, 0, len(idx.WeightMap))
+	for _, f := range idx.WeightMap {
+		if _, ok := seen[f]; ok {
+			continue
+		}
+		seen[f] = struct{}{}
+		shards = append(shards, f)
+	}
+	sort.Strings(shards)
+	for _, shard := range shards {
+		if err := fetch(modelID, shard, dir); err != nil {
+			return got, err
+		}
+		got = append(got, shard)
+	}
+	return got, nil
 }
 
 // sweepStaleTemps removes download temp files older than an hour — a
