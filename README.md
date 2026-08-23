@@ -35,12 +35,14 @@ throughput-saturated servers.
 
 ## Supported models
 
-Six architectures: BERT-family, DistilBERT, MPNet, RoBERTa, and
-ModernBERT encoders, plus **Qwen3-Embedding** — a causal *decoder*
-embedder (the current state of the art for retrieval). sentence-
-transformers format: mean, CLS, or last-token pooling; WordPiece,
-byte-level BPE, or SentencePiece Unigram tokenization (the XLM-R
-tokenizer — multilingual models work, 50+ languages); absolute positions
+Six architectures: BERT-family, DistilBERT, MPNet, RoBERTa (including
+**XLM-RoBERTa** — `multilingual-e5-base`/`-large`, `bge-m3`, the same
+encoder with the SentencePiece tokenizer), and ModernBERT encoders, plus
+**Qwen3-Embedding** — a causal *decoder* embedder (the current state of
+the art for retrieval). sentence-transformers format: mean, CLS, or
+last-token pooling; WordPiece, byte-level BPE, or SentencePiece Unigram
+tokenization (the XLM-R tokenizer — multilingual models work, 100+
+languages); absolute positions
 (plus MPNet's bucketed relative-position bias) OR rotary positions (RoPE,
 ModernBERT and Qwen3); alternating global/local sliding-window attention
 (ModernBERT) or full causal attention with grouped-query attention and
@@ -48,7 +50,9 @@ QK-norm (Qwen3); exact GELU, ModernBERT's GeGLU, and Qwen3's SwiGLU;
 LayerNorm and RMSNorm; F32/F16/BF16 safetensors. Validated end-to-end
 against each model's own ONNX Runtime reference (ModernBERT and Qwen3
 against the canonical PyTorch `ModernBertModel` / `Qwen3Model`, since
-their ONNX exports bundle or omit the pooling rembed reproduces):
+their ONNX exports bundle or omit the pooling rembed reproduces;
+XLM-RoBERTa against PyTorch `XLMRobertaModel`, since XLM-R
+sentence-transformers repos do not reliably ship ONNX):
 
 | model | pooling | dtype | fp32 vs ONNX | int8 |
 |-------|---------|-------|--------------|------|
@@ -60,6 +64,7 @@ their ONNX exports bundle or omit the pooling rembed reproduces):
 | sentence-transformers/all-distilroberta-v1 | mean | F32 | 3.2e-7 | cosine ≥ 0.9985 |
 | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | mean | F32 | 7e-7 | cosine ≥ 0.9995 |
 | intfloat/multilingual-e5-small | mean | F32 | 1.7e-7 | cosine ≥ 0.9995 |
+| intfloat/multilingual-e5-base | mean | F32 | 2.9e-7 (vs PyTorch) | cosine ≥ 0.999 |
 | BAAI/bge-base-en-v1.5 | cls | F32 | 7.4e-7 | cosine ≥ 0.995 |
 | thenlper/gte-base | mean | F32 | 3.8e-6 | cosine ≥ 0.988 |
 | sentence-transformers/paraphrase-mpnet-base-v2 | mean | F32 | 1.2e-6 | cosine ≥ 0.9945 |
@@ -82,6 +87,7 @@ test-enforced (worst golden cosine, full int8 vs weight-only):
 | MiniLM-L6 / L12 / L3 | 0.9917 / 0.9932 / 0.9979 | ≥ 0.9990 |
 | mpnet-base / paraphrase-mpnet | 0.9912 / 0.9867 | ≥ 0.9945 |
 | multilingual MiniLM / multilingual-e5 | 0.9982 / 0.9988 | ≥ 0.9995 |
+| multilingual-e5-base (xlm-roberta) | 0.9849 | 0.9992 |
 | gte-small / gte-base | 0.9991 / 0.9741 | ≥ 0.9880 |
 | multi-qa MiniLM / distilbert | 0.9949 / 0.9854 | ≥ 0.9940 |
 | arctic-embed-s | 0.9932 | 0.9953 |
