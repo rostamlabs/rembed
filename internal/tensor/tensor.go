@@ -480,6 +480,22 @@ func SiLU(x []float32) {
 	}
 }
 
+// GELUTanh applies the tanh-approximation GELU in place, matching PyTorch's
+// gelu(approximate="tanh") and HF's "gelu_pytorch_tanh" (Gemma's GeGLU
+// activation): 0.5·x·(1+tanh(√(2/π)·(x+0.044715·x³))). The tanh is computed
+// via float64 (like SiLU) for accuracy — torch does this in float32, so the
+// gap is well under the 1e-4 golden tolerance. Distinct from the erf-based
+// GELU: the two differ by up to ~1e-3, which across 24 layers would exceed
+// tolerance, so Gemma must use this variant.
+func GELUTanh(x []float32) {
+	const c = 0.7978845608028654 // √(2/π)
+	for i, v := range x {
+		v64 := float64(v)
+		inner := c * (v64 + 0.044715*v64*v64*v64)
+		x[i] = float32(0.5 * v64 * (1 + math.Tanh(inner)))
+	}
+}
+
 // geluScalar applies the erf-based Gaussian Error Linear Unit in place,
 // matching HuggingFace's "gelu" activation: 0.5x(1+erf(x/√2)), with the
 // float32 erf (~3e-7 absolute error — see fastmath.go; the golden tolerance

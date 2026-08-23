@@ -35,24 +35,29 @@ throughput-saturated servers.
 
 ## Supported models
 
-Six architectures: BERT-family, DistilBERT, MPNet, RoBERTa (including
+Seven architectures: BERT-family, DistilBERT, MPNet, RoBERTa (including
 **XLM-RoBERTa** — `multilingual-e5-base`/`-large`, `bge-m3`, the same
 encoder with the SentencePiece tokenizer), and ModernBERT encoders, plus
-**Qwen3-Embedding** — a causal *decoder* embedder (the current state of
-the art for retrieval). sentence-transformers format: mean, CLS, or
-last-token pooling; WordPiece, byte-level BPE, or SentencePiece Unigram
-tokenization (the XLM-R tokenizer — multilingual models work, 100+
-languages); absolute positions
+two decoder-derived embedders: **Qwen3-Embedding** (a causal decoder) and
+**EmbeddingGemma** (a bidirectional Gemma 3 backbone — the current MMTEB
+state of the art for its size). sentence-transformers format: mean, CLS,
+or last-token pooling, with an optional Dense projection head (EmbeddingGemma);
+WordPiece, byte-level BPE, SentencePiece Unigram (the XLM-R tokenizer —
+multilingual models work, 100+ languages), or the Gemma byte-fallback BPE;
+absolute positions
 (plus MPNet's bucketed relative-position bias) OR rotary positions (RoPE,
-ModernBERT and Qwen3); alternating global/local sliding-window attention
-(ModernBERT) or full causal attention with grouped-query attention and
-QK-norm (Qwen3); exact GELU, ModernBERT's GeGLU, and Qwen3's SwiGLU;
-LayerNorm and RMSNorm; F32/F16/BF16 safetensors. Validated end-to-end
-against each model's own ONNX Runtime reference (ModernBERT and Qwen3
-against the canonical PyTorch `ModernBertModel` / `Qwen3Model`, since
-their ONNX exports bundle or omit the pooling rembed reproduces;
-XLM-RoBERTa against PyTorch `XLMRobertaModel`, since XLM-R
-sentence-transformers repos do not reliably ship ONNX):
+single- or dual-theta — ModernBERT, Qwen3, EmbeddingGemma); alternating
+global/local sliding-window attention (ModernBERT, EmbeddingGemma), full
+causal attention (Qwen3), or bidirectional attention with grouped-query
+attention and QK-norm (Qwen3, EmbeddingGemma); exact GELU, tanh-GELU,
+GeGLU, and SwiGLU; LayerNorm and RMSNorm (unit-offset for Gemma);
+F32/F16/BF16 safetensors. Validated end-to-end against each model's own
+ONNX Runtime reference (ModernBERT and Qwen3 against the canonical PyTorch
+`ModernBertModel` / `Qwen3Model`, since their ONNX exports bundle or omit
+the pooling rembed reproduces; XLM-RoBERTa against PyTorch
+`XLMRobertaModel`, and EmbeddingGemma against PyTorch `Gemma3TextModel`
+with the sentence-transformers pool+Dense+normalize head, since neither
+reliably ships ONNX):
 
 | model | pooling | dtype | fp32 vs ONNX | int8 |
 |-------|---------|-------|--------------|------|
@@ -73,6 +78,7 @@ sentence-transformers repos do not reliably ship ONNX):
 | sentence-transformers/multi-qa-distilbert-cos-v1 | mean | F32 | 2.5e-7 | cosine ≥ 0.999 |
 | nomic-ai/modernbert-embed-base | mean | F32 | < 1e-4 (vs PyTorch) | cosine ≥ 0.998 |
 | Qwen/Qwen3-Embedding-0.6B | lasttoken | BF16 | < 1e-4 (vs PyTorch) | cosine ≥ 0.997 |
+| google/embeddinggemma-300m | mean + Dense | F32 | < 1e-4 (vs PyTorch) | cosine ≥ 0.998 |
 | thenlper/gte-small | mean | F16 | 2e-3 maxAbs + cosine ≥ 0.9999 + meanAbs ≤ 2e-4 (the repo's ONNX export is fp32 while its safetensors are f16, so maxAbs is dominated by the checkpoint's own rounding; the cosine/mean bounds are what actually constrain rembed) | — |
 
 On CPUs with AVX-VNNI — Intel Alder Lake (2021) onward and Sapphire
@@ -94,6 +100,7 @@ test-enforced (worst golden cosine, full int8 vs weight-only):
 | distilroberta | 0.9747 | 0.9987 |
 | modernbert-embed | 0.9660 | 0.9984 |
 | qwen3-embedding-0.6B | 0.9747 | 0.9978 |
+| embeddinggemma-300m | 0.9938 | 0.9981 |
 | **bge-base** | **0.9593** | 0.9957 |
 
 Activation outliers are a PER-CHECKPOINT property, not an architecture

@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rostamlabs/rembed/internal/safetensors"
@@ -58,6 +59,11 @@ func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe boo
 		// no sentencepiece probe.
 		return []string{"tokenizer.json"}, false
 	}
+	if modelType == "gemma3_text" || modelType == "gemma3" {
+		// EmbeddingGemma: SentencePiece-style byte-fallback BPE, all in
+		// tokenizer.json; no sentencepiece.bpe.model probe.
+		return []string{"tokenizer.json"}, false
+	}
 	return []string{"vocab.txt"}, true
 }
 
@@ -66,7 +72,7 @@ func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe boo
 // cannot import internal/model (which would invert the dependency).
 func supported(modelType string) bool {
 	switch modelType {
-	case "bert", "distilbert", "modernbert", "qwen3", "roberta", "xlm-roberta", "mpnet":
+	case "bert", "distilbert", "modernbert", "qwen3", "gemma3_text", "gemma3", "roberta", "xlm-roberta", "mpnet":
 		return true
 	}
 	return false
@@ -116,7 +122,9 @@ func Ensure(modelID, cacheDir string) (string, error) {
 		for _, f := range files {
 			_ = os.Remove(filepath.Join(dir, filepath.FromSlash(f)))
 		}
-		_ = os.Remove(filepath.Join(dir, "1_Pooling"))
+		for _, sub := range []string{"1_Pooling", "2_Dense", "3_Dense"} {
+			_ = os.Remove(filepath.Join(dir, sub))
+		}
 		_ = os.Remove(dir)
 	}
 	// config.json first and alone: model_type decides whether to continue
@@ -138,7 +146,7 @@ func Ensure(modelID, cacheDir string) (string, error) {
 	}
 	if !supported(hf.ModelType) {
 		cleanup("config.json")
-		return "", fmt.Errorf("hub: %s: model_type %q is not supported (rembed runs bert, distilbert, modernbert, qwen3, roberta, xlm-roberta, and mpnet encoders)", modelID, hf.ModelType)
+		return "", fmt.Errorf("hub: %s: model_type %q is not supported (rembed runs bert, distilbert, modernbert, qwen3, gemma3, roberta, xlm-roberta, and mpnet encoders)", modelID, hf.ModelType)
 	}
 	fetched := []string{"config.json"}
 	if err := fetch(modelID, "tokenizer_config.json", dir); err != nil {
@@ -179,6 +187,21 @@ func Ensure(modelID, cacheDir string) (string, error) {
 			return "", err
 		}
 		fetched = append(fetched, f)
+	}
+	// EmbeddingGemma ships its projection head as two separate
+	// sentence-transformers Dense modules (2_Dense/, 3_Dense/), each a small
+	// config + safetensors that loadGemma3 reads alongside the backbone.
+	if hf.ModelType == "gemma3_text" || hf.ModelType == "gemma3" {
+		for _, f := range []string{
+			"2_Dense/config.json", "2_Dense/model.safetensors",
+			"3_Dense/config.json", "3_Dense/model.safetensors",
+		} {
+			if err := fetch(modelID, f, dir); err != nil {
+				cleanup(fetched...)
+				return "", err
+			}
+			fetched = append(fetched, f)
+		}
 	}
 	// Weights come last (largest). A single model.safetensors is the common
 	// case; large checkpoints (Qwen3-4B/8B) ship a sharded set named by
@@ -260,6 +283,44 @@ func sweepStaleTemps(dir string) {
 // hop's X-Linked-Etag header; when present the body is verified against
 // it, so a proxy-served error page or truncated transfer can never poison
 // the cache.
+// hfTokenOnce caches the resolved Hugging Face token for the process.
+var (
+	hfTokenOnce  sync.Once
+	hfTokenValue string
+)
+
+// hfToken resolves a Hugging Face access token for gated/private repos:
+// $HF_TOKEN (or $HUGGING_FACE_HUB_TOKEN) first, then the token file the
+// `hf`/`huggingface-cli` login writes ($HF_HOME/token, else
+// ~/.cache/huggingface/token) — so a user who ran `hf auth login` needs no
+// extra env var. Returns "" when none is found (anonymous access).
+func hfToken() string {
+	hfTokenOnce.Do(func() {
+		for _, env := range []string{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"} {
+			if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+				hfTokenValue = v
+				return
+			}
+		}
+		paths := []string{}
+		if home := os.Getenv("HF_HOME"); home != "" {
+			paths = append(paths, filepath.Join(home, "token"))
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			paths = append(paths, filepath.Join(home, ".cache", "huggingface", "token"))
+		}
+		for _, p := range paths {
+			if b, err := os.ReadFile(p); err == nil {
+				if v := strings.TrimSpace(string(b)); v != "" {
+					hfTokenValue = v
+					return
+				}
+			}
+		}
+	})
+	return hfTokenValue
+}
+
 func fetch(modelID, name, dir string) error {
 	dst := filepath.Join(dir, filepath.FromSlash(name))
 	if _, err := os.Stat(dst); err == nil {
@@ -293,7 +354,7 @@ func fetch(modelID, name, dir string) error {
 		return err
 	}
 	req.Header.Set("User-Agent", "rembed/0.1")
-	if tok := os.Getenv("HF_TOKEN"); tok != "" {
+	if tok := hfToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	resp, err := client.Do(req)
@@ -309,8 +370,8 @@ func fetch(modelID, name, dir string) error {
 		// HF answers 401 for repos that DO NOT EXIST as well as for gated
 		// and private ones — never assume this is an auth problem.
 		hint := "no HF_TOKEN is set"
-		if os.Getenv("HF_TOKEN") != "" {
-			hint = "HF_TOKEN is set but may be invalid or lack access"
+		if hfToken() != "" {
+			hint = "an HF token is set but may be invalid or lack access"
 		}
 		return fmt.Errorf("hub: %s: HTTP %s — the repo does not exist, is gated, or is private (%s)", modelID, resp.Status, hint)
 	default:

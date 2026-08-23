@@ -297,17 +297,37 @@ path (dogfooded end to end), with token-for-token ids; int8 worst cosine
 0.999162 (weight-only) / 0.984945 (full int8), bounds enforced in the
 golden matrix. CI fetches it via the hub loader like every other model.
 
-## R13 — EmbeddingGemma (Gemma3 architecture) — in progress
-The current MMTEB state of the art for its size (Gemma3-backbone embedders
-top the multilingual board). High reuse of what exists: RoPE + GQA +
-RMSNorm (R9/R10), alternating global/local sliding-window attention (R9),
-GeGLU (R9); new bits are Gemma's 4-norm layer (pre/post attention +
-pre/post feed-forward), unit-offset RMSNorm, embedding scaling by
-√hidden, the Gemma SentencePiece tokenizer, and EmbeddingGemma's
-bidirectional-attention conversion + Matryoshka output dims. Gated on HF
-(Gemma license): the architecture can be written blind, but golden
-validation needs the weights, which need the user to accept the license
-and provide a token.
+## R13 — EmbeddingGemma (Gemma 3 bidirectional embedder) ✅
+Done: the seventh architecture and the MMTEB state of the art for its size.
+A Gemma 3 text backbone run as a bidirectional embedder — reusing R9/R10's
+RoPE, GQA, QK-norm, RMSNorm, sliding/global alternation, and GeGLU — plus
+the new Gemma-specific pieces: unit-offset RMSNorm (folded in at load as
+weight+1), a four-LayerNorm sandwich per layer (pre/post attention,
+pre/post feed-forward), embedding scaling by √hidden, dual-theta RoPE
+(1e6 global / 1e4 local), tanh-approximation GELU, query scaling by
+1/√query_pre_attn_scalar, a bidirectional sliding-window mask
+(|i−j| < 257 — Gemma halves the 512 window to an exclusive bound for the
+bidirectional embedder), and a two-layer bias-free Dense projection head
+(H→3072→H) between mean pooling and L2 normalization.
+
+New tokenizer family (`tokenizer/gemma`): a SentencePiece-style
+byte-fallback BPE — metaspace normalization (space→▁), whole-string
+merges, byte fallback for out-of-vocab characters, `<bos>…<eos>` framing.
+Validated token-for-token against HF over a committed fixture.
+
+Validated: `embeddinggemma-300m` matches PyTorch `Gemma3TextModel` with the
+explicit sentence-transformers pool+Dense+normalize pipeline at fp32 maxAbs
+< 1e-4 (the 306-token golden case exercises the sliding window — it caught
+the 512-vs-257 window bug), through BOTH the manifest-less DeriveConfig path
+and the hub path; int8 worst cosine 0.9981 (weight-only) / 0.9938 (full
+int8), bounds enforced in the golden matrix. The hub loader gained HF-token
+support (`HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN`, or the `hf login` token file)
+so gated repos like Gemma download in pure Go; CI fetches it when the
+`HF_TOKEN` secret is set and skips it otherwise (the model is gated).
+
+Deferred (not needed for the base embedding): Matryoshka truncation
+(768→512/256/128 is a caller-side slice+renormalize of the 768-d output)
+and the task-prompt prefixes (a usage convention applied by the caller).
 
 ## Standing rules
 Every rung: golden validation against an independent reference, its own

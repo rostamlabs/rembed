@@ -71,6 +71,15 @@ func DeriveConfig(dir, name string) (Config, error) {
 		RopeScaling      json.RawMessage `json:"rope_scaling"`
 		SlidingWindow    *int            `json:"sliding_window"`
 		UseSlidingWindow bool            `json:"use_sliding_window"`
+
+		// Gemma3 (EmbeddingGemma). model_type is "gemma3_text"; normalized to
+		// "gemma3" below.
+		RopeLocalBaseFreq         *float64 `json:"rope_local_base_freq"`
+		SlidingWindowPattern      int      `json:"_sliding_window_pattern"`
+		QueryPreAttnScalar        *int     `json:"query_pre_attn_scalar"`
+		UseBidirectionalAttention *bool    `json:"use_bidirectional_attention"`
+		AttnLogitSoftcapping      *float64 `json:"attn_logit_softcapping"`
+		FinalLogitSoftcapping     *float64 `json:"final_logit_softcapping"`
 	}
 	if err := readJSON("config.json", &hf); err != nil {
 		return c, err
@@ -89,6 +98,11 @@ func DeriveConfig(dir, name string) (Config, error) {
 			// tables would load as garbage rows.
 			return c, fmt.Errorf("model dir %s: sinusoidal_pos_embds=true is not supported", dir)
 		}
+	}
+	// EmbeddingGemma's config carries model_type "gemma3_text"; normalize to
+	// "gemma3" so the rest of the derivation and the engine see one name.
+	if hf.ModelType == "gemma3_text" {
+		hf.ModelType = "gemma3"
 	}
 	// The engine hardcodes two encoder architectures, exact-erf GELU, and
 	// absolute position embeddings; anything else would produce a
@@ -127,6 +141,28 @@ func DeriveConfig(dir, name string) (Config, error) {
 		if hf.UseSlidingWindow || (hf.SlidingWindow != nil && *hf.SlidingWindow > 0) {
 			return c, fmt.Errorf("model dir %s: qwen3 sliding-window attention is not supported (only full causal)", dir)
 		}
+	case "gemma3":
+		// EmbeddingGemma: bidirectional Gemma 3 backbone. Refuse anything that
+		// would change the geometry rembed's gemma3 path does not implement:
+		// a causal variant (the embedder is bidirectional), logit softcapping
+		// (Gemma 3 ships none; rembed does not apply it), attention_bias (the
+		// loader allocates no bias), the tanh-GELU is required (GeGLU), and a
+		// rope scaling.
+		if hf.HiddenActivation != "" && hf.HiddenActivation != "gelu_pytorch_tanh" {
+			return c, fmt.Errorf("model dir %s: hidden_activation=%q — gemma3 supports only gelu_pytorch_tanh", dir, hf.HiddenActivation)
+		}
+		if hf.UseBidirectionalAttention == nil || !*hf.UseBidirectionalAttention {
+			return c, fmt.Errorf("model dir %s: gemma3 requires use_bidirectional_attention=true (rembed's gemma3 path is a bidirectional embedder)", dir)
+		}
+		if (hf.AttnLogitSoftcapping != nil && *hf.AttnLogitSoftcapping != 0) || (hf.FinalLogitSoftcapping != nil && *hf.FinalLogitSoftcapping != 0) {
+			return c, fmt.Errorf("model dir %s: gemma3 logit softcapping is not supported", dir)
+		}
+		if hf.AttentionBias {
+			return c, fmt.Errorf("model dir %s: gemma3 with attention_bias is not supported (rembed's gemma3 path is bias-free)", dir)
+		}
+		if len(hf.RopeScaling) > 0 && string(hf.RopeScaling) != "null" {
+			return c, fmt.Errorf("model dir %s: gemma3 rope_scaling=%s is not supported (only default RoPE)", dir, hf.RopeScaling)
+		}
 	case "roberta", "xlm-roberta":
 		// XLM-RoBERTa is architecturally identical to RoBERTa (same encoder,
 		// same fairseq position offset); only the tokenizer differs — it wears
@@ -149,7 +185,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
 		}
 	default:
-		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, qwen3, roberta, xlm-roberta, and mpnet encoders", dir, hf.ModelType)
+		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, qwen3, gemma3, roberta, xlm-roberta, and mpnet encoders", dir, hf.ModelType)
 	}
 	// qwen3's activation (silu, for SwiGLU) is validated in its case above;
 	// the encoders' exact-GELU requirement does not apply to it.
@@ -213,7 +249,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 	doLower := false
 	switch {
 	case sentencePiece:
-	case hf.ModelType == "roberta" || hf.ModelType == "modernbert" || hf.ModelType == "qwen3":
+	case hf.ModelType == "roberta" || hf.ModelType == "modernbert" || hf.ModelType == "qwen3" || hf.ModelType == "gemma3":
 		if tok.DoLowerCase != nil && *tok.DoLowerCase {
 			return c, fmt.Errorf("model dir %s: do_lower_case=true on a %s model — byte-level BPE is case-preserving", dir, hf.ModelType)
 		}
@@ -235,9 +271,14 @@ func DeriveConfig(dir, name string) (Config, error) {
 		return c, fmt.Errorf("model dir %s: modules.json: %w", dir, err)
 	}
 	for _, m := range modules {
-		if strings.HasSuffix(m.Type, "models.Normalize") {
+		switch {
+		case strings.HasSuffix(m.Type, "models.Normalize"):
 			normalize = true
-		} else if !strings.HasSuffix(m.Type, "models.Transformer") && !strings.HasSuffix(m.Type, "models.Pooling") {
+		case strings.HasSuffix(m.Type, "models.Transformer"), strings.HasSuffix(m.Type, "models.Pooling"):
+		case strings.HasSuffix(m.Type, "models.Dense") && hf.ModelType == "gemma3":
+			// EmbeddingGemma's two-layer bias-free projection head, loaded
+			// from 2_Dense/ and 3_Dense/ in loadGemma3.
+		default:
 			return c, fmt.Errorf("model dir %s: unsupported sentence-transformers module %q", dir, m.Type)
 		}
 	}
@@ -301,8 +342,68 @@ func DeriveConfig(dir, name string) (Config, error) {
 		// pooling reads that position. SepToken carries the suffix content.
 		c.ClsToken = ""
 		c.SepToken = "<|endoftext|>"
+	case "gemma3":
+		// EmbeddingGemma: rms_norm_eps, explicit head_dim + kv-head count
+		// (GQA), the two RoPE thetas (global rope_theta, local
+		// rope_local_base_freq), the sliding window and its period, the
+		// attention scalar, and the Gemma BPE tokenizer. The Dense-head width
+		// comes from 2_Dense/config.json.
+		if hf.RMSNormEps != nil {
+			c.LayerNormEps = *hf.RMSNormEps
+		}
+		c.HeadDim = hf.HeadDim
+		c.NumKeyValueHeads = hf.NumKeyValueHeads
+		c.GlobalRopeTheta = hf.RopeTheta
+		if hf.RopeLocalBaseFreq != nil {
+			c.LocalRopeTheta = *hf.RopeLocalBaseFreq
+		}
+		if hf.SlidingWindow != nil {
+			// Gemma's config __post_init__ halves the window to an exclusive
+			// bound for the bidirectional embedder: sliding_window//2 + 1
+			// (512 → 257). rembed's mask keeps |i−j| < SlidingWindow, so store
+			// the same effective value the reference runs with. (A config
+			// re-exported AFTER __post_init__ already carries 257; halving it
+			// again gives 129, but HF does the same on its own re-load, so the
+			// two still agree — this is not a divergence.)
+			c.SlidingWindow = (*hf.SlidingWindow / 2) + 1
+		}
+		// HF serializes the period under the private-attribute key
+		// _sliding_window_pattern (read into hf above); the public
+		// sliding_window_pattern kwarg is not written to config.json.
+		c.SlidingWindowPattern = hf.SlidingWindowPattern
+		if hf.QueryPreAttnScalar != nil {
+			c.QueryPreAttnScalar = *hf.QueryPreAttnScalar
+		}
+		c.Tokenizer = "gemma"
+		c.ClsToken, c.SepToken = "<bos>", "<eos>"
+		dh, err := gemmaDenseHidden(dir)
+		if err != nil {
+			return c, err
+		}
+		c.DenseHidden = dh
 	}
 	return c, validate(&c, dir)
+}
+
+// gemmaDenseHidden reads the width of EmbeddingGemma's first Dense-head layer
+// (2_Dense/config.json out_features) — the hidden size of the H→D→H
+// projection applied to the pooled vector.
+func gemmaDenseHidden(dir string) (int, error) {
+	var d struct {
+		InFeatures  int `json:"in_features"`
+		OutFeatures int `json:"out_features"`
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "2_Dense", "config.json"))
+	if err != nil {
+		return 0, fmt.Errorf("model dir %s: gemma3 Dense head: %w", dir, err)
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return 0, fmt.Errorf("model dir %s: 2_Dense/config.json: %w", dir, err)
+	}
+	if d.OutFeatures < 1 {
+		return 0, fmt.Errorf("model dir %s: 2_Dense/config.json out_features=%d", dir, d.OutFeatures)
+	}
+	return d.OutFeatures, nil
 }
 
 // poolingMode maps a 1_Pooling/config.json onto rembed's pooling

@@ -198,6 +198,25 @@ func TestGELU(t *testing.T) {
 	almostEqual(t, x, want, 1e-6, "gelu")
 }
 
+// TestGELUTanh pins the tanh-approximation GELU (Gemma's GeGLU activation)
+// against its float64 reference. This is a DIFFERENT function from the
+// erf-based GELU — the two differ by up to ~1e-3, so a checkpoint expecting
+// gelu_pytorch_tanh must not silently get the erf variant.
+func TestGELUTanh(t *testing.T) {
+	const c = 0.7978845608028654 // √(2/π)
+	x := make([]float32, 0, 100)
+	for v := float32(-6); v <= 6; v += 0.25 {
+		x = append(x, v)
+	}
+	want := make([]float32, len(x))
+	for i, v := range x {
+		d := float64(v)
+		want[i] = float32(0.5 * d * (1 + math.Tanh(c*(d+0.044715*d*d*d))))
+	}
+	GELUTanh(x)
+	almostEqual(t, x, want, 1e-6, "gelu_tanh")
+}
+
 // TestGELUVectorMatchesScalar pins that the vectorized GELU tracks the
 // scalar geluScalar to fp32 rounding across the input range and every length
 // class (8-aligned bodies plus 1..7-element tails), including the values that
