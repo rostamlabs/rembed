@@ -553,3 +553,37 @@ Two real fixes fell out of the expansion, both caught by goldens:
   object form ({"content": "<s>", …}); both convert.py and the Go
   derivation now unwrap it — a long-standing backlog item closed by the
   first repo that actually shipped the form.
+
+## Performance investigation (profile-driven, 2026-08)
+
+Profiled end-to-end forward passes (BenchmarkEmbedProfile: serial, ~120
+tokens, `-cpuprofile`) on an AVX2+AVX-VNNI (no AVX-512) box, encoder
+(all-mpnet-base-v2) and decoder (Qwen3-Embedding-0.6B).
+
+- **AVX2 GELU — SHIPPED, ~12%.** GELU was 9% of the encoder forward as a
+  scalar Go polynomial. A vectorized kernel (gelu_amd64.s: 8-wide erf +
+  Cephes exp) cut mpnet serial forward 270 ms -> 238 ms (~12%), validated
+  bit-close to the scalar (<= 1e-6) and against every GELU-model golden.
+- **Matmul prefetch — REJECTED (measured wash).** gemm4x16 is the biggest
+  single hotspot (~58% encoder), but adding PREFETCHT0 to its k-loop
+  measured 269 vs 270 ms — no change. The kernel is FMA-port-bound (its
+  design saturates two FMA ports), not memory-bound, so prefetch cannot
+  help; reverted rather than add a dead instruction. Going wider needs
+  AVX-512 (the gemm4x32/VNNI-512 kernels already exist for CPUs that have
+  it; this box does not).
+- **Packed attention kernel — REJECTED (measured 1.65x slower).** The
+  decoder spends ~34% in dot4 (attention Q·Kᵀ and probs·V via
+  MatMulSerial), which has far fewer MACs than the projections yet takes
+  more time — suggesting the packed gemm4x16 might win. A micro-benchmark
+  on the real shape (m=120,k=120,n=128) refuted it: dot4 ~70 us vs packed
+  gemm4x16 + per-call PackB ~116 us. Attention weights (K/V) are computed
+  per forward and cannot be pre-packed, so the packing cost outweighs the
+  kernel's efficiency (projections only look efficient because they pack
+  once at load and amortize it). dot4 is the correct kernel for
+  attention's small, non-reusable matmuls.
+- **SiLU / RMSNorm / RoPE — not worth vectorizing.** Each < 1.5% of the
+  decoder forward; the profile cleared them despite an obvious-looking
+  float64 math.Exp in SiLU.
+
+Net: on AVX2, the matmul is at the compute roofline and attention is on
+the right kernel; GELU was the one remaining vectorization win.
