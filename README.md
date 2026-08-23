@@ -35,7 +35,7 @@ throughput-saturated servers.
 
 ## Supported models
 
-BERT-family, MPNet, and RoBERTa encoders in sentence-transformers
+BERT-family, DistilBERT, MPNet, and RoBERTa encoders in sentence-transformers
 format: mean or CLS pooling; WordPiece, byte-level BPE, or SentencePiece
 Unigram tokenization (the XLM-R tokenizer — multilingual models work,
 50+ languages); absolute positions (plus MPNet's bucketed
@@ -51,6 +51,13 @@ Validated end-to-end against each model's own ONNX Runtime reference:
 | sentence-transformers/all-mpnet-base-v2 | mean | F32 | 3.3e-7 | cosine ≥ 0.9978 |
 | sentence-transformers/all-distilroberta-v1 | mean | F32 | 3.2e-7 | cosine ≥ 0.9985 |
 | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | mean | F32 | 7e-7 | cosine ≥ 0.9995 |
+| intfloat/multilingual-e5-small | mean | F32 | 1.7e-7 | cosine ≥ 0.9995 |
+| BAAI/bge-base-en-v1.5 | cls | F32 | 7.4e-7 | cosine ≥ 0.995 |
+| thenlper/gte-base | mean | F32 | 3.8e-6 | cosine ≥ 0.988 |
+| sentence-transformers/paraphrase-mpnet-base-v2 | mean | F32 | 1.2e-6 | cosine ≥ 0.9945 |
+| sentence-transformers/multi-qa-MiniLM-L6-cos-v1 | mean | F32 | 2.1e-7 | cosine ≥ 0.998 |
+| Snowflake/snowflake-arctic-embed-s | cls | F32 | 2.5e-7 | cosine ≥ 0.995 |
+| sentence-transformers/multi-qa-distilbert-cos-v1 | mean | F32 | 2.5e-7 | cosine ≥ 0.999 |
 | thenlper/gte-small | mean | F16 | 2e-3 maxAbs + cosine ≥ 0.9999 + meanAbs ≤ 2e-4 (the repo's ONNX export is fp32 while its safetensors are f16, so maxAbs is dominated by the checkpoint's own rounding; the cosine/mean bounds are what actually constrain rembed) | — |
 
 On CPUs with AVX-VNNI — Intel Alder Lake (2021) onward and Sapphire
@@ -86,8 +93,11 @@ BERT-based sentence-transformers checkpoints. Caveat for retrieval
 models: e5 requires "query: "/"passage: " prefixes and some models
 (e.g. arctic) declare prompt handling in their pooling config — rembed
 embeds exactly the text you pass and does not add prefixes; add them
-yourself or retrieval quality silently degrades (multilingual-e5 is the
-main SentencePiece model in this category).
+yourself or retrieval quality silently degrades. Validated models in
+that category: the e5 family ("query: "/"passage: "), bge
+("Represent this sentence for searching relevant passages: " on
+queries), and arctic-embed (its own query prefix) — rembed embeds
+exactly the text you pass.
 
 One deliberate tokenizer divergence: on NFD (decomposed) Hangul/kana —
 routine output from macOS — HF's fast tokenizer skips ≥6-byte grapheme

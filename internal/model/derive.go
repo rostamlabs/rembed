@@ -43,16 +43,39 @@ func DeriveConfig(dir, name string) (Config, error) {
 		LayerNormEps          *float32 `json:"layer_norm_eps"`
 		RelAttnNumBuckets     int      `json:"relative_attention_num_buckets"`
 		PadTokenID            *int     `json:"pad_token_id"`
+
+		// DistilBERT spells its architecture with different keys.
+		Dim                *int   `json:"dim"`
+		NLayers            *int   `json:"n_layers"`
+		NHeads             *int   `json:"n_heads"`
+		HiddenDim          *int   `json:"hidden_dim"`
+		Activation         string `json:"activation"`
+		SinusoidalPosEmbds bool   `json:"sinusoidal_pos_embds"`
 	}
 	if err := readJSON("config.json", &hf); err != nil {
 		return c, err
+	}
+	if hf.ModelType == "distilbert" {
+		// Fold DistilBERT's key names into the BERT ones so the rest of
+		// the derivation (and validate) sees one shape of config.
+		if hf.Dim == nil || hf.NLayers == nil || hf.NHeads == nil || hf.HiddenDim == nil {
+			return c, fmt.Errorf("model dir %s: distilbert config.json lacks dim/n_layers/n_heads/hidden_dim", dir)
+		}
+		hf.HiddenSize, hf.NumHiddenLayers = *hf.Dim, *hf.NLayers
+		hf.NumAttentionHeads, hf.IntermediateSize = *hf.NHeads, *hf.HiddenDim
+		hf.HiddenAct = hf.Activation
+		if hf.SinusoidalPosEmbds {
+			// The engine only has learned absolute positions; sinusoidal
+			// tables would load as garbage rows.
+			return c, fmt.Errorf("model dir %s: sinusoidal_pos_embds=true is not supported", dir)
+		}
 	}
 	// The engine hardcodes two encoder architectures, exact-erf GELU, and
 	// absolute position embeddings; anything else would produce a
 	// valid-looking wrong answer, so refuse loudly here (mirrors
 	// convert.py's export-time guards).
 	switch hf.ModelType {
-	case "bert":
+	case "bert", "distilbert":
 	case "roberta":
 		if hf.PadTokenID == nil {
 			// RoBERTa's position rows are offset by pad_token_id+1;
@@ -70,7 +93,7 @@ func DeriveConfig(dir, name string) (Config, error) {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
 		}
 	default:
-		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, roberta, and mpnet encoders", dir, hf.ModelType)
+		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, roberta, and mpnet encoders", dir, hf.ModelType)
 	}
 	if hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
 		return c, fmt.Errorf("model dir %s: hidden_act=%q — only exact GELU is supported", dir, hf.HiddenAct)
@@ -80,11 +103,11 @@ func DeriveConfig(dir, name string) (Config, error) {
 	}
 
 	var tok struct {
-		DoLowerCase    *bool  `json:"do_lower_case"`
-		ClsToken       string `json:"cls_token"`
-		SepToken       string `json:"sep_token"`
-		UnkToken       string `json:"unk_token"`
-		TokenizerClass string `json:"tokenizer_class"`
+		DoLowerCase    *bool     `json:"do_lower_case"`
+		ClsToken       tokString `json:"cls_token"`
+		SepToken       tokString `json:"sep_token"`
+		UnkToken       tokString `json:"unk_token"`
+		TokenizerClass string    `json:"tokenizer_class"`
 	}
 	if err := readJSON("tokenizer_config.json", &tok); err != nil {
 		return c, err
@@ -163,9 +186,9 @@ func DeriveConfig(dir, name string) (Config, error) {
 		VocabSize:             hf.VocabSize,
 		MaxPositionEmbeddings: hf.MaxPositionEmbeddings,
 		DoLowerCase:           doLower,
-		ClsToken:              tok.ClsToken,
-		SepToken:              tok.SepToken,
-		UnkToken:              tok.UnkToken,
+		ClsToken:              string(tok.ClsToken),
+		SepToken:              string(tok.SepToken),
+		UnkToken:              string(tok.UnkToken),
 		Pooling:               mode,
 		Normalize:             normalize,
 	}
@@ -234,4 +257,25 @@ func LoadConfigOrDerive(dir, name string) (Config, error) {
 		return LoadConfig(manifest)
 	}
 	return DeriveConfig(dir, name)
+}
+
+// tokString unmarshals a special token that HF writes either as a plain
+// string or as an AddedToken object ({"content": "<s>", "lstrip": …}) —
+// paraphrase-mpnet-base-v2 ships the object form.
+type tokString string
+
+func (t *tokString) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*t = tokString(s)
+		return nil
+	}
+	var obj struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return err
+	}
+	*t = tokString(obj.Content)
+	return nil
 }

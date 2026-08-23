@@ -175,8 +175,16 @@ def main() -> None:
     modules = json.loads(fetch("modules.json").read_text())
 
     model_type = config.get("model_type")
-    if model_type not in ("bert", "roberta", "mpnet"):
-        raise SystemExit(f"model_type={model_type!r}: only bert, roberta, and mpnet models are supported")
+    if model_type not in ("bert", "distilbert", "roberta", "mpnet"):
+        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, roberta, and mpnet models are supported")
+    if model_type == "distilbert":
+        # Fold DistilBERT's config keys into the BERT names.
+        if config.get("sinusoidal_pos_embds"):
+            raise SystemExit("sinusoidal_pos_embds=true is not supported")
+        config = dict(config,
+                      hidden_size=config["dim"], num_hidden_layers=config["n_layers"],
+                      num_attention_heads=config["n_heads"], intermediate_size=config["hidden_dim"],
+                      hidden_act=config.get("activation", "gelu"))
     if model_type == "mpnet":
         # HF's MPNet code hardcodes num_buckets=32 and padding_idx=1
         # regardless of config; the Go loader refuses anything else, so
@@ -208,6 +216,13 @@ def main() -> None:
         raise SystemExit(f"unsupported sentence-transformers modules: {unknown}")
     normalize = any(m.get("type", "").endswith("models.Normalize") for m in modules)
 
+    def tok_str(v, default):
+        # HF writes special tokens either as plain strings or as
+        # AddedToken objects ({"content": ..., "lstrip": ...}).
+        if isinstance(v, dict):
+            return v.get("content", default)
+        return v if v is not None else default
+
     manifest = {
         "name": args.model_id,
         "hidden_size": config["hidden_size"],
@@ -218,12 +233,14 @@ def main() -> None:
         "max_position_embeddings": config["max_position_embeddings"],
         "layer_norm_eps": config.get("layer_norm_eps", 1e-12),
         "do_lower_case": bool(tok_config.get("do_lower_case", False)) if (model_type == "roberta" or sentencepiece_tok) else bool(tok_config.get("do_lower_case", True)),
-        "cls_token": tok_config.get("cls_token", "[CLS]"),
-        "sep_token": tok_config.get("sep_token", "[SEP]"),
-        "unk_token": tok_config.get("unk_token", "<unk>" if (model_type == "roberta" or sentencepiece_tok) else "[UNK]"),
+        "cls_token": tok_str(tok_config.get("cls_token"), "[CLS]"),
+        "sep_token": tok_str(tok_config.get("sep_token"), "[SEP]"),
+        "unk_token": tok_str(tok_config.get("unk_token"), "<unk>" if (model_type == "roberta" or sentencepiece_tok) else "[UNK]"),
         "pooling": pool_mode,
         "normalize": normalize,
     }
+    if model_type == "distilbert":
+        manifest["model_type"] = "distilbert"
     if model_type == "mpnet":
         # Positions are offset by pad_token_id+1 (fairseq convention), and
         # attention adds a shared bucketed relative-position bias.

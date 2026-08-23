@@ -229,7 +229,7 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 		return nil, err
 	}
 	prefix := ""
-	for _, p := range []string{"bert.", "roberta.", "mpnet."} {
+	for _, p := range []string{"bert.", "roberta.", "mpnet.", "distilbert."} {
 		if _, ok := tensors[p+"embeddings.word_embeddings.weight"]; ok {
 			prefix = p
 		}
@@ -238,6 +238,7 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 	// names, a [1×H] token_type table (row 0, the only one, is used), and
 	// the position offset already comes from cfg.PositionOffset().
 	mpnet := cfg.ModelType == "mpnet"
+	distil := cfg.ModelType == "distilbert"
 	get := func(name string, wantShape ...int) ([]float32, error) {
 		t, ok := tensors[prefix+name]
 		if !ok {
@@ -288,6 +289,9 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 	for i := range m.layers {
 		l := &m.layers[i]
 		p := fmt.Sprintf("encoder.layer.%d.", i)
+		if distil {
+			p = fmt.Sprintf("transformer.layer.%d.", i)
+		}
 		var raw struct {
 			qW, qB, kW, kB, vW, vB []float32
 			attnOutW, attnOutB     []float32
@@ -310,6 +314,21 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 			{&l.attnLNg, p + "attention.output.LayerNorm.weight", []int{H}},
 			{&l.attnLNb, p + "attention.output.LayerNorm.bias", []int{H}},
 		}
+		if distil {
+			// DistilBERT: same post-LN flow, renamed everything.
+			attn = []load{
+				{&raw.qW, p + "attention.q_lin.weight", []int{H, H}},
+				{&raw.qB, p + "attention.q_lin.bias", []int{H}},
+				{&raw.kW, p + "attention.k_lin.weight", []int{H, H}},
+				{&raw.kB, p + "attention.k_lin.bias", []int{H}},
+				{&raw.vW, p + "attention.v_lin.weight", []int{H, H}},
+				{&raw.vB, p + "attention.v_lin.bias", []int{H}},
+				{&raw.attnOutW, p + "attention.out_lin.weight", []int{H, H}},
+				{&raw.attnOutB, p + "attention.out_lin.bias", []int{H}},
+				{&l.attnLNg, p + "sa_layer_norm.weight", []int{H}},
+				{&l.attnLNb, p + "sa_layer_norm.bias", []int{H}},
+			}
+		}
 		if mpnet {
 			attn = []load{
 				{&raw.qW, p + "attention.attn.q.weight", []int{H, H}},
@@ -324,14 +343,25 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 				{&l.attnLNb, p + "attention.LayerNorm.bias", []int{H}},
 			}
 		}
-		for _, ld := range append(attn, []load{
+		ffn := []load{
 			{&raw.ffn1W, p + "intermediate.dense.weight", []int{I, H}},
 			{&raw.ffn1B, p + "intermediate.dense.bias", []int{I}},
 			{&raw.ffn2W, p + "output.dense.weight", []int{H, I}},
 			{&raw.ffn2B, p + "output.dense.bias", []int{H}},
 			{&l.outLNg, p + "output.LayerNorm.weight", []int{H}},
 			{&l.outLNb, p + "output.LayerNorm.bias", []int{H}},
-		}...) {
+		}
+		if distil {
+			ffn = []load{
+				{&raw.ffn1W, p + "ffn.lin1.weight", []int{I, H}},
+				{&raw.ffn1B, p + "ffn.lin1.bias", []int{I}},
+				{&raw.ffn2W, p + "ffn.lin2.weight", []int{H, I}},
+				{&raw.ffn2B, p + "ffn.lin2.bias", []int{H}},
+				{&l.outLNg, p + "output_layer_norm.weight", []int{H}},
+				{&l.outLNb, p + "output_layer_norm.bias", []int{H}},
+			}
+		}
+		for _, ld := range append(attn, ffn...) {
 			data, err := get(ld.name, ld.shape...)
 			if err != nil {
 				return nil, err
@@ -351,6 +381,10 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 		l.ffn2 = newDense(raw.ffn2W, raw.ffn2B, I, H, quantize)
 	}
 
+	if distil {
+		// DistilBERT has no segment embedding and no extras: done.
+		return m, nil
+	}
 	if mpnet {
 		// MPNet has no segment embedding; instead every layer shares one
 		// bucketed relative-position bias table over the heads.

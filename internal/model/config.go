@@ -91,7 +91,7 @@ func validate(c *Config, source string) error {
 		return fmt.Errorf("%s: tokenizer %q unsupported (\"\" or sentencepiece)", source, c.Tokenizer)
 	}
 	switch c.ModelType {
-	case "", "bert":
+	case "", "bert", "distilbert":
 	case "roberta":
 		// Unlike MPNet, HF's RoBERTa reads padding_idx from config — but
 		// zero is refused deliberately: PadTokenID is a plain int, so a

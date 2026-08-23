@@ -129,8 +129,16 @@ func (t *Tokenizer) basicTokens(text string) []string {
 			// drop, mirroring HF _clean_text
 		case unicode.IsSpace(r):
 			flush()
-		case unicode.IsControl(r):
-			// drop
+		case unicode.In(r, unicode.C):
+			// HF's _clean_text drops every category-C character that is
+			// not \t\n\r (handled as whitespace above): Cc controls AND
+			// Cf format characters — the zero-width non-joiner U+200C that
+			// Persian uses inside words («می‌کند»), ZWJ, direction marks.
+			// Go's unicode.IsControl is Cc-only, which kept ZWNJ and made
+			// Persian tokenize differently from HF (caught by the
+			// distilbert golden's Persian case). unicode.C = Cc∪Cf∪Co∪Cs;
+			// HF also drops unassigned codepoints (Cn), which Go cannot
+			// detect — never seen in real text.
 		case isCJKIdeograph(r):
 			flush()
 			out = append(out, string(r))

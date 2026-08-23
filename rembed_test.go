@@ -431,6 +431,17 @@ func TestGoldenMatrix(t *testing.T) {
 		// with a padded embedding table (250037 rows for 250002 ids).
 		// int8 bound: measured worst 0.999642 (the 402-token text) less margin.
 		{"testdata/golden-paraphrase-multilingual-MiniLM-L12-v2.json", "models/paraphrase-multilingual-MiniLM-L12-v2", "REMBED_MODEL_XLMR", 1e-4, 0, 1e-5, 0.9995, 0.9975},
+		// The coverage expansion (int8 bounds are measured worst cases
+		// less margin; full-int8 not documented for these, hence 0):
+		{"testdata/golden-multilingual-e5-small.json", "models/multilingual-e5-small", "REMBED_MODEL_E5", 1e-4, 0, 1e-5, 0.9995, 0},
+		{"testdata/golden-bge-base-en-v1.5.json", "models/bge-base-en-v1.5", "REMBED_MODEL_BGEB", 1e-4, 0, 1e-5, 0.995, 0},
+		{"testdata/golden-gte-base.json", "models/gte-base", "REMBED_MODEL_GTEB", 1e-4, 0, 1e-5, 0.988, 0},
+		{"testdata/golden-paraphrase-mpnet-base-v2.json", "models/paraphrase-mpnet-base-v2", "REMBED_MODEL_PMPNET", 1e-4, 0, 1e-5, 0.9945, 0},
+		{"testdata/golden-multi-qa-MiniLM-L6-cos-v1.json", "models/multi-qa-MiniLM-L6-cos-v1", "REMBED_MODEL_MQAM", 1e-4, 0, 1e-5, 0.998, 0},
+		{"testdata/golden-snowflake-arctic-embed-s.json", "models/snowflake-arctic-embed-s", "REMBED_MODEL_ARCTIC", 1e-4, 0, 1e-5, 0.995, 0},
+		// DistilBERT: the fourth architecture, and the golden whose
+		// Persian case caught the WordPiece ZWNJ (Cf-dropping) gap.
+		{"testdata/golden-multi-qa-distilbert-cos-v1.json", "models/multi-qa-distilbert-cos-v1", "REMBED_MODEL_DISTIL", 1e-4, 0, 1e-5, 0.999, 0},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {
