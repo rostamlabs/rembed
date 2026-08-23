@@ -14,7 +14,7 @@ import (
 // sentence-transformers pooling config.
 type Config struct {
 	Name                  string  `json:"name"`
-	ModelType             string  `json:"model_type,omitempty"` // "", bert, distilbert, roberta, or mpnet
+	ModelType             string  `json:"model_type,omitempty"` // "", bert, distilbert, modernbert, roberta, or mpnet
 	HiddenSize            int     `json:"hidden_size"`
 	NumHiddenLayers       int     `json:"num_hidden_layers"`
 	NumAttentionHeads     int     `json:"num_attention_heads"`
