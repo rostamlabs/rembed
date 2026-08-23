@@ -179,9 +179,10 @@ type scratch struct {
 	cosL, sinL []float32 // [seq×dh/2] local-theta RoPE table
 
 	// Qwen3-only buffers. q/k/v are the separate (non-fused) projections;
-	// kHead/vHeadT are the per-kv-head normed+RoPE'd K and Vᵀ (computed once
-	// and shared across a GQA group); qHead/cHead are per-q-head scratch;
-	// swUp holds the SwiGLU up-projection.
+	// kHead/vHead are the per-kv-head normed+RoPE'd K and V, both row-major
+	// (key-contiguous), computed once and shared across a GQA group;
+	// qHead/cHead are per-q-head scratch; qwUp holds the SwiGLU
+	// up-projection.
 	qwQ, qwK, qwV    []float32 // [mPad×qDim], [mPad×kvDim], [mPad×kvDim]
 	qwKHead, qwVHead []float32 // [nkv×seq×dh] row-major (K and V, both key-contiguous)
 	qwQHead, qwCHead []float32 // [nq×seq×dh]
