@@ -953,6 +953,93 @@ func TestGoldenMatrix(t *testing.T) {
 	}
 }
 
+// TestGoldenMatryoshka validates WithDim(d) truncation against the
+// deterministic slice+renormalize of the full-768 EmbeddingGemma golden
+// (the independent torch reference): MRL keeps the first d dimensions and
+// re-L2-normalizes. Pins that rembed's truncation matches that operation
+// applied to the reference — so both the truncation math and the underlying
+// full vector are correct.
+func TestGoldenMatryoshka(t *testing.T) {
+	dir := os.Getenv("REMBED_MODEL_GEMMA")
+	if dir == "" {
+		dir = "models/embeddinggemma-300m"
+	}
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("model dir %s not present", dir)
+	}
+	raw, err := os.ReadFile("testdata/golden-embeddinggemma-300m.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden goldenFile
+	if err := json.Unmarshal(raw, &golden); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []int{512, 256, 128} {
+		emb, err := Load(dir, WithDim(d), WithWorkers(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if emb.Dim() != d {
+			t.Fatalf("Dim()=%d, want %d", emb.Dim(), d)
+		}
+		for _, c := range golden.Cases {
+			// Reference: renormalize(full[:d]).
+			want := make([]float32, d)
+			var norm float64
+			for i := range d {
+				want[i] = c.Embedding[i]
+				norm += float64(want[i]) * float64(want[i])
+			}
+			inv := float32(1 / math.Sqrt(norm))
+			for i := range want {
+				want[i] *= inv
+			}
+			v, err := emb.Embed(context.Background(), []string{c.Text})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(v[0]) != d {
+				t.Fatalf("d=%d: got vector dim %d", d, len(v[0]))
+			}
+			var maxd float64
+			for i := range want {
+				if dd := math.Abs(float64(v[0][i] - want[i])); dd > maxd {
+					maxd = dd
+				}
+			}
+			if maxd > 1e-4 {
+				t.Errorf("d=%d %.30q: maxAbs=%g > 1e-4", d, c.Text, maxd)
+			}
+		}
+	}
+}
+
+// TestWithDimRange pins the WithDim bounds: 0 keeps the full dim, and an
+// out-of-range value is refused at Load rather than truncating silently.
+func TestWithDimRange(t *testing.T) {
+	dir := os.Getenv("REMBED_MODEL_GEMMA")
+	if dir == "" {
+		dir = "models/embeddinggemma-300m"
+	}
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("model dir %s not present", dir)
+	}
+	full, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir, WithDim(full.Dim()+1)); err == nil {
+		t.Fatal("WithDim above the full dim was accepted; it must refuse")
+	}
+	if _, err := Load(dir, WithDim(-1)); err == nil {
+		t.Fatal("WithDim(-1) was accepted; it must refuse")
+	}
+	if e, err := Load(dir, WithDim(0)); err != nil || e.Dim() != full.Dim() {
+		t.Fatalf("WithDim(0) should keep the full dim: dim=%d err=%v", e.Dim(), err)
+	}
+}
+
 // TestLoadPrefersLocalPaths pins the review's HIGH finding: a ref that is
 // valid org/name syntax but whose parent IS a local directory must fail as
 // a missing local path — never silently reach the network (with HF_TOKEN)

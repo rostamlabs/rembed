@@ -3,7 +3,7 @@
 // Command rembed embeds text, validates against the golden ONNX reference,
 // and benchmarks the engine.
 //
-//	rembed embed    -model DIR [-full] text...
+//	rembed embed    -model DIR [-full] [-dim N] text...
 //	rembed validate -model DIR [-golden FILE] [-tol 1e-4]
 //	rembed bench    -model DIR [-runs 30] [-warmup 5] [-text S]
 //	rembed serve    -model DIR|HF-ID [-addr :8080] [-int8] [-workers N]
@@ -70,12 +70,17 @@ func cmdEmbed(args []string) error {
 	full := fs.Bool("full", false, "print full vectors as JSON instead of a preview")
 	useInt8 := fs.Bool("int8", false, "weight-only int8 inference")
 	useInt8Act := fs.Bool("int8act", false, "full int8 (u8 activations, needs VNNI)")
+	dim := fs.Int("dim", 0, "Matryoshka output dim (truncate + renormalize; 0 = full)")
 	_ = fs.Parse(args)
 	texts := fs.Args()
 	if len(texts) == 0 {
 		return fmt.Errorf("embed: no texts given")
 	}
-	emb, err := rembed.Load(*modelDir, quantOpts(*useInt8, *useInt8Act)...)
+	opts := quantOpts(*useInt8, *useInt8Act)
+	if *dim > 0 {
+		opts = append(opts, rembed.WithDim(*dim))
+	}
+	emb, err := rembed.Load(*modelDir, opts...)
 	if err != nil {
 		return err
 	}

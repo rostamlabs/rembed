@@ -20,8 +20,10 @@ throughput (bit-identical to one-at-a-time results).
 `Load` accepts a Hub model id (downloaded into `$REMBED_CACHE`, default
 the user cache dir; `HF_TOKEN` honored), a git-cloned HF repo directory,
 or a converted model dir. Options: `rembed.WithInt8()` (weight-only
-quantization, ~4× less weight traffic, cosine ≥ 0.999 vs fp32) and
-`rembed.WithWorkers(n)` (CPU cap for servers).
+quantization, ~4× less weight traffic, cosine ≥ 0.999 vs fp32),
+`rembed.WithWorkers(n)` (CPU cap for servers), and `rembed.WithDim(d)`
+(Matryoshka: truncate to d dims and re-normalize — EmbeddingGemma
+768→512/256/128 — for cheaper storage and search; CLI `-dim`).
 
 Status: the optimization ladder is complete — naive baseline to
 **statistical parity with (and, with int8, consistently ahead of) ONNX
