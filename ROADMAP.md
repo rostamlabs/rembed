@@ -124,6 +124,80 @@ Remaining headroom: a zmm-wide kernel for 512-bit-native parts; a
 dedicated bare-metal box would still tighten the noise bands. GPU
 remains out of scope.
 
+## R9 — ModernBERT (RoPE encoder)
+Not started. The natural next architecture and a deliberate stepping
+stone: it introduces rotary positions and bias-free norms while staying
+inside rembed's encoder / mean-pool lane, so the golden harness,
+convert.py, DeriveConfig, and the R5 byte-level BPE tokenizer all carry
+over almost untouched. What is genuinely new:
+- **RoPE** (`internal/model/rope.go`) — rotary applied to Q and K per
+  head before the attention score, with DUAL theta selected by layer:
+  θ=160000 on global layers (every 3rd — 0,3,6,…), θ=10000 on the local
+  ones. This is the reusable asset R10 also needs.
+- **Sliding-window attention** — the 2/3 non-global layers attend only
+  ±64 tokens (local_attention=128 is the TOTAL window; HF splits it 64
+  each side). Still bidirectional within the window.
+- **GeGLU MLP** — two matrices, not three: Wi=Linear(H, 2·I) chunked into
+  (value, gate), output Wo(gelu(value)·gate). Existing kernels do the
+  matmuls; only the chunk/epilogue is new.
+- **Bias-free LayerNorm + structural norms** — a no-bias LayerNorm
+  variant (eps 1e-5); a LayerNorm right after the embeddings; layer 0's
+  attn-norm is Identity (HF removes it to avoid double-norming); a
+  final-norm after the stack. The ONLY bias in the model is the MLM
+  decoder, which embeddings never touch.
+Refuse-what-we-cannot-compute: the config's leftover
+`position_embedding_type:"absolute"` is a documented HF vestige and must
+be IGNORED (modernbert applies rotary regardless), not honored.
+Tokenizer is byte-level BPE (OLMo-derived, vocab 50368, [CLS]=50281 /
+[SEP]=50282 remapped onto the BPE vocab) — the R5 scanner should load it
+once merges/vocab and the remapped specials are wired. Golden target:
+nomic-ai/modernbert-embed-base (the de-facto ST embedding variant, mean
+pooling; note its search_query:/search_document: prefixes). Sizes: base
+22L/768/12h/1152, large 28L/1024/16h/2624, ctx 8192. Risk: low — the
+only new math is RoPE and the window mask. Roughly one R3-sized rung.
+
+## R10 — Qwen3-Embedding (decoder embedder)
+Not started, and the largest rung on the board — the first DECODER-based
+embedder, comparable in effort to R1–R8 combined, so realistically 3–4
+reviewed sub-branches. It reuses the golden harness, the byte-BPE
+tokenizer (Qwen2, GPT-2-style), L2 normalization, and the RoPE built in
+R9; everything else is new attention math:
+- **RMSNorm** (`internal/model/rmsnorm.go`) — replaces LayerNorm
+  throughout, eps 1e-6, no mean-subtraction, no bias.
+- **QK-norm** — Qwen3's signature addition: a per-head RMSNorm (length =
+  head_dim = 128) applied to Q and to K BEFORE RoPE. Two extra norm
+  weight vectors per layer.
+- **GQA** — 16 query heads share 8 KV heads (group size 2), and
+  head_dim=128 is INDEPENDENT of hidden/heads (16×128=2048 ≠ hidden
+  1024). q_proj 1024→2048, k/v_proj 1024→1024, o_proj 2048→1024 — the
+  config must carry head_dim explicitly, never infer it. KV heads
+  broadcast across their group.
+- **Causal mask** — rembed's first left-to-right masking; each query
+  attends only to positions ≤ itself.
+- **SwiGLU MLP** — three matrices (gate/up/down), down(silu(gate(x))·up(x)).
+- **Last-token pooling** — a new pooling mode reading the final hidden
+  state of the APPENDED `<|endoftext|>` token (id 151643, from
+  config.json — NOT `<|im_end|>` 151645 from tokenizer_config, the trap).
+  The tokenizer must auto-append 151643 and pooling reads that position.
+- **Instruction layer** — asymmetric prompting: queries get
+  `Instruct: {task}\nQuery:{text}` (no space after `Query:`), documents
+  get NO prefix. Usage-layer, not model math, but load-bearing for
+  correct retrieval — needs a clean API surface.
+Config/derive: model_type=qwen3 / architectures=[Qwen3ForCausalLM];
+carry head_dim, kv-heads, rope_theta (1e6), rms_eps; refuse a non-null
+`rope_scaling` (YaRN is off in the shipped config — refuse rather than
+silently ignore). Matryoshka (optional): truncate to the first N dims
+then re-L2-normalize (0.6B native 1024, range 32–1024). The 0.6B is
+~600M params (~1.2 GB fp32 / ~600 MB int8) — a different performance
+regime where the int8/VNNI kernels stop being a nicety and become the
+point, with a per-token-latency / batch-throughput benchmark story rather
+than R8's. Golden target: Qwen/Qwen3-Embedding-0.6B (28L/1024 hidden/16 q
+heads/8 kv/head_dim 128/3072 intermediate/vocab 151669, ctx 32768).
+Risk: high — causal, GQA, and QK-norm each have their own
+golden-attribution failure modes (a mis-broadcast KV head or wrong
+QK-norm yields plausible-but-wrong cosines the golden matrix is built to
+catch).
+
 ## Standing rules
 Every rung: golden validation against an independent reference, its own
 benchmark delta where perf-relevant, an adversarial review pass before
