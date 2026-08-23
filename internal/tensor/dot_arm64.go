@@ -10,7 +10,8 @@ package tensor
 // under qemu and CI like everything else.
 const (
 	hasVNNI    = false
-	hasVNNI512 = false // x86-only; NEON int8 uses the widening pipeline
+	hasVNNI512 = false
+	hasAVX512  = false // x86-only; NEON int8 uses the widening pipeline
 	hasSIMD    = true
 	hasSIMD8   = true
 )
@@ -41,4 +42,8 @@ func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int) {
 
 func gemm4x16vnni512(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int) {
 	panic("tensor: gemm4x16vnni512 is amd64-only")
+}
+
+func gemm4x32(dst *float32, n int, pa, pb *float32, k int) {
+	panic("tensor: gemm4x32 is amd64-only")
 }

@@ -27,6 +27,10 @@ var (
 	// weight-only int8 — correct, just not "every"), each with the one
 	// encoding its hardware accepts.
 	hasVNNI512 = hasSIMD && cpu.X86.HasAVX512VNNI && cpu.X86.HasAVX512VL
+	// hasAVX512 gates the zmm fp32 gemm (AVX512F covers 512-bit fp32
+	// FMA; x/sys folds OS state support into the flag). Server parts and
+	// Zen 4+ have it; consumer Alder/Raptor Lake do not.
+	hasAVX512 = hasSIMD && cpu.X86.HasAVX512F
 )
 
 // dot4 computes dst[0..3] = dot(a, b0..b3) over k floats with 8-lane FMA
@@ -60,3 +64,9 @@ func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int)
 //
 //go:noescape
 func gemm4x16vnni512(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int)
+
+// gemm4x32 is gemm4x16 doubled to zmm width over a 32-column B panel
+// (implemented in gemm512_amd64.s; requires AVX-512F).
+//
+//go:noescape
+func gemm4x32(dst *float32, n int, pa, pb *float32, k int)

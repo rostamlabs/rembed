@@ -129,3 +129,50 @@ func BenchmarkMatMulPacked(b *testing.B) {
 		})
 	}
 }
+
+// TestPackedPanelWidthsAgree: on AVX-512 hardware PackB builds 32-column
+// panels for n%32==0 — this test forces BOTH widths on the same data and
+// requires bit-identical output (per-element accumulation order is the
+// same sequential FMA chain in gemm4x16 and gemm4x32). Skips where only
+// the 16-wide kernel exists.
+func TestPackedPanelWidthsAgree(t *testing.T) {
+	if !hasAVX512 {
+		t.Skip("no AVX-512F on this CPU")
+	}
+	rng := rand.New(rand.NewSource(21))
+	pool := NewPool(0)
+	defer pool.Stop()
+	for _, sh := range [][3]int{{1, 3, 32}, {4, 8, 32}, {5, 129, 64}, {12, 384, 384}, {13, 384, 1536}, {64, 100, 128}} {
+		m, k, n := sh[0], sh[1], sh[2]
+		a := make([]float32, m*k)
+		bT := make([]float32, n*k)
+		for i := range a {
+			a[i] = rng.Float32()*2 - 1
+		}
+		for i := range bT {
+			bT[i] = rng.Float32()*2 - 1
+		}
+		wide, err := PackB(bT, k, n) // panelW=32 on this hardware
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wide.panelW != 32 {
+			t.Fatalf("expected 32-wide panels on AVX-512 hardware, got %d", wide.panelW)
+		}
+		// 16-wide pack via the REAL packer (shared helper), so this test
+		// cannot drift from PackB's layout.
+		narrow := &PackedB{K: k, N: n, panelW: 16, data: make([]float32, k*n)}
+		packBInto(narrow.data, bT, k, n, 16)
+		mPad := PackAPad(m)
+		aPack := make([]float32, mPad*k)
+		got := make([]float32, mPad*n)
+		want := make([]float32, mPad*n)
+		MatMulPacked(got, a, wide, m, aPack, pool)
+		MatMulPacked(want, a, narrow, m, aPack, pool)
+		for i := 0; i < m*n; i++ {
+			if got[i] != want[i] {
+				t.Fatalf("%dx%dx%d: [%d] 32-wide %v != 16-wide %v (must be bit-identical)", m, k, n, i, got[i], want[i])
+			}
+		}
+	}
+}

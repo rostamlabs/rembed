@@ -5,14 +5,17 @@ package tensor
 import "fmt"
 
 // PackedB is a weight matrix pre-packed ONCE (at model load) into the
-// panel layout the gemm4x16 micro-kernel streams: 16-column panels, k-major
-// within each panel (data[jp*K*16 + p*16 + c] = bT[(jp*16+c)*K + p]).
-// Weights are static for the life of a model, so rembed pays the packing
-// cost once where a runtime pays it per session or per call — this is the
+// panel layout a gemm micro-kernel streams: panelW-column panels, k-major
+// within each panel (data[jp*K*pw + p*pw + c] = bT[(jp*pw+c)*K + p]).
+// panelW is 16 (AVX2 gemm4x16) or 32 (AVX-512 gemm4x32) — decided at
+// pack time by what the CPU has and what n divides by. Weights are
+// static for the life of a model, so rembed pays the packing cost once
+// where a runtime pays it per session or per call — this is the
 // structural advantage the packed path exists to exploit.
 type PackedB struct {
-	K, N int
-	data []float32
+	K, N   int
+	panelW int
+	data   []float32
 }
 
 // PackB packs a bT ([n×k] row-major) weight matrix. It requires the SIMD
@@ -32,17 +35,33 @@ func PackB(bT []float32, k, n int) (*PackedB, error) {
 	if len(bT) != k*n {
 		return nil, fmt.Errorf("tensor: PackB bT has %d floats, want %d", len(bT), k*n)
 	}
-	p := &PackedB{K: k, N: n, data: make([]float32, k*n)}
-	for jp := range n / 16 {
-		panel := p.data[jp*k*16:]
-		for c := range 16 {
-			col := bT[(jp*16+c)*k:]
+	// The zmm kernel wants 32-wide panels; every BERT-family dim (384,
+	// 768, 1152, 1536, 2304, 3072) divides by 32, so on AVX-512 hardware
+	// this is the layout that gets built. Per-element accumulation order
+	// is identical either way, so results are bit-identical across panel
+	// widths (test-pinned on AVX-512 hardware).
+	pw := 16
+	if hasAVX512 && n%32 == 0 {
+		pw = 32
+	}
+	p := &PackedB{K: k, N: n, panelW: pw, data: make([]float32, k*n)}
+	packBInto(p.data, bT, k, n, pw)
+	return p, nil
+}
+
+// packBInto fills dst with the panel layout for width pw — shared by
+// PackB and the panel-width agreement test, so the test compares against
+// the real packer rather than a drift-prone duplicate.
+func packBInto(dst, bT []float32, k, n, pw int) {
+	for jp := range n / pw {
+		panel := dst[jp*k*pw:]
+		for c := range pw {
+			col := bT[(jp*pw+c)*k:]
 			for pp := range k {
-				panel[pp*16+c] = col[pp]
+				panel[pp*pw+c] = col[pp]
 			}
 		}
 	}
-	return p, nil
 }
 
 // PackAPad returns the padded row count MatMulPacked uses for m rows.
@@ -101,21 +120,29 @@ func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *P
 	_ = aPack[mPad*k-1]
 	packA4(aPack, a, m, k, pool)
 
+	// A zero-value PackedB (hand-built, panelW unset) reads as 16-wide
+	// instead of trapping on divide-by-zero.
+	pw := pb.panelW
+	if pw == 0 {
+		pw = 16
+	}
 	rowPanels := mPad / 4
-	colPanels := n / 16
-	// A parallel unit is a CHUNK of micro-tiles, not one 4×16 tile: one
-	// tile is ~2-5 µs of SIMD work, and a first cut that fanned out single
-	// tiles ran SLOWER than serial — 200+ units thrashed the atomic
+	colPanels := n / pw
+	// A parallel unit is a CHUNK of micro-tiles, not one 4×panelW tile:
+	// one tile is ~2-5 µs of SIMD work, and a first cut that fanned out
+	// single tiles ran SLOWER than serial — 200+ units thrashed the atomic
 	// counter, and the counter's interleaving handed adjacent 64-byte
-	// output strips to different workers, maximizing false sharing. Chunks
-	// of 8×4 panels (32 rows × 64 cols) restore ~the granularity the
-	// unpacked path uses, and the B chunk is reused across the chunk's row
-	// panels while cache-hot.
-	const rowChunk, colChunk = 32, 4
+	// output strips to different workers, maximizing false sharing.
+	// The column chunk is fixed in COLUMNS (64), not panels: the review
+	// measured that keeping "4 panels" at 32-wide panels silently halves
+	// the unit count and cost 18-26% on the n=768 shapes of a many-core
+	// box — the tuned decomposition must not change with kernel width.
+	const rowChunk = 32
+	colChunk := 64 / pw
 	rowUnits := (rowPanels + rowChunk - 1) / rowChunk
 	colUnits := (colPanels + colChunk - 1) / colChunk
 	units := rowUnits * colUnits
-	unitMACs := min(rowPanels, rowChunk) * 4 * k * min(colPanels, colChunk) * 16
+	unitMACs := min(rowPanels, rowChunk) * 4 * k * min(colPanels, colChunk) * pw
 	if units < 2 || unitMACs < minUnitWork {
 		gemmChunk(dst, aPack, pb, 0, rowPanels, 0, colPanels, k, n)
 		return
@@ -137,20 +164,28 @@ func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *P
 // bound by streaming the weights from DRAM, and a row-outer order
 // re-streams every B panel once per row panel (measured: 3× the weight
 // traffic at seq=12, 41 cycles per k-step against ~4 of compute). With jp
-// outer, each B panel (k×16 floats, L1/L2-resident) is loaded from memory
-// once and reused across every row panel of the chunk.
+// outer, each B panel (k×panelW floats, L1/L2-resident) is loaded from
+// memory once and reused across every row panel of the chunk.
 func gemmChunk(dst, aPack []float32, pb *PackedB, ip0, ip1, jp0, jp1, k, n int) {
+	pw := pb.panelW
+	if pw == 0 {
+		pw = 16
+	}
 	for jp := jp0; jp < jp1; jp++ {
 		// Reslice every operand to exactly what the asm touches, matching
 		// the dst discipline — a raw &s[i] checks only the first element.
-		bp := pb.data[jp*k*16 : (jp+1)*k*16]
+		bp := pb.data[jp*k*pw : (jp+1)*k*pw]
 		for ip := ip0; ip < ip1; ip++ {
 			ap := aPack[ip*k*4 : (ip+1)*k*4]
-			off := ip*4*n + jp*16
+			off := ip*4*n + jp*pw
 			// Reslice so every float the asm writes (3 full rows of stride
-			// n plus the final 16-wide row) is bounds-checked up front.
-			d := dst[off : off+3*n+16]
-			gemm4x16(&d[0], n, &ap[0], &bp[0], k)
+			// n plus the final panel-wide row) is bounds-checked up front.
+			d := dst[off : off+3*n+pw]
+			if pw == 32 {
+				gemm4x32(&d[0], n, &ap[0], &bp[0], k)
+			} else {
+				gemm4x16(&d[0], n, &ap[0], &bp[0], k)
+			}
 		}
 	}
 }
