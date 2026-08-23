@@ -163,6 +163,10 @@ def main() -> None:
         shutil.copyfile(idxp, out / "model.safetensors.index.json")
         weight_map = json.loads(idxp.read_text())["weight_map"]
         for shard in sorted(set(weight_map.values())):
+            # The index is downloaded/untrusted: a shard name is joined into
+            # output paths, so reject anything that is not a plain filename.
+            if shard in ("", ".", "..") or "/" in shard or "\\" in shard:
+                raise SystemExit(f"unsafe shard name in index: {shard!r}")
             sp = fetch(shard)
             sanity_check_safetensors(sp)
             shutil.copyfile(sp, out / shard)

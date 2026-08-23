@@ -39,6 +39,18 @@ type headerEntry struct {
 	DataOffsets [2]uint64 `json:"data_offsets"`
 }
 
+// ValidShardName reports whether name is a plain filename safe to join into
+// a model directory. A model.safetensors.index.json is downloaded and thus
+// untrusted, so a weight_map value like "../../etc/passwd" must never reach
+// filepath.Join (which does not strip ".."). Shard files are always bare
+// names like "model-00001-of-00002.safetensors".
+func ValidShardName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsAny(name, `/\`)
+}
+
 // LoadAny loads weights from a single model.safetensors file, or — when
 // that file is absent but a model.safetensors.index.json sits beside it —
 // from the sharded set the index names. Large checkpoints ship 2+ shards
@@ -76,6 +88,9 @@ func loadSharded(indexPath string) (map[string]Tensor, error) {
 	}
 	shardSet := make(map[string]struct{})
 	for _, f := range idx.WeightMap {
+		if !ValidShardName(f) {
+			return nil, fmt.Errorf("safetensors %s: unsafe shard name %q in index", indexPath, f)
+		}
 		shardSet[f] = struct{}{}
 	}
 	shards := make([]string, 0, len(shardSet))

@@ -285,7 +285,11 @@ func (m *Model) applyDense(dst, x []float32, w *denseWeight, seq int, s *scratch
 // or without a leading "bert."/"mpnet." prefix. quantize selects the int8
 // mode (see newDense).
 func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Model, error) {
-	tensors, err := safetensors.Load(weightsPath)
+	// LoadAny (not Load) so a sharded checkpoint (index.json + shards, which
+	// Qwen3-4B/8B ship) loads into RAM through the same path as a single
+	// model.safetensors — the RAM path must not be broken for exactly the
+	// large models the hub now fetches sharded.
+	tensors, err := safetensors.LoadAny(weightsPath)
 	if err != nil {
 		return nil, err
 	}

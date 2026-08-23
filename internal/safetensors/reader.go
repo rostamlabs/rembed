@@ -50,6 +50,9 @@ func OpenReader(path string) (*Reader, error) {
 		}
 		set := make(map[string]struct{})
 		for _, f := range index.WeightMap {
+			if !ValidShardName(f) {
+				return nil, fmt.Errorf("safetensors %s: unsafe shard name %q in index", idx, f)
+			}
 			set[f] = struct{}{}
 		}
 		dir := filepath.Dir(idx)

@@ -3,11 +3,14 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 
 	"github.com/rostamlabs/rembed/internal/packfile"
 	"github.com/rostamlabs/rembed/internal/safetensors"
@@ -174,8 +177,9 @@ func loadQwen3FromSource(src qwSource, cfg Config, workers int) (*Model, error) 
 // PackQwen3ToDisk streams a Qwen3 checkpoint into a rembed pack file: each
 // tensor is read from the (possibly sharded) safetensors, widened to
 // float32, and appended — so peak memory is a single tensor, and an 8B model
-// packs on a small box. The result mmaps for inference (see loadQwen3Disk).
-func PackQwen3ToDisk(weightsPath, packPath string, cfg Config) error {
+// packs on a small box. source is a fingerprint of the input weights, stored
+// so a later load can detect a stale pack. The result mmaps for inference.
+func PackQwen3ToDisk(weightsPath, packPath, source string, cfg Config) error {
 	r, err := safetensors.OpenReader(weightsPath)
 	if err != nil {
 		return err
@@ -186,24 +190,86 @@ func PackQwen3ToDisk(weightsPath, packPath string, cfg Config) error {
 	for _, s := range specs {
 		shapeOf[s.Name] = s.Shape
 	}
-	return packfile.Write(packPath, specs, func(name string) ([]float32, error) {
+	return packfile.Write(packPath, source, specs, func(name string) ([]float32, error) {
 		return r.F32(name, shapeOf[name]...)
 	})
 }
 
+// sourceFingerprint identifies the model dir's weight files by name, size,
+// and mtime — enough to detect that the safetensors changed under a cached
+// pack file (a re-download or retrain with the same shapes, which the
+// per-tensor shape check alone would not catch).
+func sourceFingerprint(modelDir string) (string, error) {
+	var files []string
+	single := filepath.Join(modelDir, "model.safetensors")
+	if _, err := os.Stat(single); err == nil {
+		files = []string{single}
+	} else {
+		idxPath := filepath.Join(modelDir, "model.safetensors.index.json")
+		raw, err := os.ReadFile(idxPath)
+		if err != nil {
+			return "", err
+		}
+		var index struct {
+			WeightMap map[string]string `json:"weight_map"`
+		}
+		if err := json.Unmarshal(raw, &index); err != nil {
+			return "", err
+		}
+		files = append(files, idxPath)
+		seen := map[string]struct{}{}
+		for _, f := range index.WeightMap {
+			if !safetensors.ValidShardName(f) {
+				return "", fmt.Errorf("unsafe shard name %q in index", f)
+			}
+			if _, ok := seen[f]; ok {
+				continue
+			}
+			seen[f] = struct{}{}
+			files = append(files, filepath.Join(modelDir, f))
+		}
+	}
+	sort.Strings(files)
+	var b strings.Builder
+	for _, f := range files {
+		fi, err := os.Stat(f)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "%s:%d:%d\n", filepath.Base(f), fi.Size(), fi.ModTime().UnixNano())
+	}
+	return b.String(), nil
+}
+
 // LoadDisk builds a Model whose weights are memory-mapped from a rembed pack
-// file in modelDir, packing the safetensors to disk on first use. Only qwen3
-// is supported today — the architecture whose size (4B/8B) motivates running
-// larger than RAM. The caller MUST Close the returned Model to unmap.
+// file in modelDir, packing the safetensors to disk on first use (and
+// rebuilding a stale pack whose source fingerprint no longer matches). Only
+// qwen3 is supported today — the architecture whose size (4B/8B) motivates
+// running larger than RAM. The caller MUST Close the returned Model to unmap.
 func LoadDisk(modelDir string, cfg Config, workers int) (*Model, error) {
 	if cfg.ModelType != "qwen3" {
 		return nil, fmt.Errorf("disk-backed weights are only supported for qwen3 models (got %q)", cfg.ModelType)
 	}
 	packPath := filepath.Join(modelDir, "weights.rembedpack")
-	if _, err := os.Stat(packPath); err != nil {
-		if err := PackQwen3ToDisk(filepath.Join(modelDir, "model.safetensors"), packPath, cfg); err != nil {
-			return nil, fmt.Errorf("packing weights to %s: %w", packPath, err)
+	fp, err := sourceFingerprint(modelDir)
+	if err != nil {
+		return nil, fmt.Errorf("fingerprinting weights: %w", err)
+	}
+	// Reuse an existing pack only if its recorded source matches; otherwise
+	// (missing or stale) rebuild it.
+	if pk, err := packfile.Open(packPath); err == nil {
+		if pk.Source() == fp {
+			m, err := loadQwen3Disk(pk, cfg, workers)
+			if err != nil {
+				_ = pk.Close()
+				return nil, err
+			}
+			return m, nil
 		}
+		_ = pk.Close()
+	}
+	if err := PackQwen3ToDisk(filepath.Join(modelDir, "model.safetensors"), packPath, fp, cfg); err != nil {
+		return nil, fmt.Errorf("packing weights to %s: %w", packPath, err)
 	}
 	pk, err := packfile.Open(packPath)
 	if err != nil {

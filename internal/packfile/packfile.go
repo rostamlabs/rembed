@@ -19,12 +19,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"unsafe"
 
 	"github.com/rostamlabs/rembed/internal/mmapfile"
 )
 
 const magic = 1 // header "rembedpack" version
+
+// maxInt is the largest value the platform int holds — a >2GB tensor's
+// element count overflows int on 32-bit (linux/386), so guard before the
+// int64→int narrowing rather than wrap silently.
+const maxInt = int64(^uint(0) >> 1)
 
 // Spec names a tensor to write and its shape (row-major).
 type Spec struct {
@@ -41,6 +47,7 @@ type entry struct {
 
 type header struct {
 	RembedPack int     `json:"rembedpack"`
+	Source     string  `json:"source,omitempty"` // fingerprint of the source weights (for staleness)
 	Tensors    []entry `json:"tensors"`
 }
 
@@ -63,9 +70,10 @@ func numElem(shape []int) int64 {
 // Write creates a pack file at path for the given specs. provide(name)
 // returns that tensor's float32 data (exactly prod(shape) elements); it is
 // called once per spec in order, so the caller can convert lazily and keep
-// only one tensor resident at a time.
-func Write(path string, specs []Spec, provide func(name string) ([]float32, error)) (err error) {
-	h := header{RembedPack: magic}
+// only one tensor resident at a time. source is an opaque fingerprint of the
+// input weights, stored in the header so a stale pack can be detected.
+func Write(path, source string, specs []Spec, provide func(name string) ([]float32, error)) (err error) {
+	h := header{RembedPack: magic, Source: source}
 	var off int64
 	for _, s := range specs {
 		nb := numElem(s.Shape) * 4
@@ -77,11 +85,14 @@ func Write(path string, specs []Spec, provide func(name string) ([]float32, erro
 		return err
 	}
 
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	// A unique temp (not a fixed path+".tmp") so two concurrent packs of the
+	// same model dir cannot interleave writes into one file; the rename at the
+	// end is atomic.
+	f, err := os.CreateTemp(filepath.Dir(path), ".rembedpack-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	defer func() {
 		if err != nil {
 			_ = f.Close()
@@ -132,6 +143,7 @@ func Write(path string, specs []Spec, provide func(name string) ([]float32, erro
 // Pack is an mmapped pack file. F32 slices are valid until Close.
 type Pack struct {
 	mf      *mmapfile.File
+	source  string
 	dataOff int64
 	entries map[string]entry
 }
@@ -161,12 +173,37 @@ func Open(path string) (*Pack, error) {
 		_ = mf.Close()
 		return nil, fmt.Errorf("packfile %s: version %d, want %d", path, h.RembedPack, magic)
 	}
-	p := &Pack{mf: mf, dataOff: dataStart(int64(hlen)), entries: make(map[string]entry, len(h.Tensors))}
+	p := &Pack{mf: mf, source: h.Source, dataOff: dataStart(int64(hlen)), entries: make(map[string]entry, len(h.Tensors))}
+	dataLen := int64(len(raw)) - p.dataOff
 	for _, e := range h.Tensors {
+		// Validate every entry up front so F32's unsafe reinterpret is always
+		// on a well-formed, in-bounds, 4-byte-aligned range even if the pack
+		// is truncated or corrupt (Write guarantees these; Open must not trust
+		// them blindly).
+		if e.Off%4 != 0 || e.NByte%4 != 0 {
+			_ = mf.Close()
+			return nil, fmt.Errorf("packfile %s: tensor %q offset/length not 4-byte aligned", path, e.Name)
+		}
+		if e.NByte != numElem(e.Shape)*4 {
+			_ = mf.Close()
+			return nil, fmt.Errorf("packfile %s: tensor %q length %d != shape %v", path, e.Name, e.NByte, e.Shape)
+		}
+		if e.NByte/4 > maxInt {
+			_ = mf.Close()
+			return nil, fmt.Errorf("packfile %s: tensor %q too large for this platform's int", path, e.Name)
+		}
+		if e.Off < 0 || e.NByte < 0 || e.Off+e.NByte > dataLen {
+			_ = mf.Close()
+			return nil, fmt.Errorf("packfile %s: tensor %q range [%d,%d) out of data section %d", path, e.Name, e.Off, e.Off+e.NByte, dataLen)
+		}
 		p.entries[e.Name] = e
 	}
 	return p, nil
 }
+
+// Source returns the fingerprint of the weights this pack was built from
+// (empty if none was recorded), for staleness checks.
+func (p *Pack) Source() string { return p.source }
 
 // Shape returns a tensor's dimensions and whether it exists.
 func (p *Pack) Shape(name string) ([]int, bool) {

@@ -22,6 +22,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/rostamlabs/rembed/internal/safetensors"
 )
 
 // required are the files every sentence-transformers-format repo must
@@ -219,6 +221,12 @@ func fetchWeights(modelID, dir string) ([]string, error) {
 	seen := make(map[string]struct{})
 	shards := make([]string, 0, len(idx.WeightMap))
 	for _, f := range idx.WeightMap {
+		// The index is downloaded and untrusted: a shard name is joined into
+		// a filesystem path (and a resolve URL), so reject anything that is
+		// not a plain filename before it can escape the cache dir.
+		if !safetensors.ValidShardName(f) {
+			return got, fmt.Errorf("hub: %s: unsafe shard name %q in index", modelID, f)
+		}
 		if _, ok := seen[f]; ok {
 			continue
 		}

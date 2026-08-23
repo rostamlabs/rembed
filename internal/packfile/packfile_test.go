@@ -3,6 +3,7 @@
 package packfile
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -28,7 +29,7 @@ func TestRoundTrip(t *testing.T) {
 		{Name: "big", Shape: []int{10, 100}},
 		{Name: "empty", Shape: []int{0}},
 	}
-	if err := Write(path, specs, func(name string) ([]float32, error) {
+	if err := Write(path, "src-fingerprint-v1", specs, func(name string) ([]float32, error) {
 		return src[name], nil
 	}); err != nil {
 		t.Fatal(err)
@@ -55,10 +56,35 @@ func TestRoundTrip(t *testing.T) {
 			}
 		}
 	}
+	if p.Source() != "src-fingerprint-v1" {
+		t.Errorf("Source() = %q, want the stored fingerprint", p.Source())
+	}
 	if _, err := p.F32("missing", 1); err == nil {
 		t.Fatal("expected error for missing tensor")
 	}
 	if _, err := p.F32("a", 3, 2); err == nil {
 		t.Fatal("expected shape-mismatch error")
+	}
+}
+
+// TestOpenRejectsCorruptHeader: Open must validate offsets/lengths rather
+// than trust a (possibly truncated) header, so F32's unsafe reinterpret is
+// always on a well-formed range.
+func TestOpenRejectsCorruptHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "w.rembedpack")
+	if err := Write(path, "fp", []Spec{{Name: "a", Shape: []int{4}}}, func(string) ([]float32, error) {
+		return []float32{1, 2, 3, 4}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Truncate the file so tensor "a"'s recorded range runs past EOF.
+	fi, _ := os.Stat(path)
+	if err := os.Truncate(path, fi.Size()-8); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := Open(path); err == nil {
+		_ = p.Close()
+		t.Fatal("expected Open to reject a truncated pack")
 	}
 }
