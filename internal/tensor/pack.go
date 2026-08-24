@@ -64,32 +64,37 @@ func packBInto(dst, bT []float32, k, n, pw int) {
 	}
 }
 
-// PackAPad returns the padded row count MatMulPacked uses for m rows.
-func PackAPad(m int) int { return (m + 3) &^ 3 }
+// PackAPad returns the padded row count the packed matmul uses for m rows.
+// It is a multiple of 12 so that BOTH tile heights the fp32 path can pick —
+// the 4-row kernels (int8/VNNI/AVX-512) and the 6-row AVX2 gemm6x16 — divide
+// it evenly; the extra pad rows are zero-filled and never read (pooling reads
+// only the m real rows).
+func PackAPad(m int) int { return ((m + 11) / 12) * 12 }
 
-// packA4 packs a ([m×k] row-major) into 4-row k-major panels
-// (dst[ip*k*4 + p*4 + r]), zero-filling pad rows so the kernel's extra
-// output rows are deterministic zeros.
-func packA4(dst, a []float32, m, k int, pool *Pool) {
+// packA packs a ([m×k] row-major) into rows-row k-major panels
+// (dst[ip*k*rows + p*rows + r]), zero-filling pad rows so the kernel's extra
+// output rows are deterministic zeros. rows is the kernel's tile height (4 or
+// 6); PackAPad(m) is a multiple of both.
+func packA(dst, a []float32, m, k, rows int, pool *Pool) {
 	mPad := PackAPad(m)
-	rowPanels := mPad / 4
-	// The pack is a cache-hostile stride-4 scatter and, run serially before
+	rowPanels := mPad / rows
+	// The pack is a cache-hostile stride scatter and, run serially before
 	// the fan-out, it measured 21% of the whole ffn2 matmul at seq=512 — a
 	// hard Amdahl ceiling. Row panels are independent, so fan them out too
-	// (tiny inputs stay inline; the pack for 3 panels is a few µs).
+	// (tiny inputs stay inline; the pack for a few panels is a few µs).
 	packOne := func(ip int) {
-		panel := dst[ip*k*4 : ip*k*4+k*4]
-		for r := range 4 {
-			i := ip*4 + r
+		panel := dst[ip*k*rows : ip*k*rows+k*rows]
+		for r := range rows {
+			i := ip*rows + r
 			if i >= m {
 				for p := range k {
-					panel[p*4+r] = 0
+					panel[p*rows+r] = 0
 				}
 				continue
 			}
 			row := a[i*k : i*k+k]
 			for p, v := range row {
-				panel[p*4+r] = v
+				panel[p*rows+r] = v
 			}
 		}
 	}
@@ -102,9 +107,14 @@ func packA4(dst, a []float32, m, k int, pool *Pool) {
 	pool.Run(rowPanels, packOne)
 }
 
+// packA4 packs A into 4-row panels — the tile height the int8 and VNNI
+// kernels use.
+func packA4(dst, a []float32, m, k int, pool *Pool) { packA(dst, a, m, k, 4, pool) }
+
 // MatMulPacked computes dst[m×N] = a[m×K] · Bᵀ from a pre-packed weight
-// matrix. dst must have PackAPad(m)·N floats (the kernel writes whole 4-row
-// tiles; pad rows receive zeros and must simply be writable — model scratch
+// matrix. dst must have PackAPad(m)·N floats (the kernel writes whole
+// tiles — 6 rows on the AVX2 16-wide path, 4 elsewhere; pad rows receive
+// zeros and must simply be writable — model scratch
 // is sized for this) and aPack PackAPad(m)·K floats of caller scratch.
 // A non-nil pool runs the fan-out on its spinning workers (the latency
 // path); nil falls back to ParallelFor.
@@ -118,7 +128,6 @@ func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *P
 	k, n := pb.K, pb.N
 	_ = dst[mPad*n-1] // fail fast before the asm writes anything
 	_ = aPack[mPad*k-1]
-	packA4(aPack, a, m, k, pool)
 
 	// A zero-value PackedB (hand-built, panelW unset) reads as 16-wide
 	// instead of trapping on divide-by-zero.
@@ -126,7 +135,14 @@ func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *P
 	if pw == 0 {
 		pw = 16
 	}
-	rowPanels := mPad / 4
+	// The 16-wide AVX2 path uses the taller 6-row micro-kernel; the 32-wide
+	// AVX-512 path keeps 4 rows (16 zmm accumulators already at capacity).
+	rows := 4
+	if pw == 16 && has6x16 {
+		rows = 6
+	}
+	packA(aPack, a, m, k, rows, pool)
+	rowPanels := mPad / rows
 	colPanels := n / pw
 	// A parallel unit is a CHUNK of micro-tiles, not one 4×panelW tile:
 	// one tile is ~2-5 µs of SIMD work, and a first cut that fanned out
@@ -142,15 +158,15 @@ func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *P
 	rowUnits := (rowPanels + rowChunk - 1) / rowChunk
 	colUnits := (colPanels + colChunk - 1) / colChunk
 	units := rowUnits * colUnits
-	unitMACs := min(rowPanels, rowChunk) * 4 * k * min(colPanels, colChunk) * pw
+	unitMACs := min(rowPanels, rowChunk) * rows * k * min(colPanels, colChunk) * pw
 	if units < 2 || unitMACs < minUnitWork {
-		gemmChunk(dst, aPack, pb, 0, rowPanels, 0, colPanels, k, n)
+		gemmChunk(dst, aPack, pb, 0, rowPanels, 0, colPanels, k, n, rows)
 		return
 	}
 	body := func(u int) {
 		ip0 := (u / colUnits) * rowChunk
 		jp0 := (u % colUnits) * colChunk
-		gemmChunk(dst, aPack, pb, ip0, min(ip0+rowChunk, rowPanels), jp0, min(jp0+colChunk, colPanels), k, n)
+		gemmChunk(dst, aPack, pb, ip0, min(ip0+rowChunk, rowPanels), jp0, min(jp0+colChunk, colPanels), k, n, rows)
 	}
 	if pool != nil {
 		pool.Run(units, body)
@@ -166,7 +182,7 @@ func MatMulPacked(dst, a []float32, pb *PackedB, m int, aPack []float32, pool *P
 // traffic at seq=12, 41 cycles per k-step against ~4 of compute). With jp
 // outer, each B panel (k×panelW floats, L1/L2-resident) is loaded from
 // memory once and reused across every row panel of the chunk.
-func gemmChunk(dst, aPack []float32, pb *PackedB, ip0, ip1, jp0, jp1, k, n int) {
+func gemmChunk(dst, aPack []float32, pb *PackedB, ip0, ip1, jp0, jp1, k, n, rows int) {
 	pw := pb.panelW
 	if pw == 0 {
 		pw = 16
@@ -176,14 +192,17 @@ func gemmChunk(dst, aPack []float32, pb *PackedB, ip0, ip1, jp0, jp1, k, n int) 
 		// the dst discipline — a raw &s[i] checks only the first element.
 		bp := pb.data[jp*k*pw : (jp+1)*k*pw]
 		for ip := ip0; ip < ip1; ip++ {
-			ap := aPack[ip*k*4 : (ip+1)*k*4]
-			off := ip*4*n + jp*pw
-			// Reslice so every float the asm writes (3 full rows of stride
-			// n plus the final panel-wide row) is bounds-checked up front.
-			d := dst[off : off+3*n+pw]
-			if pw == 32 {
+			ap := aPack[ip*k*rows : (ip+1)*k*rows]
+			off := ip*rows*n + jp*pw
+			// Reslice so every float the asm writes (rows-1 full rows of
+			// stride n plus the final panel-wide row) is bounds-checked up front.
+			d := dst[off : off+(rows-1)*n+pw]
+			switch {
+			case rows == 6:
+				gemm6x16(&d[0], n, &ap[0], &bp[0], k)
+			case pw == 32:
 				gemm4x32(&d[0], n, &ap[0], &bp[0], k)
-			} else {
+			default:
 				gemm4x16(&d[0], n, &ap[0], &bp[0], k)
 			}
 		}

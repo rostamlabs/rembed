@@ -70,7 +70,7 @@ func TestMatMulPackedAgainstFloat64Reference(t *testing.T) {
 				}
 			}
 		}
-		// Pad rows must be exact zeros (packA4 zero-fills), and the guard
+		// Pad rows must be exact zeros (packA zero-fills), and the guard
 		// region untouched.
 		for i := m; i < mPad; i++ {
 			for j := range n {
@@ -172,6 +172,53 @@ func TestPackedPanelWidthsAgree(t *testing.T) {
 		for i := 0; i < m*n; i++ {
 			if got[i] != want[i] {
 				t.Fatalf("%dx%dx%d: [%d] 32-wide %v != 16-wide %v (must be bit-identical)", m, k, n, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestGemm6x16BitIdenticalTo4x16 pins the load-bearing invariant of the wider
+// AVX2 kernel directly: gemm6x16 sums over k in the SAME order as gemm4x16
+// (one VFMADD231PS per k step, ascending p), so on identical inputs the two
+// kernels must produce bit-identical output — only the tile height differs.
+// Run 12 rows through both (three 4-row tiles vs two 6-row tiles) over one
+// 16-column B panel and require exact equality. Guards the bit-identity the
+// golden suite proves transitively against a future edit to either kernel.
+func TestGemm6x16BitIdenticalTo4x16(t *testing.T) {
+	if !has6x16 {
+		t.Skip("no AVX2 6x16 kernel on this CPU")
+	}
+	rng := rand.New(rand.NewSource(6116))
+	const rows, n = 12, 16
+	for _, k := range []int{1, 2, 3, 7, 16, 63, 64, 768} {
+		a := make([]float32, rows*k)
+		bT := make([]float32, n*k) // [n×k] row-major weight
+		for i := range a {
+			a[i] = rng.Float32()*2 - 1
+		}
+		for i := range bT {
+			bT[i] = rng.Float32()*2 - 1
+		}
+		pb := make([]float32, k*n)
+		packBInto(pb, bT, k, n, 16)
+
+		out4 := make([]float32, rows*n)
+		pa4 := make([]float32, rows*k)
+		packA(pa4, a, rows, k, 4, nil)
+		for ip := 0; ip < rows/4; ip++ {
+			gemm4x16(&out4[ip*4*n], n, &pa4[ip*k*4], &pb[0], k)
+		}
+
+		out6 := make([]float32, rows*n)
+		pa6 := make([]float32, rows*k)
+		packA(pa6, a, rows, k, 6, nil)
+		for ip := 0; ip < rows/6; ip++ {
+			gemm6x16(&out6[ip*6*n], n, &pa6[ip*k*6], &pb[0], k)
+		}
+
+		for i := range out4 {
+			if out4[i] != out6[i] {
+				t.Fatalf("k=%d idx=%d: gemm4x16=%v gemm6x16=%v — not bit-identical", k, i, out4[i], out6[i])
 			}
 		}
 	}

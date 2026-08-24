@@ -633,3 +633,36 @@ ORT outright when the int8 accuracy trade is acceptable. Decoders (qwen3,
 gemma) are not in this table — their ONNX exports are gated or not shipped,
 so a like-for-like cross-engine decoder number needs an export step this
 run did not take.
+
+### Closing the fp32 gap — gemm6x16 (SHIPPED, ~10% relative)
+
+The single-core fp32 profile above (nomic, Raptor Lake i9-13900H, no
+AVX-512) was **80% gemm4x16** — so the ~1.26–1.28× fp32 gap to ONNX
+Runtime is the GEMM micro-kernel, not blocking or non-GEMM overhead. The
+4×16 kernel used only 8 of the 16 ymm registers as accumulators; ORT's
+AVX2 kernel is the classic Goto-style **6×16** (12 accumulators).
+
+Adding a 6×16 micro-kernel (gemm_amd64.s `gemm6x16`) — 6 A-rows × 16 cols,
+2 B loads + 6 broadcasts feeding 12 FMAs, so each B-panel load and each
+loop-overhead uop covers 50% more useful FMAs — closed the gap, measured
+single-core (both-orders, median-of-40, flag-free):
+
+| model | fp32 vs ONNX before | after gemm6x16 |
+|-------|--------------------|-----------------|
+| all-MiniLM-L6-v2 | 1.26× | **1.16×** |
+| nomic-embed-text-v1.5 | 1.28× | **1.17×** |
+
+~40% of the excess gap gone, and it generalizes across a plain BERT and
+the RoPE+SwiGLU encoder (in-process serial forward: 196 → 183 ms/op, ~7%).
+Per-element accumulation is summed over k in the SAME order as 4×16, so
+every fp32 golden is bit-identical (the whole suite stayed green); only
+the tile shape changed. Only the 16-wide AVX2 path switches — AVX-512
+boxes keep the 32-wide gemm4x32 (16 zmm accumulators already at capacity),
+and int8/VNNI keep their 4-row A-pack. The A-packer took a rows parameter
+and PackAPad now rounds to 12 (a multiple of both 4 and 6) so the shared
+scratch fits either tile height.
+
+The residual ~1.16× is deeper MLAS tuning (instruction scheduling,
+kernel-specific prefetch) with diminishing returns; and rembed still
+reaches fp32 PARITY multi-core via parallelism, and passes ORT outright at
+int8. Wider still (an 8×16 or 6×32) needs AVX-512's 32 registers.

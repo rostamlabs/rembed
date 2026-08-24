@@ -14,6 +14,7 @@ const (
 	hasAVX512  = false // x86-only; NEON int8 uses the widening pipeline
 	hasSIMD    = true
 	hasSIMD8   = true
+	has6x16    = false // the wider fp32 micro-kernel is an amd64/AVX2 tuning
 )
 
 // dot4 computes dst[0..3] = dot(a, b0..b3) over k floats
@@ -35,6 +36,10 @@ func gemm4x16(dst *float32, n int, pa, pb *float32, k int)
 //
 //go:noescape
 func gemm4x16i8(dst *float32, n int, pa *float32, pb *int8, k int, scales *float32)
+
+func gemm6x16(dst *float32, n int, pa, pb *float32, k int) {
+	panic("tensor: gemm6x16 is an amd64-only tuning (has6x16 is false here)")
+}
 
 func gemm4x16vnni(dst *int32, n int, qa *uint8, aStride int, pb *int8, kg int) {
 	panic("tensor: gemm4x16vnni is amd64-only")
