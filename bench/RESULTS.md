@@ -666,3 +666,17 @@ The residual ~1.16× is deeper MLAS tuning (instruction scheduling,
 kernel-specific prefetch) with diminishing returns; and rembed still
 reaches fp32 PARITY multi-core via parallelism, and passes ORT outright at
 int8. Wider still (an 8×16 or 6×32) needs AVX-512's 32 registers.
+
+**k-unrolling gemm6x16 — REJECTED (measured wash).** The residual ~1.16×
+prompted testing whether the 6×16 k-loop's per-iteration overhead (pointer
+bumps + DEC/JNZ, ~4 uops per 12 FMAs) was stealing FMA cycles. Unrolling
+the k-loop 4× (48 FMAs per iteration + a k%4 tail, bit-identical, direct
+kernel test still green) measured no improvement: nomic 1.17× → 1.16× (a
+0.01 move inside the ~8% run spread), MiniLM's delta flagged as within
+noise, and the in-process serial forward ticked 183 → 196 ms/op if
+anything. So the non-unrolled 6×16 is already FMA-throughput-bound — the
+loop overhead does not steal FMA cycles because Raptor Lake's wide decode
+(6 uops/cycle) already hides it under the 6-cycle FMA window. Reverted
+rather than carry the larger kernel for no gain. The residual gap is
+genuinely MLAS's instruction scheduling / cache blocking / prefetch tuning,
+which unrolling alone does not buy — and a bigger tile would need AVX-512.
