@@ -587,3 +587,49 @@ tokens, `-cpuprofile`) on an AVX2+AVX-VNNI (no AVX-512) box, encoder
 
 Net: on AVX2, the matmul is at the compute roofline and attention is on
 the right kernel; GELU was the one remaining vectorization win.
+
+## Cross-engine refresh — nomic-embed + baseline (2026-08, contended 20-core box)
+
+Re-running the us-vs-ONNX protocol (bench/compare.py, both-orders,
+median-of-40, warm-up discard) after the new architectures landed,
+specifically on **nomic-embed-text-v1.5** — the first encoder combining
+RoPE + gated SwiGLU + bidirectional attention, a harder shape than the
+plain-BERT encoders R8 measured.
+
+**Environment caveat.** This box runs a clickhouse-server, so 20-thread
+runs are noise-dominated: rembed's spinning fork-join pool oversubscribes
+against the other load (fp32 nomic multi-thread measured 63% spread and a
+35% order-median drift — the harness FLAGGED it as unstable and refused to
+call it), while ONNX Runtime's pool parks and stayed at ~6% spread. That
+is a real, documented property — rembed's spin pool assumes a quiet/
+dedicated box (R8's Zen4 cloud numbers) — not a kernel result. So the
+numbers below are **single-core** (GOMAXPROCS=1 vs onnx-threads=1), which
+both removes the scheduler artifact and isolates raw kernel efficiency;
+all four runs were stable (spread <= 8%, no instability flags).
+
+| model | mode | rembed | ONNX (fp32) | ratio |
+|-------|------|--------|-------------|-------|
+| all-MiniLM-L6-v2 (seq 93) | fp32 | 49.7 ms | 39.5 ms | 1.26× (slower) |
+| nomic-embed-text-v1.5 (seq 93) | fp32 | 451 ms | 352 ms | 1.28× (slower) |
+| nomic-embed-text-v1.5 (seq 93) | **full int8 (VNNI)** | **243 ms** | 352 ms | **0.69× (1.45× faster)** |
+
+Reading it honestly:
+
+- **Single-core fp32: ONNX Runtime is ~1.26–1.28× ahead**, and it is
+  consistent across a plain BERT and the RoPE+SwiGLU encoder — so it is
+  ORT's per-core MLAS GEMM microkernels being better-tuned, not an
+  architecture-specific rembed weakness. This does NOT contradict R8's
+  encoder "parity": that was measured MULTI-core on a quiet box, where
+  rembed closes the per-core gap through parallelism. We could not
+  re-verify the multi-core parity here (the box is contended; see above).
+- **Full int8 (u8×s8 VNNI) beats ONNX fp32 by ~1.45×** on nomic, stable
+  and flag-free, reproducing R8's headline that full int8 clears ORT fp32.
+  The accuracy trade is real and per-model (nomic full-int8 worst cosine
+  0.953 — see the README int8 table); it is opt-in for exactly that reason.
+
+Net: at matched precision and per core, ORT's fp32 kernels lead ~1.26×;
+rembed reaches fp32 parity via multi-core scaling (quiet box) and passes
+ORT outright when the int8 accuracy trade is acceptable. Decoders (qwen3,
+gemma) are not in this table — their ONNX exports are gated or not shipped,
+so a like-for-like cross-engine decoder number needs an export step this
+run did not take.
