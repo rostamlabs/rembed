@@ -31,6 +31,11 @@ var (
 	// FMA; x/sys folds OS state support into the flag). Server parts and
 	// Zen 4+ have it; consumer Alder/Raptor Lake do not.
 	hasAVX512 = hasSIMD && cpu.X86.HasAVX512F
+	// has6x16 gates the wider AVX2 fp32 micro-kernel (6 rows × 16 cols, 12
+	// ymm accumulators — better B-reuse and loop-overhead amortization than
+	// the 8-accumulator 4×16). Used only for the 16-wide panel path (AVX2
+	// without AVX-512; AVX-512 boxes pack 32-wide and take gemm4x32).
+	has6x16 = hasSIMD
 )
 
 // dot4 computes dst[0..3] = dot(a, b0..b3) over k floats with 8-lane FMA
@@ -46,6 +51,14 @@ func dot4(dst, a, b0, b1, b2, b3 *float32, k int)
 //
 //go:noescape
 func gemm4x16(dst *float32, n int, pa, pb *float32, k int)
+
+// gemm6x16 writes C[6×16] = packed-A-panel (6 rows) × packed-B-panel to dst
+// with row stride n floats (implemented in gemm_amd64.s). Per-element
+// accumulation order is identical to gemm4x16, so results are bit-identical;
+// only the tile shape differs. k must be >= 1.
+//
+//go:noescape
+func gemm6x16(dst *float32, n int, pa, pb *float32, k int)
 
 // gemm4x16i8 is gemm4x16 over an int8 B panel with per-column dequant
 // scales applied in the epilogue (implemented in gemm8_amd64.s). k >= 1.
