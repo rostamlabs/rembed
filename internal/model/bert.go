@@ -95,6 +95,11 @@ type Model struct {
 	gmDense1 []float32
 	gmDense2 []float32
 
+	// nomic-embed path (cfg.ModelType == "nomic_bert"); nil otherwise. A
+	// post-norm BERT-style encoder with RoPE + SwiGLU — see nomic.go. wordEmb,
+	// typeEmb, and embLNg/embLNb are reused for the embeddings.
+	nmLayers []nmLayer
+
 	// pack is the mmapped disk-weights file when the model was loaded with
 	// WithDiskWeights (nil otherwise); Close unmaps it. Weight slices alias
 	// this mapping, so it must outlive every Forward.
@@ -325,6 +330,11 @@ func Load(weightsPath string, cfg Config, quantize QuantMode, workers int) (*Mod
 		// GeGLU, mean pooling + a Dense head) — dedicated path in gemma3.go.
 		return loadGemma3(tensors, cfg, quantize, workers, weightsPath)
 	}
+	if cfg.ModelType == "nomic_bert" {
+		// nomic-embed: a post-norm BERT-style encoder with RoPE + SwiGLU,
+		// bias-free — dedicated path in nomic.go.
+		return loadNomic(tensors, cfg, quantize, workers, weightsPath)
+	}
 	prefix := ""
 	for _, p := range []string{"bert.", "roberta.", "mpnet.", "distilbert."} {
 		if _, ok := tensors[p+"embeddings.word_embeddings.weight"]; ok {
@@ -541,6 +551,17 @@ func (m *Model) Quantized() bool {
 		}
 		return len(m.gmLayers) > 0
 	}
+	if m.nmLayers != nil {
+		for i := range m.nmLayers {
+			l := &m.nmLayers[i]
+			for _, w := range []*denseWeight{&l.wqkv, &l.attnOut, &l.fc11, &l.fc12, &l.fc2} {
+				if w.packed8 == nil && w.packed8v == nil {
+					return false
+				}
+			}
+		}
+		return len(m.nmLayers) > 0
+	}
 	if m.mbLayers != nil {
 		for i := range m.mbLayers {
 			l := &m.mbLayers[i]
@@ -588,6 +609,17 @@ func (m *Model) QuantizedActivations() bool {
 			}
 		}
 		return len(m.gmLayers) > 0
+	}
+	if m.nmLayers != nil {
+		for i := range m.nmLayers {
+			l := &m.nmLayers[i]
+			for _, w := range []*denseWeight{&l.wqkv, &l.attnOut, &l.fc11, &l.fc12, &l.fc2} {
+				if w.packed8v == nil {
+					return false
+				}
+			}
+		}
+		return len(m.nmLayers) > 0
 	}
 	if m.mbLayers != nil {
 		for i := range m.mbLayers {
@@ -721,6 +753,9 @@ func (m *Model) encodeWorkers(ids []int64, workers int) (*scratch, error) {
 	}
 	if m.gmLayers != nil {
 		return m.encodeGemma3(ids, workers)
+	}
+	if m.nmLayers != nil {
+		return m.encodeNomic(ids, workers)
 	}
 	H := m.cfg.HiddenSize
 	heads := m.cfg.NumAttentionHeads

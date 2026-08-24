@@ -160,6 +160,19 @@ func validate(c *Config, source string) error {
 		if c.RopeTheta <= 0 {
 			return fmt.Errorf("%s: qwen3 requires a positive rope_theta (found %g)", source, c.RopeTheta)
 		}
+	case "nomic_bert":
+		// nomic-embed: a bidirectional BERT-style POST-norm encoder with RoPE
+		// (no learned positions), SwiGLU, and bias-free projections. head_dim
+		// is explicit and even for RoPE; a single RoPE theta.
+		if c.HeadDim <= 0 || c.HeadDim%2 != 0 {
+			return fmt.Errorf("%s: nomic_bert requires an even head_dim > 0 (found %d)", source, c.HeadDim)
+		}
+		if c.HeadDim*c.NumAttentionHeads != c.HiddenSize {
+			return fmt.Errorf("%s: nomic_bert head_dim*heads (%d*%d) must equal hidden_size %d", source, c.HeadDim, c.NumAttentionHeads, c.HiddenSize)
+		}
+		if c.RopeTheta <= 0 {
+			return fmt.Errorf("%s: nomic_bert requires a positive rope_theta (found %g)", source, c.RopeTheta)
+		}
 	case "gemma3":
 		// EmbeddingGemma: bidirectional Gemma 3 backbone. head_dim is explicit
 		// and even for RoPE; GQA needs the query heads to partition over the kv
@@ -210,7 +223,7 @@ func validate(c *Config, source string) error {
 			return fmt.Errorf("%s: pad_token_id=%d — HF's MPNet embeddings hardcode padding_idx=1 regardless of config, so rembed only accepts 1", source, c.PadTokenID)
 		}
 	default:
-		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, modernbert, qwen3, gemma3, roberta, or mpnet)", source, c.ModelType)
+		return fmt.Errorf("%s: model_type %q unsupported (bert, distilbert, modernbert, qwen3, gemma3, nomic_bert, roberta, or mpnet)", source, c.ModelType)
 	}
 	if c.LayerNormEps == 0 {
 		c.LayerNormEps = 1e-12

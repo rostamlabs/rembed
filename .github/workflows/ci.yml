@@ -95,7 +95,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/rembed
-          key: rembed-models-v8
+          key: rembed-models-v9
       - name: fetch models via the hub loader
         env:
           # EmbeddingGemma is gated: set repo secret HF_TOKEN to a token whose
@@ -113,6 +113,7 @@ jobs:
           go run ./cmd/rembed embed -model sentence-transformers/multi-qa-distilbert-cos-v1 "warm" > /dev/null
           go run ./cmd/rembed embed -model nomic-ai/modernbert-embed-base "warm" > /dev/null
           go run ./cmd/rembed embed -model Qwen/Qwen3-Embedding-0.6B "warm" > /dev/null
+          go run ./cmd/rembed embed -model nomic-ai/nomic-embed-text-v1.5 "warm" > /dev/null
           if [ -n "$HF_TOKEN" ]; then
             go run ./cmd/rembed embed -model google/embeddinggemma-300m "warm" > /dev/null
           fi
@@ -127,6 +128,7 @@ jobs:
           export REMBED_MODEL_DISTIL=~/.cache/rembed/sentence-transformers--multi-qa-distilbert-cos-v1
           export REMBED_MODEL_MODERNBERT=~/.cache/rembed/nomic-ai--modernbert-embed-base
           export REMBED_MODEL_QWEN3=~/.cache/rembed/Qwen--Qwen3-Embedding-0.6B
+          export REMBED_MODEL_NOMIC=~/.cache/rembed/nomic-ai--nomic-embed-text-v1.5
           # EmbeddingGemma: present only when HF_TOKEN was set above; the
           # golden and tokenizer tests skip when the dir is absent.
           export REMBED_MODEL_GEMMA=~/.cache/rembed/google--embeddinggemma-300m

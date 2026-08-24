@@ -72,6 +72,22 @@ func DeriveConfig(dir, name string) (Config, error) {
 		SlidingWindow    *int            `json:"sliding_window"`
 		UseSlidingWindow bool            `json:"use_sliding_window"`
 
+		// nomic-embed (nomic_bert): post-norm BERT + RoPE + SwiGLU, bias-free.
+		ActivationFunction   string          `json:"activation_function"`
+		Prenorm              *bool           `json:"prenorm"`
+		Causal               *bool           `json:"causal"`
+		UseRMSNorm           *bool           `json:"use_rms_norm"`
+		RotaryEmbBase        *float64        `json:"rotary_emb_base"`
+		RotaryEmbFraction    *float64        `json:"rotary_emb_fraction"`
+		RotaryEmbInterleaved *bool           `json:"rotary_emb_interleaved"`
+		RotaryScalingFactor  json.RawMessage `json:"rotary_scaling_factor"`
+		QKVProjBias          *bool           `json:"qkv_proj_bias"`
+		MLPFC1Bias           *bool           `json:"mlp_fc1_bias"`
+		MLPFC2Bias           *bool           `json:"mlp_fc2_bias"`
+		RopeParameters       struct {
+			RopeTheta float64 `json:"rope_theta"`
+		} `json:"rope_parameters"`
+
 		// Gemma3 (EmbeddingGemma). model_type is "gemma3_text"; normalized to
 		// "gemma3" below.
 		RopeLocalBaseFreq         *float64 `json:"rope_local_base_freq"`
@@ -163,6 +179,38 @@ func DeriveConfig(dir, name string) (Config, error) {
 		if len(hf.RopeScaling) > 0 && string(hf.RopeScaling) != "null" {
 			return c, fmt.Errorf("model dir %s: gemma3 rope_scaling=%s is not supported (only default RoPE)", dir, hf.RopeScaling)
 		}
+	case "nomic_bert":
+		// nomic-embed: refuse anything that changes the geometry rembed's
+		// nomic path does not implement. It is a POST-norm, non-causal,
+		// LayerNorm (not RMS) encoder with full-head RoPE (no interleave, no
+		// NTK scaling) and bias-free SwiGLU.
+		if hf.Prenorm != nil && *hf.Prenorm {
+			return c, fmt.Errorf("model dir %s: nomic_bert prenorm=true is not supported (rembed's path is post-norm)", dir)
+		}
+		if hf.Causal != nil && *hf.Causal {
+			return c, fmt.Errorf("model dir %s: nomic_bert causal=true is not supported (embedder is bidirectional)", dir)
+		}
+		if hf.UseRMSNorm != nil && *hf.UseRMSNorm {
+			return c, fmt.Errorf("model dir %s: nomic_bert use_rms_norm=true is not supported (rembed's path uses LayerNorm)", dir)
+		}
+		if hf.RotaryEmbInterleaved != nil && *hf.RotaryEmbInterleaved {
+			return c, fmt.Errorf("model dir %s: nomic_bert rotary_emb_interleaved=true is not supported (only rotate-half)", dir)
+		}
+		if hf.RotaryEmbFraction != nil && *hf.RotaryEmbFraction != 1.0 {
+			return c, fmt.Errorf("model dir %s: nomic_bert rotary_emb_fraction=%g is not supported (only 1.0)", dir, *hf.RotaryEmbFraction)
+		}
+		if len(hf.RotaryScalingFactor) > 0 && string(hf.RotaryScalingFactor) != "null" {
+			return c, fmt.Errorf("model dir %s: nomic_bert rotary_scaling_factor=%s is not supported (only unscaled RoPE up to max_position_embeddings)", dir, hf.RotaryScalingFactor)
+		}
+		if (hf.QKVProjBias != nil && *hf.QKVProjBias) || (hf.MLPFC1Bias != nil && *hf.MLPFC1Bias) || (hf.MLPFC2Bias != nil && *hf.MLPFC2Bias) {
+			return c, fmt.Errorf("model dir %s: nomic_bert with projection biases is not supported (rembed's path is bias-free)", dir)
+		}
+		if hf.ActivationFunction != "" && hf.ActivationFunction != "swiglu" {
+			return c, fmt.Errorf("model dir %s: nomic_bert activation_function=%q — only swiglu is supported", dir, hf.ActivationFunction)
+		}
+		if hf.HiddenAct != "" && hf.HiddenAct != "silu" {
+			return c, fmt.Errorf("model dir %s: nomic_bert hidden_act=%q — SwiGLU uses silu", dir, hf.HiddenAct)
+		}
 	case "roberta", "xlm-roberta":
 		// XLM-RoBERTa is architecturally identical to RoBERTa (same encoder,
 		// same fairseq position offset); only the tokenizer differs — it wears
@@ -185,11 +233,11 @@ func DeriveConfig(dir, name string) (Config, error) {
 			return c, fmt.Errorf("model dir %s: mpnet config.json lacks pad_token_id", dir)
 		}
 	default:
-		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, qwen3, gemma3, roberta, xlm-roberta, and mpnet encoders", dir, hf.ModelType)
+		return c, fmt.Errorf("model dir %s: model_type=%q — rembed supports bert, distilbert, modernbert, qwen3, gemma3, nomic_bert, roberta, xlm-roberta, and mpnet encoders", dir, hf.ModelType)
 	}
-	// qwen3's activation (silu, for SwiGLU) is validated in its case above;
-	// the encoders' exact-GELU requirement does not apply to it.
-	if hf.ModelType != "qwen3" && hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
+	// qwen3 and nomic_bert use SwiGLU (silu), validated in their cases above;
+	// the encoders' exact-GELU requirement does not apply to them.
+	if hf.ModelType != "qwen3" && hf.ModelType != "nomic_bert" && hf.HiddenAct != "" && hf.HiddenAct != "gelu" {
 		key := "hidden_act"
 		if hf.ModelType == "distilbert" {
 			key = "activation" // distilbert's spelling of the same knob
@@ -342,6 +390,18 @@ func DeriveConfig(dir, name string) (Config, error) {
 		// pooling reads that position. SepToken carries the suffix content.
 		c.ClsToken = ""
 		c.SepToken = "<|endoftext|>"
+	case "nomic_bert":
+		// nomic-embed spells its norm eps layer_norm_eps (set by the block
+		// above). Carry the explicit head_dim and the RoPE base (rope_theta,
+		// or the legacy rotary_emb_base). WordPiece tokenizer + [CLS]/[SEP]
+		// come from tokenizer_config via the default handling.
+		c.HeadDim = hf.HeadDim
+		switch {
+		case hf.RopeParameters.RopeTheta > 0:
+			c.RopeTheta = hf.RopeParameters.RopeTheta
+		case hf.RotaryEmbBase != nil:
+			c.RopeTheta = *hf.RotaryEmbBase
+		}
 	case "gemma3":
 		// EmbeddingGemma: rms_norm_eps, explicit head_dim + kv-head count
 		// (GQA), the two RoPE thetas (global rope_theta, local

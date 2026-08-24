@@ -851,6 +851,12 @@ func TestGoldenMatrix(t *testing.T) {
 		// with the explicit ST pooling+dense+normalize pipeline.
 		// int8 worst 0.998140, full int8 worst 0.993849 (measured), less margin.
 		{"testdata/golden-embeddinggemma-300m.json", "models/embeddinggemma-300m", "REMBED_MODEL_GEMMA", 1e-4, 0, 1e-5, 0.998, 0.99},
+		// nomic-embed: the eighth architecture — a post-norm BERT-style encoder
+		// with RoPE (no learned positions), bias-free SwiGLU, LayerNorm, and
+		// token_type embeddings, bidirectional. Reference is the repo's own
+		// ONNX export (last_hidden_state), mean-pooled, un-normalized.
+		// int8 worst 0.996845, full int8 worst 0.952968 (measured), less margin.
+		{"testdata/golden-nomic-embed-text-v1.5.json", "models/nomic-embed-text-v1.5", "REMBED_MODEL_NOMIC", 1e-4, 0, 1e-5, 0.996, 0.95},
 	}
 	for _, tc := range cases {
 		t.Run(filepath.Base(tc.dir), func(t *testing.T) {
