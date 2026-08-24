@@ -226,11 +226,12 @@ func Load(ref string, opts ...Option) (*Embedder, error) {
 		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 128 {
 			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 		}
-	case cfg.ModelType == "modernbert" || cfg.ModelType == "qwen3":
-		// ModernBERT and Qwen3 pad their embedding tables to round numbers
-		// (ModernBERT 50368 rows for ~50310 tokens; Qwen3 151669), so the
-		// check is one-sided like SentencePiece: a small positive gap is the
-		// padding; a negative or large gap means a mismatched tokenizer.json.
+	case cfg.ModelType == "modernbert" || cfg.ModelType == "qwen3" || cfg.ModelType == "nomic_bert":
+		// ModernBERT, Qwen3, and nomic-embed pad their embedding tables to
+		// round numbers (ModernBERT 50368 rows for ~50310 tokens; Qwen3
+		// 151669; nomic 30528 for the 30522-token BERT vocab, pad multiple
+		// 64), so the check is one-sided like SentencePiece: a small positive
+		// gap is padding; a negative or large gap means a mismatched vocab.
 		if gap := cfg.VocabSize - tok.VocabSize(); gap < 0 || gap > 128 {
 			return nil, fmt.Errorf("rembed: tokenizer has %d ids but the model has %d embedding rows — mismatched model dir", tok.VocabSize(), cfg.VocabSize)
 		}

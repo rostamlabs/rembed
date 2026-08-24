@@ -5,6 +5,13 @@ cgo-free embedding inference engine validated end-to-end against each
 model's own independent reference (ONNX Runtime, or the canonical PyTorch
 model where an ONNX export is unavailable).
 
+## Unreleased
+
+- **nomic-embed** (`nomic-embed-text-v1.5`): the eighth architecture — a
+  post-norm BERT encoder with RoPE, gated SwiGLU, and token_type
+  embeddings, bias-free. Validated against its own ONNX export at fp32
+  maxAbs < 1e-4.
+
 ## v0.3.0
 
 Seven architectures, three tokenizer families, weight-only and full int8,

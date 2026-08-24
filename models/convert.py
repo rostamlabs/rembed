@@ -200,8 +200,8 @@ def main() -> None:
     modules = json.loads(fetch("modules.json").read_text())
 
     model_type = config.get("model_type")
-    if model_type not in ("bert", "distilbert", "modernbert", "qwen3", "roberta", "xlm-roberta", "mpnet"):
-        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, modernbert, qwen3, roberta, xlm-roberta, and mpnet models are supported")
+    if model_type not in ("bert", "distilbert", "modernbert", "qwen3", "nomic_bert", "roberta", "xlm-roberta", "mpnet"):
+        raise SystemExit(f"model_type={model_type!r}: only bert, distilbert, modernbert, qwen3, nomic_bert, roberta, xlm-roberta, and mpnet models are supported")
     # XLM-RoBERTa is the RoBERTa encoder with a SentencePiece tokenizer
     # (already handled above via sentencepiece_tok); fold it onto roberta so
     # the manifest and every downstream branch treat it identically. The one
@@ -224,6 +224,28 @@ def main() -> None:
             raise SystemExit(f"qwen3 rope_scaling={config.get('rope_scaling')!r} is not supported")
         if config.get("use_sliding_window") or config.get("sliding_window"):
             raise SystemExit("qwen3 sliding-window attention is not supported")
+    if model_type == "nomic_bert":
+        # Post-norm BERT + RoPE + SwiGLU, bias-free. Refuse every variant
+        # rembed's nomic path does not implement, at export time — these
+        # would otherwise produce a valid-looking dir that computes the wrong
+        # thing (the manifest path never re-derives, so it cannot catch them).
+        # Mirrors the DeriveConfig nomic_bert guards.
+        if config.get("prenorm"):
+            raise SystemExit("nomic_bert prenorm=true is not supported (rembed's path is post-norm)")
+        if config.get("causal"):
+            raise SystemExit("nomic_bert causal=true is not supported (embedder is bidirectional)")
+        if config.get("use_rms_norm"):
+            raise SystemExit("nomic_bert use_rms_norm=true is not supported (rembed's path uses LayerNorm)")
+        if config.get("rotary_emb_interleaved"):
+            raise SystemExit("nomic_bert rotary_emb_interleaved=true is not supported (only rotate-half)")
+        if config.get("rotary_emb_fraction", 1.0) != 1.0:
+            raise SystemExit(f"nomic_bert rotary_emb_fraction={config.get('rotary_emb_fraction')!r} is not supported (only 1.0)")
+        if config.get("rotary_scaling_factor") is not None:
+            raise SystemExit(f"nomic_bert rotary_scaling_factor={config.get('rotary_scaling_factor')!r} is not supported (only unscaled RoPE up to max_position_embeddings)")
+        if config.get("qkv_proj_bias") or config.get("mlp_fc1_bias") or config.get("mlp_fc2_bias"):
+            raise SystemExit("nomic_bert with projection biases is not supported (rembed's path is bias-free)")
+        if config.get("activation_function", "swiglu") != "swiglu":
+            raise SystemExit(f"nomic_bert activation_function={config.get('activation_function')!r}: only swiglu is supported")
     if model_type == "modernbert":
         # rembed's ModernBERT path is bias-free; refuse a checkpoint that
         # enabled any bias (it would silently be dropped). Positions enter
@@ -256,7 +278,7 @@ def main() -> None:
     # The Go engine hardcodes exact-erf GELU and absolute position embeddings;
     # anything else would produce a valid-looking model dir that computes the
     # wrong thing, so refuse at export time.
-    if model_type != "qwen3" and config.get("hidden_act", "gelu") != "gelu":
+    if model_type not in ("qwen3", "nomic_bert") and config.get("hidden_act", "gelu") != "gelu":
         raise SystemExit(f"hidden_act={config.get('hidden_act')!r}: only exact GELU is supported")
     if config.get("position_embedding_type", "absolute") != "absolute":
         raise SystemExit(f"position_embedding_type={config.get('position_embedding_type')!r}: only absolute is supported")
@@ -327,6 +349,14 @@ def main() -> None:
         manifest["rope_theta"] = config["rope_theta"]
         manifest["cls_token"] = ""
         manifest["sep_token"] = "<|endoftext|>"
+    if model_type == "nomic_bert":
+        # nomic-embed: post-norm BERT + RoPE (no learned positions) + SwiGLU,
+        # bias-free. Explicit head_dim and the RoPE base (rope_theta, or the
+        # legacy rotary_emb_base); WordPiece tokenizer from vocab.txt.
+        manifest["model_type"] = "nomic_bert"
+        manifest["head_dim"] = config["head_dim"]
+        rp = config.get("rope_parameters") or {}
+        manifest["rope_theta"] = rp.get("rope_theta") or config.get("rotary_emb_base")
     if model_type == "distilbert":
         manifest["model_type"] = "distilbert"
     if model_type == "mpnet":

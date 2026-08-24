@@ -37,12 +37,13 @@ throughput-saturated servers.
 
 ## Supported models
 
-Seven architectures: BERT-family, DistilBERT, MPNet, RoBERTa (including
+Eight architectures: BERT-family, DistilBERT, MPNet, RoBERTa (including
 **XLM-RoBERTa** — `multilingual-e5-base`/`-large`, `bge-m3`, the same
-encoder with the SentencePiece tokenizer), and ModernBERT encoders, plus
-two decoder-derived embedders: **Qwen3-Embedding** (a causal decoder) and
-**EmbeddingGemma** (a bidirectional Gemma 3 backbone — the current MMTEB
-state of the art for its size). sentence-transformers format: mean, CLS,
+encoder with the SentencePiece tokenizer), ModernBERT, and **nomic-embed**
+(a post-norm BERT with RoPE + SwiGLU) encoders, plus two decoder-derived
+embedders: **Qwen3-Embedding** (a causal decoder) and **EmbeddingGemma**
+(a bidirectional Gemma 3 backbone — the current MMTEB state of the art for
+its size). sentence-transformers format: mean, CLS,
 or last-token pooling, with an optional Dense projection head (EmbeddingGemma);
 WordPiece, byte-level BPE, SentencePiece Unigram (the XLM-R tokenizer —
 multilingual models work, 100+ languages), or the Gemma byte-fallback BPE;
@@ -81,6 +82,7 @@ reliably ships ONNX):
 | nomic-ai/modernbert-embed-base | mean | F32 | < 1e-4 (vs PyTorch) | cosine ≥ 0.998 |
 | Qwen/Qwen3-Embedding-0.6B | lasttoken | BF16 | < 1e-4 (vs PyTorch) | cosine ≥ 0.997 |
 | google/embeddinggemma-300m | mean + Dense | F32 | < 1e-4 (vs PyTorch) | cosine ≥ 0.998 |
+| nomic-ai/nomic-embed-text-v1.5 | mean | F32 | < 1e-4 | cosine ≥ 0.996 |
 | thenlper/gte-small | mean | F16 | 2e-3 maxAbs + cosine ≥ 0.9999 + meanAbs ≤ 2e-4 (the repo's ONNX export is fp32 while its safetensors are f16, so maxAbs is dominated by the checkpoint's own rounding; the cosine/mean bounds are what actually constrain rembed) | — |
 
 On CPUs with AVX-VNNI — Intel Alder Lake (2021) onward and Sapphire
@@ -103,13 +105,15 @@ test-enforced (worst golden cosine, full int8 vs weight-only):
 | modernbert-embed | 0.9660 | 0.9984 |
 | qwen3-embedding-0.6B | 0.9747 | 0.9978 |
 | embeddinggemma-300m | 0.9938 | 0.9981 |
+| nomic-embed-text-v1.5 | 0.9530 | 0.9968 |
 | **bge-base** | **0.9593** | 0.9957 |
 
 Activation outliers are a PER-CHECKPOINT property, not an architecture
-one: bge-base (a plain BERT) measures worst of all at 0.9593, below
-distilroberta's 0.9747 and modernbert-embed's 0.9660 (whose GeGLU gate
-activations have a range the per-row u8 scale can't hold), while
-bge-base's sibling bge-small is unremarkable. Qwen3-Embedding compounds
+one: nomic-embed (SwiGLU, and an un-normalized output) measures worst at
+0.9530 and bge-base (a plain BERT) next at 0.9593, below distilroberta's
+0.9747 and modernbert-embed's 0.9660 (whose GeGLU gate activations have a
+range the per-row u8 scale can't hold), while bge-base's sibling bge-small
+is unremarkable. Qwen3-Embedding compounds
 this: last-token pooling reads a single position, so there is no
 averaging across tokens to soften activation-quantization error — prefer
 `WithInt8` (weight-only) there.

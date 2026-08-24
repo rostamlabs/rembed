@@ -64,6 +64,10 @@ func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe boo
 		// tokenizer.json; no sentencepiece.bpe.model probe.
 		return []string{"tokenizer.json"}, false
 	}
+	if modelType == "nomic_bert" {
+		// nomic-embed uses the BERT WordPiece vocab (vocab.txt); no probe.
+		return []string{"vocab.txt"}, false
+	}
 	return []string{"vocab.txt"}, true
 }
 
@@ -72,7 +76,7 @@ func tokenizerFiles(modelType, tokenizerClass string) (files []string, probe boo
 // cannot import internal/model (which would invert the dependency).
 func supported(modelType string) bool {
 	switch modelType {
-	case "bert", "distilbert", "modernbert", "qwen3", "gemma3_text", "gemma3", "roberta", "xlm-roberta", "mpnet":
+	case "bert", "distilbert", "modernbert", "qwen3", "gemma3_text", "gemma3", "nomic_bert", "roberta", "xlm-roberta", "mpnet":
 		return true
 	}
 	return false

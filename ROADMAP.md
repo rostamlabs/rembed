@@ -332,6 +332,27 @@ full-768 torch golden (maxAbs < 1e-4), and range-guarded at Load. Still
 deferred (a caller-side usage convention, not model correctness): the
 task-prompt prefixes ("task: search result | query: …").
 
+## R14 — nomic-embed (post-norm BERT + RoPE + SwiGLU) ✅
+Done: the eighth architecture. `nomic-embed-text-v1.5` — a BERT-style
+POST-norm encoder (residual-add THEN LayerNorm) but bias-free, with RoPE
+(no learned positions), a gated SwiGLU MLP, and token_type embeddings,
+bidirectional. High reuse: the WordPiece tokenizer (R0), RoPE
+(ropeTable/applyRoPE from R9), SiLU/SwiGLU (R10), LayerNorm, and the
+per-head attention pattern. The one subtlety the golden caught: nomic's
+GatedMLP is `fc11(x) · silu(fc12(x))` — silu on fc12, not fc11 (the first
+implementation had it reversed and every case landed near-orthogonal until
+the reference modeling code settled it).
+
+Validated: `nomic-embed-text-v1.5` matches its own ONNX Runtime export
+(last_hidden_state, mean pooling, un-normalized) at fp32 maxAbs < 1e-4 —
+cross-checked against the trust_remote_code torch model (cos 1.0 vs ONNX) —
+through BOTH the manifest and DeriveConfig/hub paths; int8 worst cosine
+0.996845 (weight-only) / 0.952968 (full int8 — SwiGLU + un-normalized
+output makes it the accuracy floor, like the GeGLU family), bounds enforced.
+Refuse-guards reject the NTK rotary scaling that extends v1.5 to 8k (only
+unscaled RoPE up to max_position_embeddings), plus prenorm/causal/RMSNorm
+variants. CI fetches it via the hub loader (not gated).
+
 ## Standing rules
 Every rung: golden validation against an independent reference, its own
 benchmark delta where perf-relevant, an adversarial review pass before
