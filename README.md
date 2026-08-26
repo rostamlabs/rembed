@@ -4,6 +4,9 @@ Pure-Go embedding inference engine for BERT-family encoder models.
 Text in, L2-normalized embedding vectors out — no cgo, no ONNX Runtime,
 one static binary.
 
+📚 **[Documentation](docs/index.md)** — Go library, CLI & server, Python/C
+bindings, supported models, architecture, and benchmarks.
+
 ```go
 // Loads straight from the Hugging Face Hub (pure Go, cached locally) —
 // no Python, no conversion step:
