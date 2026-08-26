@@ -1,0 +1,35 @@
+name: docs
+
+# A build gate only. --strict turns MkDocs warnings (dead internal links,
+# missing nav targets) into a failed build, so a renamed page or a stale nav
+# entry is caught in review. Publishing is handled by the unified docs hub that
+# aggregates this repo's docs/ alongside the other projects' — this repo does
+# not deploy its own site.
+
+on:
+  pull_request:
+    paths: ['docs/**', 'mkdocs.yml', '.github/workflows/docs.yml']
+  push:
+    branches: [main]
+    paths: ['docs/**', 'mkdocs.yml', '.github/workflows/docs.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: pip install mkdocs-material
+
+      - name: Build (strict)
+        run: mkdocs build --strict --site-dir _site

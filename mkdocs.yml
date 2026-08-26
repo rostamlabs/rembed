@@ -1,0 +1,65 @@
+site_name: rembed
+site_description: >-
+  Pure-Go embedding inference for BERT-family encoder models — text in,
+  L2-normalized vectors out. No cgo, no ONNX Runtime, one static binary.
+site_url: https://docs.rostamlabs.com/rembed/
+repo_url: https://github.com/rostamlabs/rembed
+repo_name: rostamlabs/rembed
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.indexes
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - search.suggest
+    - search.highlight
+    - search.share
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle: { icon: material/brightness-7, name: Dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle: { icon: material/brightness-4, name: Light mode }
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.keys
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+  - Go library: usage.md
+  - CLI & server: cli.md
+  - Python & C bindings: python.md
+  - Supported models: models.md
+  - Architecture: architecture.md
+  - Benchmarks: benchmarks.md
+  - Rostam integration: rostam-integration.md
