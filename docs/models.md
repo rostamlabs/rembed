@@ -1,9 +1,10 @@
 # Supported models
 
-rembed covers eight encoder architectures — BERT, DistilBERT, MPNet, RoBERTa
-(including XLM-RoBERTa), ModernBERT, nomic-embed, and two decoder-derived
-embedders (Qwen3-Embedding and EmbeddingGemma) — across four tokenizer families
-(WordPiece, byte-level BPE, SentencePiece Unigram, Gemma byte-fallback BPE).
+rembed covers eight model architectures — six BERT-style encoders (BERT,
+DistilBERT, MPNet, RoBERTa including XLM-RoBERTa, ModernBERT, nomic-embed) and
+two decoder-derived embedders (Qwen3-Embedding and EmbeddingGemma) — across four
+tokenizer families (WordPiece, byte-level BPE, SentencePiece Unigram, Gemma
+byte-fallback BPE).
 Pass any of them to [`Load`](usage.md#loading-a-model) by Hugging Face id.
 
 Every model below ships a **committed golden** and is validated in CI against an

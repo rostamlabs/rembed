@@ -1,8 +1,8 @@
 # rembed
 
-**Pure-Go embedding inference for BERT-family encoder models.** Text in,
-L2-normalized embedding vectors out — no cgo, no ONNX Runtime, no Python in the
-path, one static binary.
+**Pure-Go embedding inference for text-embedding models — BERT-style encoders
+and decoder-derived embedders.** Text in, L2-normalized embedding vectors out —
+no cgo, no ONNX Runtime, no Python in the path, one static binary.
 
 ```go
 emb, err := rembed.Load("sentence-transformers/all-MiniLM-L6-v2") // downloads from the HF Hub, pure Go
