@@ -1,8 +1,8 @@
 # rembed
 
-Pure-Go embedding inference engine for BERT-family encoder models.
-Text in, L2-normalized embedding vectors out — no cgo, no ONNX Runtime,
-one static binary.
+Pure-Go embedding inference engine for text-embedding models — BERT-style
+encoders and decoder-derived embedders. Text in, L2-normalized embedding
+vectors out — no cgo, no ONNX Runtime, one static binary.
 
 📚 **[Documentation](docs/index.md)** — Go library, CLI & server, Python/C
 bindings, supported models, architecture, and benchmarks.
