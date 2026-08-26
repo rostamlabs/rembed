@@ -33,3 +33,27 @@ jobs:
 
       - name: Build (strict)
         run: mkdocs build --strict --site-dir _site
+
+  # The unified docs hub (rostamlabs/docs) imports this repo's docs/ at build
+  # time, so a docs change here won't reach the published site until the hub
+  # rebuilds. On a push to main, fire a repository_dispatch so the hub redeploys
+  # immediately instead of waiting for its daily schedule.
+  #
+  # Requires a repo secret DOCS_DISPATCH_TOKEN — a token with Contents:write on
+  # rostamlabs/docs. The step is guarded on it, so this no-ops (never fails) when
+  # the secret is absent, including on forks and PRs.
+  notify-hub:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      DOCS_DISPATCH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+    steps:
+      - name: Trigger docs hub rebuild
+        if: env.DOCS_DISPATCH_TOKEN != ''
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer $DOCS_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/rostamlabs/docs/dispatches \
+            -d '{"event_type":"rebuild-docs"}'
