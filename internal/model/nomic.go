@@ -230,7 +230,7 @@ func (m *Model) encodeNomic(ids []int64, workers int) (*scratch, error) {
 		m.applyDense(fc11Out, x[:seq*H], &l.fc11, seq, s)
 		m.applyDense(fc12Out, x[:seq*H], &l.fc12, seq, s)
 		s.pool.Run(seq, func(i int) {
-			lin := fc11Out[i*I : i*I+I]  // linear operand
+			lin := fc11Out[i*I : i*I+I]   // linear operand
 			gated := fc12Out[i*I : i*I+I] // silu-gated operand
 			d := act[i*I : i*I+I]
 			// nomic's GatedMLP: fc11(x) * silu(fc12(x)) — silu is on fc12.
